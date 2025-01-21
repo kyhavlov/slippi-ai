@@ -79,7 +79,8 @@ _MACOS_SHM_SIZE = 1024 # MB
 @functools.cache
 def get_tmp_dir(in_memory: bool) -> tp.Optional[str]:
   if not in_memory:
-    return None
+    #print current working directory
+    return os.path.join(os.curdir, 'tmp')
 
   if os.path.exists('/dev/shm'):
     return '/dev/shm'

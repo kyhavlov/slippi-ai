@@ -35,11 +35,11 @@ def to_libmelee_stick(raw_stick: np.ndarray) -> np.ndarray:
 
 def get_stick(stick) -> types.Stick:
   return types.Stick(
-      x=to_libmelee_stick(stick.field('x').to_numpy()),
-      y=to_libmelee_stick(stick.field('y').to_numpy()),
+      x=to_libmelee_stick(stick.field('x').to_numpy(zero_copy_only=False)),
+      y=to_libmelee_stick(stick.field('y').to_numpy(zero_copy_only=False)),
   )
 
-def get_player(player: pa.StructArray) -> types.Player:
+def get_player(player: pa.StructArray, team: np.uint8) -> types.Player:
   leader = player.field('leader')
 
   post = leader.field('post')
@@ -49,12 +49,12 @@ def get_player(player: pa.StructArray) -> types.Player:
 
   return types.Player(
       percent=np.asarray(get_post('percent'), dtype=np.uint16),
-      facing=get_post('direction').to_numpy() > 0,
+      facing=get_post('direction').to_numpy(zero_copy_only=False) > 0,
       x=position.field('x'),
       y=position.field('y'),
       action=get_post('state'),
       # libmelee does extra processing to determine invulnerability
-      invulnerable=get_post('hurtbox_state').to_numpy() != 0,
+      invulnerable=get_post('hurtbox_state').to_numpy(zero_copy_only=False) != 0,
       character=get_post('character'),  # uint8
       jumps_left=get_post('jumps'),  # uint8
       shield_strength=get_post('shield'),  # float
@@ -63,10 +63,11 @@ def get_player(player: pa.StructArray) -> types.Player:
           c_stick=get_stick(pre.field('cstick')),
           # libmelee reads the logical value and assigns it to both l/r
           shoulder=pre.field('triggers'),
-          buttons=get_buttons(pre.field('buttons_physical')),
+          buttons=get_buttons(pre.field('buttons_physical').fill_null(0)),
       ),
       on_ground=np.logical_not(
           post.field('airborne').to_numpy(zero_copy_only=False)),
+      team=np.full(len(get_post('character')), team, dtype=np.uint8),
   )
 
 def from_peppi(game: peppi_py.Game) -> types.GAME_TYPE:
@@ -75,8 +76,13 @@ def from_peppi(game: peppi_py.Game) -> types.GAME_TYPE:
   players = {}
   port_names = sorted(p['port'] for p in game.start['players'])
   ports_data = frames.field('ports')
+  #print(game.metadata)
+  #print(game.start)
   for i, port_name in enumerate(port_names):
-    players[f'p{i}'] = get_player(ports_data.field(port_name))
+    team = 0
+    if len(game.start['players']) > 2:
+      team = game.start['players'][i]['team']['color']
+    players[f'p{i}'] = get_player(ports_data.field(port_name), team)
 
   stage = melee.enums.to_internal_stage(game.start['stage'])
   stage = np.full([len(frames)], stage.value, dtype=np.uint8)

@@ -64,7 +64,7 @@ def get_game(
     ports: Optional[Sequence[int]] = None,
 ) -> Game:
   ports = ports or sorted(game.players)
-  assert len(ports) == 2
+  assert len(ports) == 4
   players = {
       f'p{i}': get_player(game.players[p])
       for i, p in enumerate(ports)}

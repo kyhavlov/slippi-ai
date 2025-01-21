@@ -29,6 +29,7 @@ This will process all unprocessed .zip and .7z files in the Raw directory,
 overwriting any existing files in Parsed, and will update parsed.pkl.
 """
 
+import traceback
 import concurrent.futures
 import json
 import os
@@ -55,8 +56,11 @@ def parse_slp(
 ) -> dict:
   result = dict(name=file.name)
 
+  #print(f"Processing {file.name} ({tmpdir})...")
+
   try:
     with file.extract(tmpdir) as path:
+      #print(f"path: {path}")
       with open(path, 'rb') as f:
         slp_bytes = f.read()
         slp_size = len(slp_bytes)
@@ -79,6 +83,9 @@ def parse_slp(
           not_training_reason=reason,
       )
 
+      # log the game file, is_training and reason
+      print(f"{file.name} {is_training} {reason}")
+
       if is_training:
         game = parse_peppi.from_peppi(game)
         game_bytes = parsing_utils.convert_game(
@@ -96,6 +103,7 @@ def parse_slp(
     raise
   except BaseException as e:
     result.update(valid=False, reason=repr(e))
+    print(f"exception: {repr(e)}\n{traceback.format_exc()}")
   # except:  # should be a catch-all, but sadly prevents KeyboardInterrupt?
   #   result.update(valid=False, reason='uncaught exception')
 
@@ -263,7 +271,7 @@ def run_parsing(
   for dirpath, _, filenames in os.walk(raw_dir):
     reldirpath = os.path.relpath(dirpath, raw_dir)
     for name in filenames:
-      path = os.path.join(reldirpath, name).removeprefix('./')
+      path = os.path.join(reldirpath, name).removeprefix('.\\')
       if path not in raw_by_name:
         raw_by_name[path] = dict(processed=False, name=path)
       if wipe or not raw_by_name[path]['processed']:
@@ -291,9 +299,9 @@ def run_parsing(
     if f.endswith('.zip'):
       fs = utils.traverse_slp_files_zip(raw_path)
     else:
-      # print(f"Can't handle {f} yet.")
+      print(f"Can't handle {f} yet.")
       continue
-    print(f"Found {len(fs)} slp files in {f}")
+    print(f"Found {len(fs)} slp files in {raw_path}")
     slp_files.extend(fs)
     raw_names.extend([f] * len(fs))
 

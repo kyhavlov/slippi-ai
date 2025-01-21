@@ -206,8 +206,8 @@ def is_training_replay(meta_dict: dict) -> tuple[bool, str]:
 
   if meta.slippi_version < MIN_SLP_VERSION:
     return False, 'slippi version too low'
-  if meta.num_players != 2:
-    return False, 'not 1v1'
+  if meta.num_players != 4:
+    return False, 'not 2v2'
   if meta.lastFrame < MIN_FRAMES:
     return False, 'game length too short'
   if meta.timer != GAME_TIME:

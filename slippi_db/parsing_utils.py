@@ -24,6 +24,9 @@ class CompressionType(enum.Enum):
       return CompressionType.NONE.value
     return self.value
 
+# Convert a game to a parquet file
+# This is a simplified version of the function in slippi_ai.data
+# It doesn't handle the case where the game is a list of games
 def convert_game(
     game: types.GAME_TYPE,  # a pyarrow StructArray
     pq_version: str = '2.4',

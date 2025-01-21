@@ -44,10 +44,13 @@ class Player(NamedTuple):
   shield_strength: np.float32
   on_ground: np.bool_
   controller: Controller
+  team: np.uint8
 
 class Game(NamedTuple):
   p0: Player
   p1: Player
+  p2: Player
+  p3: Player
   stage: np.uint8
 
 # maps pyarrow types back to NamedTuples
