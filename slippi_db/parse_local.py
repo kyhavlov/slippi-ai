@@ -47,6 +47,14 @@ from slippi_db import utils
 from slippi_db import parsing_utils
 from slippi_db.parsing_utils import CompressionType
 
+class ArrowJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if hasattr(obj, "to_pylist"):
+            return obj.to_pylist()  # Handle Arrow Arrays
+        if hasattr(obj, "as_py"):
+            return obj.as_py()  # Handle Arrow Scalars
+        return super().default(obj)
+
 def parse_slp(
     file: utils.LocalFile,
     output_dir: str,
@@ -278,6 +286,7 @@ def run_parsing(
         to_process.append(path)
 
   print("To process:", to_process)
+  print("threads: ", num_threads)
 
   if dry_run:
     return

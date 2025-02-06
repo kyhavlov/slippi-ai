@@ -1,7 +1,7 @@
 import dataclasses
 import pickle
 
-from absl import logging
+import logging
 import tree
 import tensorflow as tf
 

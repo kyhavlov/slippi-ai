@@ -1,8 +1,8 @@
 """Track known player nametags and connect codes."""
 
 from typing import Optional
-
 import melee
+from melee import Character
 
 DEFAULT_NAME = 'Master Player'
 NAME_UNKNOWN = ''
@@ -68,6 +68,29 @@ name_groups = [
   ('Gosu', 'WIZZ#310'),
   # Most Franz games are local with no name; for those we assume any Doctor Mario is Franz.
   ('Franz', 'XELA#158', 'PLATO#0'),
+
+  ('xRunRiot', 'DUBS#185', 'JOKR#744', 'YMCM#734'),
+  ('Tempo', 'TEMP#0', 'TMPO#972'),
+  ('Enzyme', 'ENZYME#0', 'ZYME#749', 'ENZ#643'),
+  ('Darkatma', 'CROU#224', 'ATMA#372', 'DKDK#583'),
+  ('Ralph', 'ROWF#148'),
+  ('Light', 'ROCK#906'),
+  ('Woopty', 'WOOP#518'),
+  ('Azusa', 'AMY#890'),
+  ('Openzmindz', 'MIND#733'),
+  ('Notorious', 'NTRS#538'),
+  ('Shinobi', 'SHIN#474'),
+  ('Zbert', 'ZBOT#673', 'ZBRT#561'),
+  ('TK', 'TK#703'),
+  ('Buttlet', 'FUZZ#987'),
+  ('Azel', 'AZEL#0', 'AOI#632'),
+  ('MisterGW', 'BASK#629', 'MRGW#989', 'BLIK#539'),
+  ('Nuckels', 'NUCK#205'),
+
+  ('Nocki', 'NOCK#354', 'NOCK#726'),
+  ('Zuijin', 'ZUIJ#435'),
+  ('Mino', 'MINO#616'),
+  ('Veto', 'VETO#536'),
 ]
 
 name_map = {}
@@ -88,10 +111,12 @@ def name_encoder(name_map: dict[str, int]):
     return name_map.get(normalize_name(name), missing_name_code)
   return encode_name
 
-
 BANNED_NAMES = {
     'Mang0',  # Has asked not to be included in AI training
     'Phillip AI',  # This is us!
+    'Nocki',
+    'Zuijin',
+    'Mino',
 }
 for name in BANNED_NAMES:
   assert name in name_map.values(), name

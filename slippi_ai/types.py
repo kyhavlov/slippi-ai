@@ -43,8 +43,8 @@ class Player(NamedTuple):
   jumps_left: np.uint8
   shield_strength: np.float32
   on_ground: np.bool_
+  is_dead: np.bool_
   controller: Controller
-  team: np.uint8
 
 class Game(NamedTuple):
   p0: Player

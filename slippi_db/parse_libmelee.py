@@ -48,6 +48,7 @@ def get_player(player: melee.PlayerState) -> Player:
       jumps_left=player.jumps_left,
       shield_strength=player.shield_strength,
       on_ground=player.on_ground,
+      is_dead=player.stock == 0,
       controller=get_controller(player.controller_state),
       # v2.1.0
       invulnerable=player.invulnerable,
@@ -64,10 +65,16 @@ def get_game(
     ports: Optional[Sequence[int]] = None,
 ) -> Game:
   ports = ports or sorted(game.players)
-  assert len(ports) == 4
-  players = {
-      f'p{i}': get_player(game.players[p])
-      for i, p in enumerate(ports)}
+  #assert len(ports) == 4
+  players = {}
+  for i, p in enumerate(ports):
+    if p in game.players:
+      players[f'p{i}'] = get_player(game.players[p])
+    else:
+      state = melee.PlayerState()
+      state.action = melee.Action.DEAD_DOWN
+      players[f'p{i}'] = get_player(state)
+
   return Game(
       stage=game.stage.value,
       **players,

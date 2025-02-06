@@ -403,6 +403,7 @@ def make_player_embedding(
       # ("charging_smash", embedFloat),
       ("shield_strength", FloatEmbedding("shield_size", scale=shield_scale)),
       ("on_ground", embed_bool),
+      ("is_dead", embed_bool),
     ]
 
     if with_controller:
@@ -446,6 +447,8 @@ def make_game_embedding(player_config={}):
   embedding = Game(
       p0=embed_player,
       p1=embed_player,
+      p2=embed_player,
+      p3=embed_player,
       stage=embed_stage,
   )
 

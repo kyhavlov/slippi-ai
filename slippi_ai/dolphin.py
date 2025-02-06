@@ -73,6 +73,8 @@ class Dolphin:
       headless: bool = False,
       render: Optional[bool] = None,  # Render even when running headless.
       connect_code: Optional[str] = None,
+      teams_connect_code: Optional[str] = None,
+      desired_teams: Mapping[int, int] = None,
       **console_kwargs,
   ) -> None:
     self._players = players
@@ -128,6 +130,8 @@ class Dolphin:
     self._menuing_controllers: list[tuple[melee.Controller, Player]] = []
     self._autostart = True
     self._connect_code = connect_code
+    self._teams_connect_code = teams_connect_code
+    self._desired_teams = desired_teams
 
     for port, player in players.items():
       controller = melee.Controller(
@@ -145,6 +149,8 @@ class Dolphin:
     )
 
     logging.info('Connecting to console...')
+    #import time
+    #time.sleep(6000)
     if not console.connect():
       import os
       logging.error(
@@ -170,8 +176,8 @@ class Dolphin:
 
     # The console object keeps track of how long your bot is taking to process frames
     #   And can warn you if it's taking too long
-    # if self.console.processingtime * 1000 > 12:
-    #     print("WARNING: Last frame took " + str(self.console.processingtime*1000) + "ms to process.")
+    #if self.console.processingtime * 1000 > 12:
+    #    print("WARNING: Last frame took " + str(self.console.processingtime*1000) + "ms to process.")
 
     menu_frames = 0
     while is_menu_state(gamestate):
@@ -181,6 +187,9 @@ class Dolphin:
             gamestate, controller,
             stage_selected=self._stage,
             connect_code=self._connect_code,
+            teams_connect_code=self._teams_connect_code,
+            desired_teams=self._desired_teams,
+            offline_teams=self._desired_teams and not self._teams_connect_code,
             autostart=self._autostart and i == 0 and menu_frames > 180,
             swag=False,
             costume=i,
@@ -206,6 +215,8 @@ class Dolphin:
               gamestate, controller,
               stage_selected=self._stage,
               connect_code=self._connect_code,
+              teams_connect_code=self._teams_connect_code,
+              desired_teams=self._desired_teams,
               autostart=self._autostart and i == 0 and menu_frames > 180,
               swag=False,
               costume=i,
@@ -289,4 +300,5 @@ DOLPHIN_FLAGS = dict(
     log_level=ff.Integer(3, 'Dolphin log level, defaults to WARN.'),
     log_types=ff.StringList(['SLIPPI'], 'Enabled logging categories.'),
     disable_audio=ff.Boolean(False, 'Disable dolphin audio.'),
+    force_lan_ip=ff.String(None, 'Force Slippi LAN IP'),
 )

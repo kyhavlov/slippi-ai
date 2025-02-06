@@ -24,16 +24,21 @@ from slippi_ai.types import Game, game_array_to_nt, Controller
 class PlayerMeta(NamedTuple):
   character: int
   name: str
+  team: int
 
   @classmethod
   def from_metadata(cls, player_meta: dict, raw: str) -> 'PlayerMeta':
     return cls(
         character=player_meta['character'],
-        name=nametags.name_from_metadata(player_meta, raw=raw))
+        name=nametags.name_from_metadata(player_meta, raw=raw),
+        team=player_meta['team'],
+    )
 
 class ReplayMeta(NamedTuple):
   p0: PlayerMeta
   p1: PlayerMeta
+  p2: PlayerMeta
+  p3: PlayerMeta
   stage: int
   slp_md5: str
 
@@ -43,18 +48,28 @@ class ReplayMeta(NamedTuple):
     return cls(
         p0=PlayerMeta.from_metadata(metadata['players'][0], raw),
         p1=PlayerMeta.from_metadata(metadata['players'][1], raw),
+        p2=PlayerMeta.from_metadata(metadata['players'][2], raw),
+        p3=PlayerMeta.from_metadata(metadata['players'][3], raw),
         stage=metadata['stage'],
         slp_md5=metadata['slp_md5'])
 
 class ReplayInfo(NamedTuple):
   path: str
-  swap: bool
   # We use empty tuple instead of None to play nicely with Tensorflow.
+  main_player_index: int
+  teammate_index: int
+  main_player_name: str
   meta: Union[ReplayMeta, Tuple[()]] = ()
 
   @property
   def main_player(self) -> PlayerMeta:
-    return self.meta.p1 if self.swap else self.meta.p0
+    if self.main_player_index == 0:
+      return self.meta.p0
+    elif self.main_player_index == 1:
+      return self.meta.p1
+    elif self.main_player_index == 2:
+      return self.meta.p2
+    return self.meta.p3
 
 class ChunkMeta(NamedTuple):
   start: int
@@ -107,7 +122,7 @@ class DatasetConfig:
   allowed_opponents: str = 'all'
   swap: bool = True  # yield swapped versions of each replay
   seed: int = 0
-
+  include2v2: bool = True
 
 def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
   replays = []
@@ -121,12 +136,17 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
   banned_counts = collections.Counter()
 
   for row in meta_rows:
+    if len(row['players']) != 4:
+      print("not a 2v2 game")
+      continue
+
     replay_meta = ReplayMeta.from_metadata(row)
     replay_path = os.path.join(config.data_dir, replay_meta.slp_md5)
 
     if not config.swap:
       is_banned = False
-      for name in [replay_meta.p0.name, replay_meta.p1.name]:
+      for name in [replay_meta.p0.name, replay_meta.p1.name,
+                   replay_meta.p2.name, replay_meta.p3.name]:
         if nametags.is_banned_name(name):
           banned_counts[name] += 1
           is_banned = True
@@ -135,28 +155,50 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
         continue
 
       if (replay_meta.p0.character not in allowed_characters
-          or replay_meta.p1.character not in allowed_opponents):
+          or replay_meta.p1.character not in allowed_opponents
+          or replay_meta.p2.character not in allowed_opponents
+          or replay_meta.p3.character not in allowed_opponents):
         continue
 
-      replays.append(ReplayInfo(replay_path, False, replay_meta))
+      replays.append(ReplayInfo(replay_path, 0, 0, replay_meta.p0.name, replay_meta))
 
       continue
 
-    for swap in [False, True]:
-      players = [replay_meta.p0, replay_meta.p1]
-      if swap:
-        players = reversed(players)
-      p0, p1 = players
+    # append a replay for each player index
+    for player_index in range(4):
+      players = [replay_meta.p0, replay_meta.p1, replay_meta.p2, replay_meta.p3]
 
-      if (p0.character not in allowed_characters
-          or p1.character not in allowed_opponents):
+      if players[player_index].character not in allowed_characters:
         continue
 
-      if nametags.is_banned_name(p0.name):
-        banned_counts[p0.name] += 1
+      # check whether any of the other characters are not allowed
+      if any(p.character not in allowed_opponents for i, p in enumerate(players) if i != player_index):
         continue
 
-      replays.append(ReplayInfo(replay_path, swap, replay_meta))
+      if nametags.is_banned_name(players[player_index].name):
+        banned_counts[players[player_index].name] += 1
+        continue
+
+      # make sure the player+character combo is in REQUIRED_PLAYERS
+      '''is_required_player = False
+      for codes, character in nametags.REQUIRED_PLAYERS:
+        if players[player_index].name in codes and players[player_index].character == character.value:
+          is_required_player = True
+          break
+
+      if not is_required_player:
+        continue'''
+
+      team_id = players[player_index].team
+      # find teammate index
+      teammate_index = next((i for i, p in enumerate(players) if p.team == team_id and i != player_index), -1)
+
+      if teammate_index != -1:
+        replays.append(ReplayInfo(replay_path, player_index, teammate_index, players[player_index].name, replay_meta))
+      else:
+        print("invalid team ids (3v1?): ", replay_path)
+
+      #print("added replay", row['name'], player_index, players[player_index].name, players[player_index].character, teammate_index)
 
   print('Banned names:', banned_counts)
 
@@ -177,6 +219,7 @@ def train_test_split(
     filenames_set = set(filenames)
     assert all(info.meta.slp_md5 in filenames_set for info in replays)
   else:
+    raise ValueError("Please provide a metadata file.")
     if not (config.allowed_characters == 'all'
             and config.allowed_opponents == 'all'):
       raise ValueError(
@@ -191,12 +234,8 @@ def train_test_split(
   # TODO: stable partition
   rng = random.Random(config.seed)
   rng.shuffle(replays)
-  num_test = int(config.test_ratio * len(replays))
-
-  train_replays = replays[num_test:]
-  test_replays = replays[:num_test]
-
-  return train_replays, test_replays
+  split_idx = int(len(replays) * config.test_ratio)
+  return replays[split_idx:], replays[:split_idx]
 
 name_to_character = {c.name.lower(): c for c in melee.Character}
 
@@ -233,8 +272,30 @@ class TrajectoryManager:
 
   def load_game(self, info: ReplayInfo) -> Game:
     game = read_table(info.path, compressed=self.compressed)
-    if info.swap:
-      game = swap_players(game)
+    # print('pre-swap: ', id(game.p0), id(game.p1), id(game.p2), id(game.p3), info.main_player_index, info.teammate_index)
+    game = swap_players(game, info)
+    # print('post-swap: ', id(game.p0), id(game.p1), id(game.p2), id(game.p3))
+
+    # check for nans in any player data
+    '''for i, player in enumerate([game.p0, game.p1, game.p2, game.p3]):
+      fields = [player.percent, player.facing, player.x, player.y, player.action,
+                player.invulnerable, player.character, player.jumps_left,
+                player.shield_strength, player.on_ground, player.controller.main_stick.x,
+                player.controller.main_stick.y, player.controller.c_stick.x, player.controller.c_stick.y,
+                player.controller.shoulder, player.controller.buttons.A, player.controller.buttons.B,
+                player.controller.buttons.X, player.controller.buttons.Y, player.controller.buttons.Z,
+                player.controller.buttons.L, player.controller.buttons.R, player.controller.buttons.D_UP]
+
+      was_nan = False
+      for j, field in enumerate(fields):
+        nan_present = np.any(np.isnan(field))
+        if nan_present:
+          nan_locs = np.argwhere(np.isnan(field)).flatten()
+          print(f'NAN in field {j} for player {i} in {info.path}: ', nan_locs)
+          was_nan = True
+
+      assert not was_nan'''
+
     return game
 
   def find_game(self):
@@ -270,8 +331,17 @@ class TrajectoryManager:
 
     return Chunk(states, ChunkMeta(start, end, self.info))
 
-def swap_players(game: Game) -> Game:
-  return game._replace(p0=game.p1, p1=game.p0)
+# swap info.main_player_index and info.teammate_index to p0 and p1
+# of game and put the other 2 players in p2 and p3
+def swap_players(game: Game, info: ReplayInfo) -> Game:
+  # make a list of the ports in 0-3 that aren't the main player or teammate
+  opponent_ports = [i for i in range(4) if i not in [info.main_player_index, info.teammate_index]]
+
+  p0 = getattr(game, f'p{info.main_player_index}')
+  p1 = getattr(game, f'p{info.teammate_index}')
+  p2 = getattr(game, f'p{opponent_ports[0]}')
+  p3 = getattr(game, f'p{opponent_ports[1]}')
+  return game._replace(p0=p0, p1=p1, p2=p2, p3=p3, stage=game.stage)
 
 def read_table(path: str, compressed: bool) -> Game:
   if compressed:
@@ -331,6 +401,7 @@ class DataSource:
 
   def is_allowed(self, game: Game) -> bool:
     # TODO: handle Zelda/Sheik transformation
+    return True
     return (
         game.p0.character[0] in self.allowed_characters
         and

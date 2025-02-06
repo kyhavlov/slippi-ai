@@ -54,6 +54,8 @@ class PlayerMeta(typing.NamedTuple):
   type: int
   # netplay info
   netplay: dict
+  # team id
+  team: int = -1
 
 class Metadata(typing.NamedTuple):
   lastFrame: int
@@ -90,21 +92,29 @@ def port_to_int(port: str) -> int:
   return int(port[1])
 
 def compute_winner(game: peppi_py.Game) -> Optional[int]:
-  if len(game.start['players']) > 2:
-    # TODO: handle more than 2 players
-    return None
-
   last_frame = game.frames[-1]
-  stock_counts = {}
-  for port, player in last_frame['ports'].items():
-    stock_counts[port] = player['leader']['post']['stocks'].as_py()
 
-  # s is 0 or None for eliminated players
-  losers = [p for p, s in stock_counts.items() if not s]
-  if losers:
-    winners = [p for p, s in stock_counts.items() if s]
-    if len(winners) == 1:
-      return port_to_int(winners[0])
+  if len(game.start['players']) == 4:
+    remaining_teams = set()
+    for port in range(len(game.start['players'])):
+      stocks_left = last_frame['ports'][port]['leader']['post']['stocks'].as_py()
+
+      if game.start['players'][port]['team'] is not None and stocks_left and stocks_left > 0:
+        remaining_teams.add(game.start['players'][port]['team']['color'])
+
+    if len(remaining_teams) == 1:
+      return remaining_teams.pop()
+
+    return None
+  elif len(game.start['players']) == 2:
+    player_stocks = []
+    for port in range(len(game.start['players'])):
+      player_stocks.append(last_frame['ports'][port]['leader']['post']['stocks'].as_py())
+
+    if player_stocks[0] > 0 and player_stocks[1] == 0:
+      return 0
+    if player_stocks[1] > 0 and player_stocks[0] == 0:
+      return 1
 
   return None
 
@@ -138,13 +148,18 @@ def get_metadata(game: peppi_py.Game) -> dict:
       leader = game.frames[0]['ports'][port]['leader']
       character = leader['post']['character'].as_py()
 
-    player_metas.append(dict(
+    meta = dict(
         port=port_to_int(port),
         character=character,
         type=0 if player['type'] == 'Human' else 1,
         name_tag=player['name_tag'],
         netplay=player.get('netplay'),
-    ))
+    )
+    if player['team']:
+      meta['team'] = player['team']['color']
+
+    player_metas.append(meta)
+
   result.update(
       num_players=len(player_metas),
       players=player_metas,
@@ -155,6 +170,8 @@ def get_metadata(game: peppi_py.Game) -> dict:
 
   # compute winner
   result['winner'] = compute_winner(game)
+
+  print("winner: {winner}, player count: {player_count}".format(winner=result['winner'], player_count=len(players)))
 
   return result
 
@@ -206,8 +223,8 @@ def is_training_replay(meta_dict: dict) -> tuple[bool, str]:
 
   if meta.slippi_version < MIN_SLP_VERSION:
     return False, 'slippi version too low'
-  if meta.num_players != 4:
-    return False, 'not 2v2'
+  #if meta.num_players != 4:
+  #  return False, 'not 2v2'
   if meta.lastFrame < MIN_FRAMES:
     return False, 'game length too short'
   if meta.timer != GAME_TIME:

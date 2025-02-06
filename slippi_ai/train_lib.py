@@ -104,8 +104,8 @@ class ValueFunctionConfig:
 class Config:
   runtime: RuntimeConfig = _field(RuntimeConfig)
 
-  dataset: data_lib.DatasetConfig = _field(data_lib.DatasetConfig)
   data: data_lib.DataConfig = _field(data_lib.DataConfig)
+  dataset: data_lib.DatasetConfig = _field(data_lib.DatasetConfig)
 
   learner: learner_lib.LearnerConfig = _field(learner_lib.LearnerConfig)
 
@@ -433,9 +433,7 @@ def train(config: Config):
     meta: data_lib.ChunkMeta = tf.nest.map_structure(utils.stack, *metas)
 
     # Name of the player we're imitating.
-    name = np.where(
-        meta.info.swap, meta.info.meta.p1.name, meta.info.meta.p0.name)
-    encoded_name = batch_encode_name(name)
+    encoded_name = batch_encode_name(meta.info.main_player_name)
     assert encoded_name.dtype == np.uint8
     assert encoded_name.shape == loss.shape
 

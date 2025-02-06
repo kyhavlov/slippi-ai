@@ -61,6 +61,9 @@ class FakeAgent:
   ) -> list[SampleOutputs]:
     return [self._sample_outputs] * len(states)
 
+  def warmup(self):
+    pass
+
 class BasicAgent:
   """Wraps a Policy to track hidden state."""
 
@@ -356,14 +359,15 @@ class AsyncDelayedAgent:
     self._batch_steps = batch_steps
     self._agent_kwargs = agent_kwargs
 
-    # Temporarily load the policy to get the delay/controller embedding.
-    policy = saving.load_policy_from_state(state)
-    self.embed_controller = policy.controller_embedding
+    config = state['config']
+    policy_delay = config['policy']['delay']
+    self.embed_controller = embed.get_controller_embedding(
+        **config['embed']['controller'])
 
-    self.delay = policy.delay - console_delay
+    self.delay = policy_delay - console_delay
     if self.delay < 0:
       raise ValueError(
-          f"Console delay ({console_delay}) cannot exceed policy delay ({policy.delay})."
+          f"Console delay ({console_delay}) cannot exceed policy delay ({policy_delay})."
       )
 
     # We create separate multiprocessing queues for input (state) and output (controllers).
@@ -509,6 +513,8 @@ class NameChangeMode(enum.Enum):
   CYCLE = enum.auto()
   RANDOM = enum.auto()
 
+from melee import enums
+
 class Agent:
   """Wraps a Policy to interact with Dolphin."""
 
@@ -516,6 +522,7 @@ class Agent:
       self,
       state: dict,
       opponent_port: int,
+      teammate_port: int,
       config: dict,  # use train.Config instead
       port: tp.Optional[int] = None,
       controller: tp.Optional[melee.Controller] = None,
@@ -530,9 +537,15 @@ class Agent:
     else:
       raise ValueError('Must provide either controller or port.')
 
-    self.players = (self._port, opponent_port)
+    self.players = (self._port, teammate_port)
+    self.teammate_port = teammate_port
+    # Append the two players that aren't ourself or our teammate
+    self.players += tuple(p for p in (1, 2, 3, 4) if p not in self.players)
+    #print("agent players: ", self._port, self.players)
     self.config = config
     self.name_change_mode = name_change_mode
+    self._pressed_start = False
+    self._dead_frame = 0
 
     self.name_map: dict[str, int] = state['name_map']
     rl_names = get_name_from_rl_state(state)
@@ -578,10 +591,26 @@ class Agent:
     action = utils.map_nt(lambda x: x[0], action)
     action = self._agent.embed_controller.decode(action)
     send_controller(self._controller, action)
+
+    # stock stealing hack
+    if game.p0.is_dead:
+      self._dead_frame += 1
+      if not self._pressed_start and self._dead_frame >= 120 and self.teammate_port in gamestate.players and gamestate.players[self.teammate_port].stock > 1:
+        logging.info("p0 is dead, stock stealing from %d, %s", self.teammate_port, gamestate.players)
+        logging.info("pressing start")
+        self._controller.press_button(enums.Button.BUTTON_START)
+        self._pressed_start = True
+      elif self._pressed_start:
+        self._controller.release_button(enums.Button.BUTTON_START)
+        self._pressed_start = False
+    else:
+      self._dead_frame = 0
+
     return sample_outputs
 
 def build_agent(
     opponent_port: int,
+    teammate_port: int = 0,
     name: str = nametags.DEFAULT_NAME,
     port: tp.Optional[int] = None,
     controller: tp.Optional[melee.Controller] = None,
@@ -597,6 +626,7 @@ def build_agent(
       controller=controller,
       port=port,
       opponent_port=opponent_port,
+      teammate_port=teammate_port,
       config=state['config'],
       # The rest are passed through to build_delayed_agent
       state=state,
