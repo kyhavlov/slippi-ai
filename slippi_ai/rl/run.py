@@ -8,8 +8,9 @@ if __name__ == '__main__':
   import fancyflags as ff
 
   import wandb
+  #import ray
 
-  from slippi_ai import flag_utils
+  from slippi_ai import flag_utils, eval_lib
   from slippi_ai.rl import run_lib
 
 
@@ -31,6 +32,11 @@ if __name__ == '__main__':
 
   def main(_):
     config = flag_utils.dataclass_from_dict(run_lib.Config, CONFIG.value)
+
+    #ray.init()
+    #ray.init(runtime_env={"working_dir": "./"})
+
+    #print(ray.cluster_resources())
 
     wandb_kwargs = dict(WANDB.value)
     wandb.init(

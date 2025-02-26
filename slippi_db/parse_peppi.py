@@ -47,7 +47,10 @@ def get_player(player: pa.StructArray) -> types.Player:
   position = post.field('position')
   pre = leader.field('pre')
 
+  # there doesn't seem to be a good way to check if a player is dead,
+  # so just check if the position data is missing since that's what happens after a player dies.
   dead = np.where(np.isnan(position.field('x')), True, False)
+
   char = get_post('character')[0].as_py()
 
   player = types.Player(

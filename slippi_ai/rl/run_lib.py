@@ -9,6 +9,9 @@ import typing as tp
 import numpy as np
 import tensorflow as tf
 import wandb
+from collections import defaultdict
+
+from melee import Character
 
 from slippi_ai import (
     dolphin as dolphin_lib,
@@ -53,6 +56,7 @@ class ActorConfig:
   rollout_length: int = 64
   num_envs: int = 1
   async_envs: bool = False
+  ray_envs: bool = False
   num_env_steps: int = 0
   inner_batch_size: int = 1
   gpu_inference: bool = True
@@ -136,6 +140,31 @@ class Config:
 DEFAULT_CONFIG = Config()
 DEFAULT_CONFIG.dolphin.console_timeout = 30
 
+CHARACTER_WEIGHTINGS = {
+      Character.FOX: 2000,
+      Character.FALCO: 1000,
+      Character.MARTH: 1000,
+      Character.SHEIK: 1000,
+      Character.PEACH: 1000,
+      Character.CPTFALCON: 1000,
+      Character.JIGGLYPUFF: 1000,
+      Character.PIKACHU: 200,
+      Character.YOSHI: 200,
+      Character.POPO: 100,
+      Character.SAMUS: 100,
+      Character.DK: 100,
+      Character.LUIGI: 100,
+      Character.DOC: 50,
+      Character.MARIO: 50,
+      Character.YLINK: 50,
+      Character.LINK: 50,
+      Character.GAMEANDWATCH: 50,
+      Character.NESS: 50,
+      Character.ROY: 50,
+      Character.MEWTWO: 50,
+      Character.PICHU: 50,
+      Character.BOWSER: 50,
+}
 
 class LearnerManager:
 
@@ -144,8 +173,8 @@ class LearnerManager:
       learner: learner_lib.Learner,
       config: Config,
       build_actor: tp.Callable[[], evaluators.RolloutWorker],
-      port: int,
-      enemy_port: int,
+      port: int = 1,
+      enemy_port: int = 2,
   ):
     self._config = config
     self._learner = learner
@@ -158,7 +187,7 @@ class LearnerManager:
 
     batch_size = config.actor.num_envs
     if config.opponent.should_train():
-      batch_size *= 2
+      batch_size *= 4
     self._hidden_state = learner.initial_state(batch_size)
 
     self.update_profiler = utils.Profiler(burnin=0)
@@ -183,12 +212,9 @@ class LearnerManager:
   def _rollout(self) -> tuple[evaluators.Trajectory, dict]:
     trajectories, timings = self.actor.rollout(self._unroll_length)
 
-    if self._config.opponent.should_train():
-      ports = [self._port, self._enemy_port]
-      trajectories = [trajectories[p] for p in ports]
-      trajectory = evaluators.Trajectory.batch(trajectories)
-    else:
-      trajectory = trajectories[self._port]
+    ports = [1, 2, 3, 4]
+    trajectories = [trajectories[p] for p in ports]
+    trajectory = evaluators.Trajectory.batch(trajectories)
 
     return trajectory, timings
 
@@ -199,9 +225,10 @@ class LearnerManager:
 
   def step(self, step: int, ppo_steps: int = None) -> tuple[list[evaluators.Trajectory], dict]:
     with self.update_profiler:
-      variables = {self._port: self._learner.policy_variables()}
-      if self._config.opponent.should_update(step):
-        variables[self._enemy_port] = self._learner.policy_variables()
+      variables = {}
+      for port in [1, 2, 3, 4]:
+        variables[port] = self._learner.policy_variables()
+      #variables[self._enemy_port] = self._learner.policy_variables()
       self.actor.update_variables(variables)
 
     with self.rollout_profiler:
@@ -214,6 +241,8 @@ class LearnerManager:
 
       actor_metrics = tf.nest.map_structure(
           lambda *xs: np.mean(xs), *actor_metrics)
+      
+      print("collected %d trajectories" % len(trajectories))
 
     with self.learner_profiler:
       self._hidden_state, metrics = self._learner.ppo(
@@ -359,9 +388,9 @@ def run(config: Config):
   learner.restore_from_imitation(rl_state['state'])
 
   PORT = 1
-  ENEMY_PORT = 2
+  #ENEMY_PORT = 2
 
-  dolphin_kwargs = dict(
+  '''dolphin_kwargs = dict(
       players={
           PORT: dolphin_lib.AI(),
           ENEMY_PORT: (
@@ -369,35 +398,39 @@ def run(config: Config):
               else dolphin_lib.AI()),
       },
       **config.dolphin.to_kwargs(),
+  )'''
+
+  # set ports 1-4 to AI
+  dolphin_kwargs = dict(
+      players={port: dolphin_lib.AI(character_weight_table=CHARACTER_WEIGHTINGS) for port in range(1, 5)},
+      **config.dolphin.to_kwargs(),
   )
 
   main_agent_kwargs = config.agent.get_kwargs()
   main_agent_kwargs['state'] = rl_state
-  agent_kwargs = {PORT: main_agent_kwargs}
-
+  #main_agent_kwargs['fake'] = True
   batch_size = config.actor.num_envs
 
-  if config.opponent.type is OpponentType.CPU:
-    names = itertools.islice(itertools.cycle(config.agent.name), batch_size)
-    main_agent_kwargs['name'] = list(names)
-  else:
-    if config.opponent.type is OpponentType.SELF:
-      opponent_kwargs = main_agent_kwargs.copy()
-      opponent_names = config.agent.name
-    elif config.opponent.type is OpponentType.OTHER:
-      opponent_kwargs = config.opponent.other.get_kwargs()
-      opponent_names = config.opponent.other.name
+  if config.opponent.type is not OpponentType.SELF:
+    raise NotImplementedError('Only self-play is currently supported.')
 
-    name_combinations = list(itertools.product(
-        config.agent.name, opponent_names))
-    name_combination_batch = list(itertools.islice(
-        itertools.cycle(name_combinations), batch_size))
+  # Generate all possible permutations of 4 players
+  all_permutations = list(itertools.product(config.agent.name, repeat=4))
+  num_permutations = len(all_permutations)
 
-    main_agent_names, opponent_names = zip(*name_combination_batch)
-    main_agent_kwargs['name'] = main_agent_names
-    opponent_kwargs['name'] = opponent_names
+  # Create the batch by cycling through the permutations in a round-robin manner
+  name_configuration_batch = [
+      all_permutations[(i * num_permutations // batch_size + i) % num_permutations]
+      for i in range(batch_size)
+  ]
 
-    agent_kwargs[ENEMY_PORT] = opponent_kwargs
+  agent_kwargs: tp.Mapping[int, dict] = {}
+  for i in range(1, 5):
+    agent_kwargs[i] = dict(
+        name=[name_configuration_batch[j][i-1] for j in range(batch_size)],
+        **main_agent_kwargs.copy(),
+    )
+    print("port names: ", i, agent_kwargs[i]['name'])
 
   env_kwargs = dict(swap_ports=False)
   if config.actor.async_envs:
@@ -405,12 +438,14 @@ def run(config: Config):
         num_steps=config.actor.num_env_steps,
         inner_batch_size=config.actor.inner_batch_size,
     )
+    print('num steps', config.actor.num_env_steps)
 
   build_actor = lambda: evaluators.RolloutWorker(
       agent_kwargs=agent_kwargs,
       dolphin_kwargs=dolphin_kwargs,
       env_kwargs=env_kwargs,
       num_envs=config.actor.num_envs,
+      use_ray_envs=config.actor.ray_envs,
       async_envs=config.actor.async_envs,
       use_gpu=config.actor.gpu_inference,
       use_fake_envs=config.actor.use_fake_envs,
@@ -420,8 +455,8 @@ def run(config: Config):
   learner_manager = LearnerManager(
       config=config,
       learner=learner,
-      port=PORT,
-      enemy_port=ENEMY_PORT,
+      #port=PORT,
+      #enemy_port=ENEMY_PORT,
       build_actor=build_actor,
   )
 
@@ -432,7 +467,7 @@ def run(config: Config):
   rev = lambda x: x[::-1]
 
   if config.opponent.type is OpponentType.SELF:
-    ordered_name_combinations: list[tuple[str, str]] = []
+    '''ordered_name_combinations: list[tuple[str, str]] = []
     for i, n1 in enumerate(config.agent.name):
       for j, n2 in enumerate(config.agent.name):
         if i < j:
@@ -446,28 +481,95 @@ def run(config: Config):
         name_combination: [] for name_combination in ordered_name_combinations
     }
 
-    for i, name_combination in enumerate(name_combination_batch):
+    for i, name_combination in enumerate(name_configuration_batch):
       if name_combination in ordered_name_combination_indices:
         ordered_name_combination_indices[name_combination].append(i)
       elif rev(name_combination) in reversed_name_combination_indices:
         reversed_name_combination_indices[rev(name_combination)].append(i)
       # We don't log mirror matches as the ko_diff will be 0.
 
-    def get_matchup_stats(states: Game) -> dict:
-      tm_kos = reward.compute_rewards(states, damage_ratio=0)  # [T, P, B]
-      bm_kos = tm_kos.mean(axis=(0, 1))  # [B]
+    print('ordered_name_combinations:', ordered_name_combinations)
+    print('ordered_name_combination_indices:', ordered_name_combination_indices)
+    print('reversed_name_combination_indices:', reversed_name_combination_indices)'''
 
-      stats = {}
-      for name_combination, indices in ordered_name_combination_indices.items():
-        key = '_'.join(map(concise_name, name_combination))
-        ko_diff = np.concatenate([
-            bm_kos[indices],
-            -bm_kos[reversed_name_combination_indices[name_combination]],
-        ], axis=0).mean() * MINUTES_PER_FRAME
-        stats[key] = dict(ko_diff=ko_diff)
+    def get_player_stats(states: Game) -> dict:
+      """
+      Computes the mean KO differential for each player across a batch of trajectories.
+      Expects:
+        - states: an array of shape [T, B] where each element is a Game namedtuple with p0, p1, p2, p3 fields.
+      Uses the global variable name_configuration_batch (a list of length B where each element is a 4-tuple
+      of player names corresponding to positions p0, p1, p2, p3).
 
-      # TODO: log reward hacking stats
+      For each environment (rollout) in the batch:
+        * Compute the per-player mean reward (pm_kos) over time.
+        * Calculate team averages for team1 (positions 0 and 1) and team2 (positions 2 and 3).
+        * For each player slot, compute the KO differential:
+              diff = (team_avg - opponent_avg) * MINUTES_PER_FRAME
+          where team_avg is the average reward for the player's own team and opponent_avg is the other team's.
+        * Use the corresponding value from name_configuration_batch as the player's unique identifier.
+      Finally, average the differences across all environments where the player appears.
+      """
+      # Compute rewards over time. tm_kos: [T, P, B]
+      tm_kos = reward.compute_rewards(states, damage_ratio=0)
+      # Average over time for each player and each environment. pm_kos: [4, B]
+      pm_kos = tm_kos.mean(axis=0)
+      B = pm_kos.shape[1]
 
+      player_diffs = defaultdict(list)
+
+      # Loop over each environment in the batch.
+      for b in range(B):
+          # Compute team averages for environment b.
+          team1_avg = np.mean([pm_kos[0, b], pm_kos[1, b]])
+          team2_avg = np.mean([pm_kos[2, b], pm_kos[3, b]])
+          
+          # Lookup the 4-tuple of player names for environment b from the global variable.
+          names_tuple = name_configuration_batch[b]
+          for p_idx in range(4):
+              player_name = names_tuple[p_idx]
+              # Compute KO differential for the player.
+              if p_idx in (0, 1):
+                  diff = (team1_avg - team2_avg) * MINUTES_PER_FRAME
+              else:
+                  diff = (team2_avg - team1_avg) * MINUTES_PER_FRAME
+              player_diffs[player_name].append(diff)
+
+      # Average the KO differentials for each player over all environments.
+      stats = {player: float(np.mean(diffs)) for player, diffs in player_diffs.items()}
+      return stats
+    
+    def get_character_stats(states: Game) -> dict:
+      """
+      Computes the mean knockouts for each character across a batch of trajectories.
+      Expects `states` to be of type Game, where each field (p0, p1, p2, p3) is a Player with attributes
+      (including 'character') stored as np.ndarrays of shape [T, B] (T timesteps, B environments).
+      
+      For each environment:
+        - Computes each player's mean KO reward.
+        - Retrieves the player's character from the first timestep using:
+              player = getattr(states, f'p{p_idx}')
+              player_character = player.character[0, b]
+        - Converts the character code to a readable melee.Character name.
+      
+      Finally, aggregates the KO values per character across all environments.
+      """
+      tm_kos = reward.compute_rewards(states, damage_ratio=0)
+      pm_kos = tm_kos.mean(axis=0)  # shape: [4, B]
+      B = pm_kos.shape[1]
+      
+      char_kos = defaultdict(list)
+      
+      for b in range(B):
+        for p_idx in range(4):
+          # Retrieve the Player object from states.
+          player = getattr(states, f'p{p_idx}')
+          # Access the character code from the player's 'character' ndarray.
+          player_character = player.character[0, b]
+          char_enum = Character(int(player_character))
+          char_name = char_enum.name  # Get the readable name.
+          char_kos[char_name].append(pm_kos[p_idx, b])
+      
+      stats = {char: float(np.mean(values)) for char, values in char_kos.items()}
       return stats
 
   # TODO: log per-name stats for CPU and OTHER opponents
@@ -503,14 +605,20 @@ def run(config: Config):
         lambda *xs: np.stack(xs, axis=1),
         *[t.states for t in trajectories])
 
-    p0_stats = reward.player_stats(states.p0, states.p1, states.stage)
+    #p0_stats = reward.player_stats(states.p0, states.p1, states.stage)
+    p0_stats = reward.team_stats([states.p0, states.p1], [states.p2, states.p3], states.stage)
 
-    if config.opponent.type is OpponentType.SELF:
+    '''if config.opponent.type is OpponentType.SELF:
       # The second half of the batch just has the players reversed.
       deduplicated_states = utils.map_single_structure(
           lambda x: x[:, :, :batch_size], states)
-      matchup_stats = get_matchup_stats(deduplicated_states)
-      metrics.update(by_name=matchup_stats)
+      player_stats = get_player_stats(deduplicated_states)
+      metrics.update(player_stats=player_stats)
+      print("player stats: ", player_stats)
+
+      character_stats = get_character_stats(deduplicated_states)
+      metrics.update(character_stats=character_stats)
+      print("character stats: ", character_stats)'''
 
     metrics.update(
         timings=timings,
@@ -526,7 +634,7 @@ def run(config: Config):
     if metrics is None:
       return
 
-    print('\nStep:', step)
+    logging.info('\nStep: ' + str(step))
 
     timings: dict = metrics['timings']
     timing_str = ', '.join(
@@ -586,8 +694,9 @@ def run(config: Config):
       logging.info('Optimizer burnin')
 
       learning_rate.assign(0)
-      for _ in range(config.optimizer_burnin_steps // steps_per_epoch):
+      for i in range(config.optimizer_burnin_steps // steps_per_epoch):
         learner_manager.step(0, ppo_steps=1)
+        print("optimizer burnin step complete: ", i)
       learning_rate.assign(config.learner.learning_rate)
 
       logging.info('Value function burnin')

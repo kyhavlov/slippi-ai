@@ -63,7 +63,9 @@ class RolloutWorker:
       use_gpu: bool = False,
       damage_ratio: float = 0,  # For rewards.
       use_fake_envs: bool = False,
+      use_ray_envs: bool = False,
   ):
+    print("use_gpu = ", use_gpu)
     self._agents = {
         port: eval_lib.build_delayed_agent(
             console_delay=dolphin_kwargs['online_delay'],
@@ -89,6 +91,7 @@ class RolloutWorker:
     self._use_fake_envs = use_fake_envs
     self._env_kwargs = env_kwargs
     self._async_envs = async_envs
+    self._use_ray_envs = use_ray_envs
     self._build_env()
 
     self._damage_ratio = damage_ratio
@@ -126,8 +129,11 @@ class RolloutWorker:
       self._push_actions()
 
   def _build_env(self):
-    if self._use_fake_envs:
-      self._env = env_lib.ReplayBatchedEnvironment(
+    if self._use_ray_envs:
+      self._env = env_lib.RayBatchedEnvironment(
+          self._num_envs, self._dolphin_kwargs, **self._env_kwargs)
+    elif self._use_fake_envs:
+      self._env = env_lib.FakeBatchedEnvironment(
           self._num_envs, players=list(self._agents))
     else:
       if not self._async_envs:

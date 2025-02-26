@@ -29,6 +29,7 @@ from absl import app
 from absl import flags
 import fancyflags as ff
 
+from melee import Character
 from slippi_ai import eval_lib, flag_utils, utils
 from slippi_ai import dolphin as dolphin_lib
 
@@ -40,11 +41,11 @@ player_flags['ai']['async_inference'] = ff.Boolean(True)
 PLAYERS = {p: ff.DEFINE_dict(f"p{p}", **player_flags) for p in PORTS}
 
 dolphin_config = dolphin_lib.DolphinConfig(
-    headless=False,
+    headless=True,
     infinite_time=False,
     path=os.environ.get('DOLPHIN_PATH'),
     iso=os.environ.get('ISO_PATH'),
-    #save_replays=True,
+    save_replays=True,
     disable_audio=True,
     blocking_input=True,
     #replay_dir="/mnt/c/Users/kyleh/git/slippi-ai/bot-replays",
@@ -54,6 +55,32 @@ DOLPHIN = ff.DEFINE_dict(
     'dolphin', **flag_utils.get_flags_from_default(dolphin_config))
 
 FLAGS = flags.FLAGS
+
+CHARACTER_WEIGHTINGS = {
+      Character.FOX: 2000,
+      Character.FALCO: 500,
+      Character.MARTH: 500,
+      Character.SHEIK: 750,
+      Character.PEACH: 1000,
+      Character.CPTFALCON: 500,
+      Character.JIGGLYPUFF: 500,
+      Character.PIKACHU: 200,
+      Character.YOSHI: 200,
+      Character.POPO: 50,
+      Character.SAMUS: 50,
+      Character.DK: 50,
+      Character.LUIGI: 50,
+      Character.DOC: 25,
+      Character.MARIO: 25,
+      Character.YLINK: 25,
+      Character.LINK: 25,
+      Character.GAMEANDWATCH: 25,
+      Character.NESS: 5,
+      Character.ROY: 5,
+      Character.MEWTWO: 5,
+      Character.PICHU: 5,
+      Character.BOWSER: 5,
+}
 
 def main(_):
   eval_lib.disable_gpus()
@@ -75,6 +102,7 @@ def main(_):
           console_delay=DOLPHIN.value['online_delay'],
           **PLAYERS[port].value['ai'],
       )
+      #player.character_weight_table = CHARACTER_WEIGHTINGS
       agent.start()
       agents.append(agent)
 
@@ -110,6 +138,9 @@ def main(_):
         logging.info(f'step_time: {step_timer.mean_time():.3f}')
         #for i, player in gamestate.players:
         #  logging.info(f'gamestate: {pformat(player)}')
+        for port, player in gamestate.players.items():
+          logging.info(f'port {port} x: {player.position.x} y: {player.position.y}')
+
   except BaseException as e:
     print(f"exception: {repr(e)}\n{traceback.format_exc()}")
   finally:

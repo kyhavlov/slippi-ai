@@ -173,8 +173,6 @@ def main(_):
     rows = [row for row in rows if row.get('winner') is not None]
     print(f"Filtered to {len(rows)} games with a winner.")
 
-  return
-
   make_tar = MAKE_TAR.value
 
   if make_tar:

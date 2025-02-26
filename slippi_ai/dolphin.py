@@ -2,6 +2,7 @@ import abc
 import atexit
 import dataclasses
 import logging
+import random
 from typing import Dict, Mapping, Optional, Iterator
 
 import fancyflags as ff
@@ -43,6 +44,14 @@ class CPU(Player):
 @dataclasses.dataclass
 class AI(Player):
   character: melee.Character = melee.Character.FOX
+  character_weight_table: Optional[dict[melee.Character, int]] = None
+
+  def shuffle_character(self):
+    if self.character_weight_table is not None:
+      self.character = random.choices(
+          list(self.character_weight_table.keys()),
+          weights=list(self.character_weight_table.values()),
+      )[0]
 
   def controller_type(self) -> melee.ControllerType:
     return melee.ControllerType.STANDARD
@@ -111,6 +120,22 @@ class Dolphin:
 
     self.menu_helper = melee.MenuHelper()
 
+    print("blocking_input ", blocking_input)
+    print("polling_mode ", console_timeout is not None)
+    print("polling_timeout ", console_timeout)
+    print("console_kwargs ", console_kwargs)
+
+    '''
+    yes: <Character.CPTFALCON: 2>, <Character.MARTH: 18>, <Character.FOX: 1>, <Character.DK: 3>
+    yes: <Character.JIGGLYPUFF: 15>, <Character.CPTFALCON: 2>, <Character.FOX: 1>, <Character.MARTH: 18>
+    yes: <Character.CPTFALCON: 2>, <Character.JIGGLYPUFF: 15>, <Character.MARTH: 18>, <Character.FOX: 1>
+    no: <Character.PEACH: 9>, <Character.JIGGLYPUFF: 15>, <Character.SHEIK: 7>, <Character.PEACH: 9>
+    yes: <Character.SHEIK: 7>, <Character.FOX: 1>, <Character.FOX: 1>, <Character.JIGGLYPUFF: 15> (pokemon)
+    yes: <Character.YOSHI: 14>, <Character.MARTH: 18>, <Character.FOX: 1>, <Character.CPTFALCON: 2> (dreamland)
+    yes: <Character.FALCO: 22>, <Character.MARTH: 18>, <Character.SHEIK: 7>, <Character.JIGGLYPUFF: 15> (battlefield)
+    yes: <Character.JIGGLYPUFF: 15>, <Character.MARTH: 18>, <Character.CPTFALCON: 2>, <Character.FALCO: 22> (dreamland)
+    '''
+
     console = melee.Console(
         path=path,
         online_delay=online_delay,
@@ -132,6 +157,7 @@ class Dolphin:
     self._connect_code = connect_code
     self._teams_connect_code = teams_connect_code
     self._desired_teams = desired_teams
+    self._prev_menu_state = False
 
     for port, player in players.items():
       controller = melee.Controller(
@@ -178,6 +204,20 @@ class Dolphin:
     #   And can warn you if it's taking too long
     #if self.console.processingtime * 1000 > 12:
     #    print("WARNING: Last frame took " + str(self.console.processingtime*1000) + "ms to process.")
+
+    if is_menu_state(gamestate) and not self._prev_menu_state:
+      #print("menu state transition, shuffling characters")
+      self.menu_helper.done_selecting_character = {1: False, 2: False, 3: False, 4: False}
+
+      new_characters = []
+      for i, (controller, player) in enumerate(self._menuing_controllers):
+        if isinstance(player, AI):
+          player.shuffle_character()
+          new_characters.append(player.character)
+      
+      print(f"shuffled characters for next game: {new_characters}")
+
+    self._prev_menu_state = is_menu_state(gamestate)
 
     menu_frames = 0
     while is_menu_state(gamestate):

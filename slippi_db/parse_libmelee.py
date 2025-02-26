@@ -73,7 +73,17 @@ def get_game(
     else:
       state = melee.PlayerState()
       state.action = melee.Action.DEAD_DOWN
-      players[f'p{i}'] = get_player(state)
+      player = get_player(state)
+      players[f'p{i}'] = player._replace(is_dead=True)
+
+  if len(game.players) == 0:
+    print("================== NO PLAYERS LEFT IN GAME ====================")
+
+  # clone p2 or p3 if one of the opponents is dead
+  if np.sum(players['p2'].is_dead) > 0:
+    players['p2'] = players['p3']
+  elif np.sum(players['p3'].is_dead) > 0:
+    players['p3'] = players['p2']
 
   return Game(
       stage=game.stage.value,

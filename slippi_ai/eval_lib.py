@@ -499,6 +499,8 @@ def build_delayed_agent(
   else:
     name_code = [get_name_code(state, n) for n in name]
 
+  print("building agent, async = ", async_inference)
+
   agent_class = AsyncDelayedAgent if async_inference else DelayedAgent
   return agent_class(
       state=state,

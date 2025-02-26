@@ -28,10 +28,12 @@ class PlayerMeta(NamedTuple):
 
   @classmethod
   def from_metadata(cls, player_meta: dict, raw: str) -> 'PlayerMeta':
+    team = 0 if 'team' not in player_meta else player_meta['team']
+
     return cls(
         character=player_meta['character'],
         name=nametags.name_from_metadata(player_meta, raw=raw),
-        team=player_meta['team'],
+        team=team,
     )
 
 class ReplayMeta(NamedTuple):
@@ -41,17 +43,30 @@ class ReplayMeta(NamedTuple):
   p3: PlayerMeta
   stage: int
   slp_md5: str
+  is_singles: bool = False
 
   @classmethod
   def from_metadata(cls, metadata: dict) -> 'ReplayMeta':
     raw = metadata['raw']
+    p0=PlayerMeta.from_metadata(metadata['players'][0], raw)
+    p1=PlayerMeta.from_metadata(metadata['players'][1], raw)
+    if len(metadata['players']) == 4:
+      p2=PlayerMeta.from_metadata(metadata['players'][2], raw)
+      p3=PlayerMeta.from_metadata(metadata['players'][3], raw)
+      is_singles = False
+    else:
+      p2 = PlayerMeta(character=0, name='', team=0)
+      p3 = PlayerMeta(character=0, name='', team=0)
+      is_singles = True
+
     return cls(
-        p0=PlayerMeta.from_metadata(metadata['players'][0], raw),
-        p1=PlayerMeta.from_metadata(metadata['players'][1], raw),
-        p2=PlayerMeta.from_metadata(metadata['players'][2], raw),
-        p3=PlayerMeta.from_metadata(metadata['players'][3], raw),
+        p0=p0,
+        p1=p1,
+        p2=p2,
+        p3=p3,
         stage=metadata['stage'],
-        slp_md5=metadata['slp_md5'])
+        slp_md5=metadata['slp_md5'],
+        is_singles=is_singles)
 
 class ReplayInfo(NamedTuple):
   path: str

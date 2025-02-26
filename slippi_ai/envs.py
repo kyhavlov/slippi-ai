@@ -6,12 +6,13 @@ from multiprocessing.connection import Connection
 import traceback
 import typing as tp
 from typing import Mapping, Optional
+import time
 
 import numpy as np
 import portpicker
 
 from melee.slippstream import EnetDisconnected
-from melee import GameState, Stage
+from melee import GameState, Stage, enums
 
 from slippi_ai import dolphin, utils
 from slippi_ai.controller_lib import send_controller
@@ -21,6 +22,13 @@ from slippi_db.parse_libmelee import get_game
 
 Port = int
 Controllers = Mapping[Port, Controller]
+
+DOUBLES_PORT_MAPPINGS: Mapping[int, list[int]] = {
+    1: (1, 4, 2, 3),
+    2: (2, 3, 1, 4),
+    3: (3, 2, 4, 1),
+    4: (4, 1, 3, 2),
+}
 
 def is_initial_frame(gamestate: GameState) -> bool:
   return gamestate.frame == -123
@@ -39,8 +47,11 @@ class Environment:
       check_controller_outputs: bool = False,
   ):
     players: dict[Port, dolphin.Player] = dolphin_kwargs['players']
-    if len(players) != 2:
-      raise ValueError('Environment requires exactly 2 players.')
+    if len(players) != 4:
+      raise ValueError('Environment requires exactly 4 players.')
+    
+    logging.info("creating environment on %s" % socket.gethostname())
+    print("Creating environment on ", socket.gethostname())
 
     ports = list(players)
     actual_ports = list(reversed(ports)) if swap_ports else ports
@@ -52,14 +63,17 @@ class Environment:
         for port, actual_port in self.port_to_actual.items()
     }
 
-    actual_dolphin_kwargs = dict(dolphin_kwargs, players=actual_players)
+    actual_dolphin_kwargs = dict(dolphin_kwargs, 
+                                 players=actual_players,
+                                 desired_teams={1: 0, 2: 1, 3: 1, 4: 0})
     self._dolphin = dolphin.Dolphin(**actual_dolphin_kwargs)
+    self._dead_frame = {port: 0 for port in ports}
 
-    self._opponents: Mapping[int, int] = {}
+    '''self._opponents: Mapping[int, int] = {}
 
     for port, opponent_port in zip(actual_ports, reversed(actual_ports)):
       if isinstance(actual_players[port], dolphin.AI):
-        self._opponents[port] = opponent_port
+        self._opponents[port] = opponent_port'''
 
     self._prev_state: Optional[GameState] = None
 
@@ -73,9 +87,13 @@ class Environment:
     needs_reset = is_initial_frame(self._prev_state)
 
     games = {}
-    for actual_port, opponent in self._opponents.items():
+    '''for actual_port, opponent in self._opponents.items():
       port = self.port_from_actual[actual_port]
-      games[port] = get_game(self._prev_state, (actual_port, opponent))
+      games[port] = get_game(self._prev_state, (actual_port, opponent))'''
+    
+    # return one game per port in DOUBLES_PORT_MAPPINGS
+    for port, ports in DOUBLES_PORT_MAPPINGS.items():
+      games[port] = get_game(self._prev_state, ports)
 
     return EnvOutput(games, needs_reset)
 
@@ -87,13 +105,41 @@ class Environment:
     controllers: Controllers,
   ) -> EnvOutput:
     """Send controllers for each AI. Return the next state."""
+    #print("controllers: ", controllers)
+    #start = time.perf_counter()
 
     for port, controller in controllers.items():
       actual_port = self.port_to_actual[port]
       send_controller(self._dolphin.controllers[actual_port], controller)
 
+    #controller_timing = time.perf_counter() - start
+
     # TODO: compute reward?
     self._prev_state = self._dolphin.step()
+
+    #step_timing = time.perf_counter() - start
+
+    #logging.info("sent controllers for frame %d", self._prev_state.frame)
+
+    # stock stealing hack
+    for port, controller in controllers.items():
+      player_port = port
+      teammate_port = DOUBLES_PORT_MAPPINGS[port][1]
+
+      if player_port not in self._prev_state.players or self._prev_state.players[player_port].stock == 0:
+        self._dead_frame[port] += 1
+        if self._dead_frame[port] >= 120 and teammate_port in self._prev_state.players and self._prev_state.players[teammate_port].stock > 1:
+          logging.info("port %d is dead, stock stealing from %d, %s", player_port, teammate_port, self._prev_state.players)
+          logging.info("pressing start")
+          self._dolphin.controllers[player_port].press_button(enums.Button.BUTTON_START)
+      else:
+        self._dolphin.controllers[player_port].release_button(enums.Button.BUTTON_START)
+        self._dead_frame[port] = 0
+
+    '''end = time.perf_counter()
+
+    print("step timing: ", end - start)'''
+
     return self.current_state()
 
   def multi_step(
@@ -282,6 +328,7 @@ def _run_env(
   env = None
   try:
     env = build_environment(**build_env_kwargs)
+    #env = FakeBatchedEnvironment(num_envs=1, players=[1, 2, 3, 4])
 
     # Push initial env state.
     initial_state = env.current_state()
@@ -401,8 +448,14 @@ class AsyncEnvMP:
 
   def recv(self) -> EnvOutput:
     # TODO: ensure that enough data has been pushed?
+    recv_profiler = utils.Profiler()
     try:
       output = self._recv()
+      '''with recv_profiler:
+        output = self._recv()
+
+      print("recv time: ", recv_profiler.mean_time())'''
+
     except ConnectionResetError as e:
       self.ensure_stopped()
       raise EnvError("run_env process died")
@@ -507,6 +560,8 @@ class AsyncBatchedEnvironmentMP:
       self._flush()
 
   def _receive(self):
+    #start = time.perf_counter()
+
     if self._num_steps == 0:
       outputs = [env.recv() for env in self._envs]
       output = utils.concat_nest_nt(outputs)
@@ -518,6 +573,243 @@ class AsyncBatchedEnvironmentMP:
       for batch in time_major:
         self._state_queue.appendleft(utils.concat_nest_nt(batch))
         self._num_in_transit -= 1
+
+    #total = time.perf_counter() - start
+    #print("receive time: ", total)
+
+  def pop(self) -> EnvOutput:
+    if not self._state_queue:
+      self._receive()
+    return self._state_queue.pop()
+
+  def peek_n(self, n: int) -> list[EnvOutput]:
+    while len(self._state_queue) < n:
+      self._receive()
+    return utils.peek_deque(self._state_queue, n)
+
+  def peek(self) -> EnvOutput:
+    if not self._state_queue:
+      self._receive()
+    return self._state_queue[-1]
+
+import ray
+import socket
+
+@ray.remote(num_cpus=1.0)
+class RayEnvActor:
+    def __init__(self, dolphin_kwargs, **env_kwargs):
+        # Wrap your existing environment creation
+        print("actor creation on ", socket.gethostname())
+        self._env = build_environment(
+            num_envs=0,
+            dolphin_kwargs=dolphin_kwargs,
+            **env_kwargs
+        )
+
+    def current_state(self):
+        return self._env.current_state()
+    
+    def step(self, controllers):
+        return self._env.step(controllers)
+
+    def multi_step(self, controllers):
+        return self._env.multi_step(controllers)
+
+    def stop(self):
+        self._env.stop()
+
+    def reset(self):
+        self._env._reset_env()
+        # Rebuild the environment if needed
+
+class RayBatchedEnvironment:
+  """A set of remote environments with batched input/output."""
+
+  def __init__(
+      self,
+      num_envs: int,
+      dolphin_kwargs: dict,
+      num_steps: int = 0,
+      inner_batch_size: int = 1,
+      slippi_ports: Optional[list[int]] = None,
+      num_retries: int = 2,
+      swap_ports: bool = True,  # Swap ports on half of the environments.
+  ):
+    self._dolphin_kwargs = dolphin_kwargs
+    slippi_ports = slippi_ports or utils.find_open_udp_ports(num_envs)
+
+    if swap_ports and num_envs % 2 != 0:
+      raise ValueError('swap_ports=True requires an even number of environments.')
+
+    envs: list[RayEnvActor] = []
+    for i in range(num_envs):
+      dolphin_kwargs_i = dolphin_kwargs.copy()
+      dolphin_kwargs_i.update(slippi_port=slippi_ports[i])
+      env = RayEnvActor.remote(
+          dolphin_kwargs_i, num_retries=num_retries)
+      envs.append(env)
+
+    self._envs = envs
+
+    # Optional "async" interface for compatibility with the Async* Envs.
+    self._output_queue = collections.deque()
+    self._output_queue.appendleft(self.current_state())
+
+  @property
+  def num_steps(self) -> int:
+    return 1
+
+  def stop(self):
+    for env in self._envs:
+      env.stop.remote()
+
+  @contextlib.contextmanager
+  def run(self):
+    try:
+      yield self
+    finally:
+      self.stop()
+
+  def current_state(self) -> EnvOutput:
+    state_refs = [env.current_state.remote() for env in self._envs]
+    states = ray.get(state_refs)
+    return utils.batch_nest_nt(states)
+
+  def multi_current_state(self) -> list[EnvOutput]:
+    return [self.current_state()]
+
+  def step(
+    self,
+    controllers: Controllers,
+  ) -> EnvOutput:
+    get_action = lambda i: utils.map_single_structure(
+        lambda x: x[i], controllers)
+
+    result_refs = [
+        env.step.remote(get_action(i))
+        for i, env in enumerate(self._envs)
+    ]
+    results = ray.get(result_refs)
+    return utils.batch_nest_nt(results)
+
+  def multi_step(
+    self,
+    controllers: list[Controllers],
+  ) -> list[EnvOutput]:
+    """Batched step to reduce communication overhead."""
+    return [self.step(c) for c in controllers]
+
+  def push(self, controllers: Controllers):
+    self._output_queue.appendleft(self.step(controllers))
+
+  def pop(self) -> EnvOutput:
+    return self._output_queue.pop()
+
+  def peek(self) -> EnvOutput:
+    return self._output_queue[-1]
+
+class AsyncBatchedEnvironmentRay:
+  """A set of asynchronous Ray-based environments with batched input/output."""
+
+  def __init__(
+      self,
+      num_envs: int,
+      dolphin_kwargs: dict,
+      num_steps: int = 0,
+      inner_batch_size: int = 1,
+      num_retries: int = 2,
+      swap_ports: bool = False,
+  ):
+    if num_envs % inner_batch_size != 0:
+      raise ValueError(
+          f'num_envs={num_envs} must be divisible by '
+          f'inner_batch_size={inner_batch_size}')
+
+    print("initializing async ray env")
+    self._total_batch_size = num_envs
+    self._outer_batch_size = num_envs // inner_batch_size
+    self._inner_batch_size = inner_batch_size
+    self._slice = lambda i, x: x[i * inner_batch_size:(i + 1) * inner_batch_size]
+
+    self._dolphin_kwargs = dolphin_kwargs
+
+    self._envs: list[RayEnvActor] = []
+    #slippi_ports = utils.find_open_udp_ports(num_envs)
+    for i in range(self._outer_batch_size):
+      env = RayEnvActor.remote(
+          dolphin_kwargs=dolphin_kwargs,
+          swap_ports=swap_ports,
+      )
+      self._envs.append(env)
+
+    self._num_steps = num_steps
+    self._action_queue: list[Controllers] = []
+    self._state_queue = collections.deque()
+    self._num_in_transit = 1  # take into account initial state
+
+  def qsize(self):
+    return self._num_in_transit + len(self._state_queue)
+
+  @property
+  def num_steps(self) -> int:
+    return self._num_steps or 1  # 0 means 1
+
+  def stop(self):
+    # First initiate stop asynchronously for all envs.
+    for env in self._envs:
+      env.stop.remote()
+
+  def __del__(self):
+    self.stop()
+
+  @contextlib.contextmanager
+  def run(self):
+    try:
+      yield self
+    finally:
+      self.stop()
+
+  def _flush(self):
+    # Returns a time-indexed list of controller dictionaries.
+    get_action = lambda i: utils.map_single_structure(
+        lambda x: self._slice(i, x), self._action_queue)
+
+    for i, env in enumerate(self._envs):
+      env.multi_step.remote(get_action(i))
+
+    self._num_in_transit += len(self._action_queue)
+    self._action_queue.clear()
+
+  def push(self, controllers: Controllers):
+    if self._num_steps == 0:
+      get_action = lambda i: utils.map_single_structure(
+          lambda x: self._slice(i, x), controllers)
+      for i, env in enumerate(self._envs):
+        env.multi_step.remote(get_action(i))
+      self._num_in_transit += 1
+      return
+
+    self._action_queue.append(controllers)
+    if len(self._action_queue) == self._num_steps:
+      self._flush()
+
+  def _receive(self):
+    print("receive start")
+    if self._num_steps == 0:
+      output_refs = [env.current_state.remote() for env in self._envs]
+      outputs = ray.get(output_refs)
+      output = utils.concat_nest_nt(outputs)
+      self._state_queue.appendleft(output)
+      self._num_in_transit -= 1
+    else:
+      batch_refs = [env.current_state.remote() for env in self._envs]
+      batch_major = ray.get(batch_refs)
+      time_major = zip(*batch_major)
+      for batch in time_major:
+        self._state_queue.appendleft(utils.concat_nest_nt(batch))
+        self._num_in_transit -= 1
+
+    print("receive end")
 
   def pop(self) -> EnvOutput:
     if not self._state_queue:
@@ -556,6 +848,9 @@ class FakeBatchedEnvironment:
 
   def stop(self):
     pass
+
+  def current_state(self) -> EnvOutput:
+    return self._dummy_output
 
   def pop(self) -> EnvOutput:
     return self._output_queue.popleft()
