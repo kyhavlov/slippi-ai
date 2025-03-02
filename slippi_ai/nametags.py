@@ -55,7 +55,7 @@ name_groups = [
   ('Cody', 'iBDW', 'cody', 'IBDW#0', 'IBDW#734', 'JBDW#120'),
   ('S2J', 'Mr Plow', 'John Redcorn', 'SSJ#998'),
   ('Amsa', 'AMSA#0'),
-  ('Phillip AI', 'PHAI#591'),
+  ('Phillip AI', 'PHAI#591', 'BOT#570', 'BOT#323', 'BOT#265'),
   ('Hax', 'XX#02', 'HAX#472'),
   ('Aklo', 'AKLO#381', 'AKLO#239'),
   ('Morsecode', 'MORS#762'),
@@ -84,8 +84,13 @@ name_groups = [
   ('TK', 'TK#703'),
   ('Buttlet', 'FUZZ#987'),
   ('Azel', 'AZEL#0', 'AOI#632'),
-  ('MisterGW', 'BASK#629', 'MRGW#989', 'BLIK#539'),
+  ('Dragunov', 'BASK#629', 'MRGW#989', 'BLIK#539'),
   ('Nuckels', 'NUCK#205'),
+  ('Buddyboom', 'ZAP#151'),
+
+  ('Nocki', 'NOCK#354', 'NOCK#726'),
+  ('Zuijin', 'ZUIJ#435'),
+  ('Mino', 'MINO#616'),
 ]
 
 name_map = {}
@@ -109,6 +114,9 @@ def name_encoder(name_map: dict[str, int]):
 BANNED_NAMES = {
     'Mang0',  # Has asked not to be included in AI training
     'Phillip AI',  # This is us!
+    'Nocki',
+    'Zuijin',
+    'Mino',
 }
 for name in BANNED_NAMES:
   assert name in name_map.values(), name

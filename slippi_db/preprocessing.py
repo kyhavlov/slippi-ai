@@ -171,7 +171,7 @@ def get_metadata(game: peppi_py.Game) -> dict:
   # compute winner
   result['winner'] = compute_winner(game)
 
-  print("winner: {winner}, player count: {player_count}".format(winner=result['winner'], player_count=len(players)))
+  # print("winner: {winner}, player count: {player_count}".format(winner=result['winner'], player_count=len(players)))
 
   return result
 

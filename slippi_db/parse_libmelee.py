@@ -49,6 +49,7 @@ def get_player(player: melee.PlayerState) -> Player:
       shield_strength=player.shield_strength,
       on_ground=player.on_ground,
       is_dead=player.stock == 0,
+      stocks_left=player.stock,
       controller=get_controller(player.controller_state),
       # v2.1.0
       invulnerable=player.invulnerable,
@@ -63,9 +64,10 @@ def get_player(player: melee.PlayerState) -> Player:
 def get_game(
     game: melee.GameState,
     ports: Optional[Sequence[int]] = None,
+    singles_opponent_port: int = 2,
 ) -> Game:
   ports = ports or sorted(game.players)
-  #assert len(ports) == 4
+
   players = {}
   for i, p in enumerate(ports):
     if p in game.players:
@@ -79,14 +81,25 @@ def get_game(
   if len(game.players) == 0:
     print("================== NO PLAYERS LEFT IN GAME ====================")
 
-  # clone p2 or p3 if one of the opponents is dead
-  if np.sum(players['p2'].is_dead) > 0:
-    players['p2'] = players['p3']
-  elif np.sum(players['p3'].is_dead) > 0:
-    players['p3'] = players['p2']
+  # clone p3 or p4 if one of the opponents is dead
+  '''if len(ports) == 4:
+    if np.sum(players['p2'].is_dead) > 0:
+      players['p2'] = players['p3']
+    elif np.sum(players['p3'].is_dead) > 0:
+      players['p3'] = players['p2']'''
+  if len(ports) == 2:
+    state = melee.PlayerState()
+    state.action = melee.Action.DEAD_DOWN
+    empty_player = get_player(state)._replace(is_dead=True)
+    players[f'p2'] = empty_player
+    players[f'p3'] = empty_player
+    players[f'p{singles_opponent_port}'] = players[f'p1']
+    players[f'p1'] = empty_player
 
   return Game(
       stage=game.stage.value,
+      randall_phase=game.frame % 1200,
+      is_teams=game.is_teams,
       **players,
   )
 

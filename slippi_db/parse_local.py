@@ -35,6 +35,9 @@ import json
 import os
 import pickle
 from typing import Optional
+import sys
+import tempfile
+import subprocess
 
 from absl import app, flags
 import tqdm
@@ -92,7 +95,7 @@ def parse_slp(
       )
 
       # log the game file, is_training and reason
-      print(f"{file.name} {is_training} {reason}")
+      # print(f"{file.name} {is_training} {reason}")
 
       if is_training:
         game = parse_peppi.from_peppi(game)
@@ -111,7 +114,7 @@ def parse_slp(
     raise
   except BaseException as e:
     result.update(valid=False, reason=repr(e))
-    print(f"exception: {repr(e)}\n{traceback.format_exc()}")
+    #print(f"exception: {repr(e)}\n{traceback.format_exc()}")
   # except:  # should be a catch-all, but sadly prevents KeyboardInterrupt?
   #   result.update(valid=False, reason='uncaught exception')
 
@@ -121,7 +124,7 @@ def parse_files(
     files: list[utils.LocalFile],
     output_dir: str,
     tmpdir: str,
-    num_threads: int = 1,
+    pool: Optional[concurrent.futures.ProcessPoolExecutor] = None,
     compression_options: dict = {},
 ) -> list[dict]:
   parse_slp_kwargs = dict(
@@ -130,25 +133,23 @@ def parse_files(
       **compression_options,
   )
 
-  if num_threads == 1:
+  if pool is None:
     return [
         parse_slp(f, **parse_slp_kwargs)
         for f in tqdm.tqdm(files, unit='slp')]
 
-  with concurrent.futures.ProcessPoolExecutor(num_threads) as pool:
-    try:
-      futures = [
-          pool.submit(parse_slp, f, **parse_slp_kwargs)
-          for f in files]
-      as_completed = concurrent.futures.as_completed(futures)
-      results = [
-          f.result() for f in
-          tqdm.tqdm(as_completed, total=len(files), smoothing=0, unit='slp')]
-      return results
-    except KeyboardInterrupt:
-      print('KeyboardInterrupt, shutting down')
-      pool.shutdown()
-      raise
+  try:
+    futures = [
+        pool.submit(parse_slp, f, **parse_slp_kwargs)
+        for f in files]
+    as_completed = concurrent.futures.as_completed(futures)
+    results = [
+        f.result() for f in
+        tqdm.tqdm(as_completed, total=len(files), smoothing=0, unit='slp')]
+    return results
+  except KeyboardInterrupt:
+    print('KeyboardInterrupt, shutting down')
+    raise
 
 def parse_chunk(
     chunk: list[utils.LocalFile],
@@ -252,118 +253,265 @@ def get_key(row: dict):
 
   return (row['raw'], row['name'])
 
+def save_raw_db(raw_by_name: dict, raw_db_path: str):
+    with open(raw_db_path, 'w') as f:
+        json.dump(list(raw_by_name.values()), f, indent=2)
+
+def save_slp_meta(results: list, slp_db_path: str):
+    # Load existing metadata
+    if os.path.exists(slp_db_path):
+        with open(slp_db_path, 'rb') as f:
+            slp_meta = pickle.load(f)
+    else:
+        slp_meta = []
+
+    # Update with new results
+    by_key = {get_key(row): row for row in slp_meta}
+    for result in results:
+        by_key[get_key(result)] = result
+
+    # Save updated metadata
+    with open(slp_db_path, 'wb') as f:
+        pickle.dump(list(by_key.values()), f)
+
+def count_replays_in_archive(f: str, raw_dir: str, chunk_size_gb: float, raw_by_name: dict, wipe: bool = False) -> int:
+    """Count number of replay files in an archive without processing them."""
+    # Skip already processed archives
+    if not wipe and raw_by_name[f].get('processed', False):
+        return 0
+        
+    raw_path = os.path.join(raw_dir, f)
+    if f.endswith('.7z'):
+        chunks = utils.traverse_7z_fast(raw_path, chunk_size_gb=chunk_size_gb)
+        return sum(len(chunk.files) for chunk in chunks)
+    elif f.endswith('.zip'):
+        return len(utils.traverse_slp_files_zip(raw_path))
+    return 0
+
+def get_archive_files(archive_name: str, path: str, chunk_size_gb: float) -> list[utils.LocalFile]:
+    """Get all files from a single archive."""
+    if archive_name.endswith('.7z'):
+        chunks = utils.traverse_7z_fast(path, chunk_size_gb=chunk_size_gb)
+        files = []
+        for chunk in chunks:
+            # Create SevenZipFile objects instead of using raw strings
+            files.extend(utils.SevenZipFile(path, f) for f in chunk.files)
+        return files
+    elif archive_name.endswith('.zip'):
+        return utils.traverse_slp_files_zip(path)
+    return []
+
+def get_all_files(root_dir: str, raw_by_name: dict, wipe: bool, chunk_size_gb: float) -> tuple[list[tuple[str, utils.LocalFile]], dict]:
+    """Get all files that need processing across all archives.
+    Returns:
+        - list of (archive_name, file) tuples
+        - dict mapping archive_name to total expected files
+    """
+    files = []
+    archive_totals = {}  # Track total files per archive
+    
+    for archive_name, meta in raw_by_name.items():
+        if wipe or not meta.get('processed', False):
+            path = os.path.join(root_dir, archive_name)
+            archive_files = get_archive_files(archive_name, path, chunk_size_gb)
+            
+            if archive_files:
+                files.extend((archive_name, f) for f in archive_files)
+                archive_totals[archive_name] = len(archive_files)
+                
+    return files, archive_totals
+
+def process_chunk(files: list[tuple[str, utils.LocalFile]], output_dir: str, 
+                 tmpdir: str, compression_options: dict) -> list[tuple[str, dict]]:
+    """Process a chunk of files.
+    Returns list of (archive_name, result) tuples."""
+    results = []
+    
+    # Group files by archive
+    by_archive = {}
+    for archive_name, file in files:
+        if archive_name not in by_archive:
+            by_archive[archive_name] = []
+        by_archive[archive_name].append(file)
+
+    # Create one temp dir for the whole chunk
+    with tempfile.TemporaryDirectory(dir=tmpdir) as extract_dir:
+        # Process each archive's files
+        for archive_name, archive_files in by_archive.items():
+            if isinstance(archive_files[0], utils.SevenZipFile):
+                # Extract all files from this archive at once
+                file_paths = [f.path for f in archive_files]
+                utils.SevenZipFile.batch_extract(
+                    archive_files[0].root, file_paths, extract_dir, 
+                    batch_size=1000)  # Larger batch size for fewer 7z calls
+                
+                # Process extracted files
+                for file in archive_files:
+                    try:
+                        extracted_path = os.path.join(extract_dir, file.path)
+                        simple_file = utils.SimplePath(extract_dir, file.path)
+                        result = parse_slp(simple_file, output_dir, extract_dir, **compression_options)
+                        result['raw'] = archive_name
+                        results.append((archive_name, result))
+                    except Exception as e:
+                        print(f"Failed to process {archive_name}/{file.name}: {e}")
+                        result = {'name': file.name, 'raw': archive_name, 'valid': False, 'reason': str(e)}
+                        results.append((archive_name, result))
+            else:
+                # Process zip files
+                for file in archive_files:
+                    try:
+                        result = parse_slp(file, output_dir, extract_dir, **compression_options)
+                        result['raw'] = archive_name
+                        results.append((archive_name, result))
+                    except Exception as e:
+                        print(f"Failed to process {archive_name}/{file.name}: {e}")
+                        result = {'name': file.name, 'raw': archive_name, 'valid': False, 'reason': str(e)}
+                        results.append((archive_name, result))
+    
+    return results
+
 def run_parsing(
     root: str,
     num_threads: int = 1,
     compression_options: dict = {},
-    chunk_size_gb: float = 0.5,
+    chunk_size: int = 1000,  # Increased default chunk size
     in_memory: bool = True,
     wipe: bool = False,
     dry_run: bool = False,
 ):
-  # Cache tmp dir once
-  tmpdir = utils.get_tmp_dir(in_memory=in_memory)
+    # Cache tmp dir once
+    tmpdir = utils.get_tmp_dir(in_memory=in_memory)
 
-  raw_dir = os.path.join(root, 'Raw')
+    raw_dir = os.path.join(root, 'Raw')
 
-  raw_db_path = os.path.join(root, 'raw.json')
-  if os.path.exists(raw_db_path):
-    with open(raw_db_path) as f:
-      raw_db = json.load(f)
-  else:
-    raw_db = []
-
-  raw_by_name = {row['name']: row for row in raw_db}
-
-  to_process: list[str] = []
-  for dirpath, _, filenames in os.walk(raw_dir):
-    reldirpath = os.path.relpath(dirpath, raw_dir)
-    for name in filenames:
-      path = os.path.join(reldirpath, name).removeprefix('.\\')
-      if path not in raw_by_name:
-        raw_by_name[path] = dict(processed=False, name=path)
-      if wipe or not raw_by_name[path]['processed']:
-        to_process.append(path)
-
-  print("To process:", to_process)
-  print("threads: ", num_threads)
-
-  if dry_run:
-    return
-
-  output_dir = os.path.join(root, 'Parsed')
-  os.makedirs(output_dir, exist_ok=True)
-
-  # Special-case 7z files which we process in chunks.
-  results = parse_7zs(
-      raw_dir, to_process, output_dir, num_threads,
-      compression_options, chunk_size_gb, in_memory)
-
-  # Now handle zip files.
-  print("Processing zip files.")
-  slp_files: list[utils.LocalFile] = []
-  raw_names: list[str] = []
-  for f in to_process:
-    raw_path = os.path.join(raw_dir, f)
-    if f.endswith('.zip'):
-      fs = utils.traverse_slp_files_zip(raw_path)
+    # Load existing raw.json
+    raw_db_path = os.path.join(root, 'raw.json')
+    if os.path.exists(raw_db_path):
+        with open(raw_db_path) as f:
+            raw_db = json.load(f)
     else:
-      print(f"Can't handle {f} yet.")
-      continue
-    print(f"Found {len(fs)} slp files in {raw_path}")
-    slp_files.extend(fs)
-    raw_names.extend([f] * len(fs))
+        raw_db = []
 
-  # TODO: handle raw .slp and .slp.gz files
+    raw_by_name = {row['name']: row for row in raw_db}
 
-  zip_results = parse_files(
-      slp_files, output_dir, tmpdir, num_threads, compression_options)
-  assert len(zip_results) == len(slp_files)
+    # Scan Raw directory for archives
+    to_process = []
+    for dirpath, _, filenames in os.walk(raw_dir):
+        for f in filenames:
+            if f.endswith('.7z') or f.endswith('.zip'):
+                rel_path = os.path.relpath(os.path.join(dirpath, f), raw_dir)
+                if rel_path not in raw_by_name:
+                    # Add new archive to raw_by_name
+                    raw_by_name[rel_path] = {'name': rel_path, 'processed': False}
+                    to_process.append(rel_path)
+                elif wipe or not raw_by_name[rel_path].get('processed', False):
+                    # Add unprocessed or wiped archives
+                    to_process.append(rel_path)
 
-  # Point back to raw file
-  for result, raw_name in zip(zip_results, raw_names):
-    result['raw'] = raw_name
+    if not to_process:
+        print("No new archives to process")
+        return
 
-  # Combine 7z and zip results
-  results.extend(zip_results)
+    print(f"To process: {to_process}")
 
-  if results:
-    num_valid = sum(r['valid'] for r in results)
-    print(f"Processed {num_valid}/{len(results)} valid files.")
+    # Get all files that need processing
+    all_files, archive_totals = get_all_files(raw_dir, raw_by_name, wipe, 
+                                            compression_options.get('chunk_size_gb', 0.5))
+    if not all_files:
+        print("No files to process")
+        return
+    
+    print(f"Found {len(all_files)} files across {len(archive_totals)} archives to process")
+    
+    # Track processed files per archive
+    archive_processed = {name: 0 for name in archive_totals}
+    
+    # Split into roughly equal chunks
+    chunks = [all_files[i:i + chunk_size] for i in range(0, len(all_files), chunk_size)]
+    print(f"Split into {len(chunks)} chunks of ~{chunk_size} files each")
 
-  # Now record the results.
-  for raw_name in to_process:
-    raw_by_name[raw_name].update(
-        processed=True,
-    )
+    # Use more threads for processing
+    max_concurrent = num_threads  # Use all available threads
+    print(f"Using {max_concurrent} concurrent workers")
 
-  # Record raw metadata
-  with open(raw_db_path, 'w') as f:
-    json.dump(list(raw_by_name.values()), f, indent=2)
+    # Batch metadata updates
+    metadata_batch_size = 5000
+    pending_results = []
+    
+    with concurrent.futures.ProcessPoolExecutor(max_concurrent) as pool:
+        futures = [
+            pool.submit(process_chunk, chunk, os.path.join(root, 'Parsed'), tmpdir, compression_options)
+            for chunk in chunks
+        ]
 
-  # Record slp metadata.
-  # TODO: column-major would be more efficient
-  slp_db_path = os.path.join(root, 'parsed.pkl')
-  if os.path.exists(slp_db_path):
-    with open(slp_db_path, 'rb') as f:
-      slp_meta = pickle.load(f)
-    print(f"Loaded slp metadata with {len(slp_meta)} records.")
-  else:
-    slp_meta = []
-
-  by_key = {get_key(row): row for row in slp_meta}
-
-  for result in results:
-    by_key[get_key(result)] = result
-
-  with open(os.path.join(root, 'parsed.pkl'), 'wb') as f:
-    pickle.dump(list(by_key.values()), f)
+        pbar = tqdm.tqdm(total=len(all_files), desc="Processing files", unit="file")
+        
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results = future.result()
+                pending_results.extend(results)
+                
+                # Update archive processed counts
+                for archive_name, result in results:
+                    archive_processed[archive_name] += 1
+                
+                # Batch update metadata
+                if len(pending_results) >= metadata_batch_size:
+                    # Group by archive
+                    by_archive = {}
+                    for archive_name, result in pending_results:
+                        if archive_name not in by_archive:
+                            by_archive[archive_name] = []
+                        by_archive[archive_name].append(result)
+                    
+                    # Update metadata for completed archives
+                    for archive_name, archive_results in by_archive.items():
+                        save_slp_meta(archive_results, os.path.join(root, 'parsed.pkl'))
+                        if archive_processed[archive_name] >= archive_totals[archive_name]:
+                            raw_by_name[archive_name].update(processed=True)
+                            save_raw_db(raw_by_name, raw_db_path)
+                            pbar.write(f"Completed archive {archive_name}")
+                    
+                    pending_results = []
+                
+                # Update progress
+                num_valid = sum(r[1]['valid'] for r in results)
+                pbar.update(len(results))
+                completed_archives = sum(
+                    1 for name, count in archive_processed.items() 
+                    if count >= archive_totals[name]
+                )
+                pbar.set_postfix({
+                    'valid': f"{num_valid}/{len(results)}", 
+                    'archives': f"{completed_archives}/{len(archive_totals)}"
+                }, refresh=True)
+                
+            except Exception as e:
+                pbar.write(f"Chunk failed: {e}")
+                traceback.print_exc()
+        
+        # Process any remaining results
+        if pending_results:
+            by_archive = {}
+            for archive_name, result in pending_results:
+                if archive_name not in by_archive:
+                    by_archive[archive_name] = []
+                by_archive[archive_name].append(result)
+            
+            for archive_name, archive_results in by_archive.items():
+                save_slp_meta(archive_results, os.path.join(root, 'parsed.pkl'))
+                if archive_processed[archive_name] >= archive_totals[archive_name]:
+                    raw_by_name[archive_name].update(processed=True)
+                    save_raw_db(raw_by_name, raw_db_path)
+        
+        pbar.close()
 
 def main(_):
   run_parsing(
       ROOT.value,
       num_threads=THREADS.value,
-      chunk_size_gb=CHUNK_SIZE.value,
+      chunk_size=CHUNK_SIZE.value,
       in_memory=IN_MEMORY.value,
       compression_options=dict(
           compression=COMPRESSION.value,
@@ -377,7 +525,7 @@ if __name__ == '__main__':
   ROOT = flags.DEFINE_string('root', None, 'root directory', required=True)
   # MAX_FILES = flags.DEFINE_integer('max_files', None, 'max files to process')
   THREADS = flags.DEFINE_integer('threads', 1, 'number of threads')
-  CHUNK_SIZE = flags.DEFINE_float('chunk_size', 0.5, 'max chunk size in GB')
+  CHUNK_SIZE = flags.DEFINE_integer('chunk_size', 1000, 'max chunk size in files')
   IN_MEMORY = flags.DEFINE_bool('in_memory', True, 'extract in memory')
   # LOG_INTERVAL = flags.DEFINE_integer('log_interval', 20, 'log interval')
   COMPRESSION = flags.DEFINE_enum_class(

@@ -74,6 +74,7 @@ def get_player(player: pa.StructArray) -> types.Player:
       on_ground=np.logical_not(
           post.field('airborne').to_numpy(zero_copy_only=False)),
       is_dead=dead,
+      stocks_left=np.nan_to_num(get_post('stocks'), nan=np.uint8(0)),
   )
 
   return player
@@ -155,8 +156,12 @@ def from_peppi(game: peppi_py.Game) -> types.GAME_TYPE:
 
   stage = melee.enums.to_internal_stage(game.start['stage'])
   stage = np.full([len(frames)], stage.value, dtype=np.uint8)
+  is_teams = np.full([len(frames)], len(game.start['players']) == 4, dtype=np.uint8)
 
-  game = types.Game(stage=stage, **players)
+  # randall_phase for each frame is equal to the current game frame % 1200
+  randall_phase = np.arange(len(frames)) % 1200
+
+  game = types.Game(stage=stage, is_teams=is_teams, randall_phase=randall_phase, **players)
   game_array = types.array_from_nt(game)
 
   index = frames.field('id').to_numpy()

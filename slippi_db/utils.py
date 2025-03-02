@@ -191,31 +191,47 @@ class GZipFile(LocalFile):
       os.remove(path)
 
 class SevenZipFile(LocalFile):
-  """File inside a 7z archive."""
+    """File inside a 7z archive."""
 
-  def __init__(self, root: str, path: str):
-    self.root = root
-    self.path = path
+    def __init__(self, root: str, path: str):
+        self.root = root
+        self.path = path
 
-  @property
-  def name(self) -> str:
-    return self.path
+    @property
+    def name(self) -> str:
+        return self.path
 
-  def read(self) -> bytes:
-    result = subprocess.run(
-        ['7z', 'e', '-so', self.root, self.path],
-        stdout=subprocess.PIPE)
-    return result.stdout
+    def read(self) -> bytes:
+        """Read file directly from archive."""
+        result = subprocess.run(
+            ['7z', 'e', '-so', self.root, self.path],
+            stdout=subprocess.PIPE)
+        return result.stdout
 
-  @contextmanager
-  def extract(self, tmpdir: str) -> Generator[str, None, None]:
-    with tempfile.TemporaryDirectory(dir=tmpdir) as tmpdir:
-      subprocess.check_call(
-        ['7z', 'x', '-o' + tmpdir, self.root, self.path],
-        stdout=subprocess.DEVNULL)
-      # with py7zr.SevenZipFile(self.root) as archive:
-      #   archive.extract(path=tmpdir, targets=[self.path])
-      yield os.path.join(tmpdir, self.path)
+    @contextmanager
+    def extract(self, tmpdir: str) -> Generator[str, None, None]:
+        """Extract single file - mainly used for non-batch operations."""
+        with tempfile.TemporaryDirectory(dir=tmpdir) as tmpdir:
+            subprocess.check_call(
+                ['7z', 'x', '-o' + tmpdir, self.root, self.path],
+                stdout=subprocess.DEVNULL)
+            yield os.path.join(tmpdir, self.path)
+
+    @staticmethod
+    def batch_extract(root: str, paths: list[str], output_dir: str, batch_size: int = 100):
+        """Extract multiple files at once, in batches to avoid command line length limits.
+        
+        Args:
+            root: Path to 7z archive
+            paths: List of file paths to extract
+            output_dir: Directory to extract to
+            batch_size: Number of files to extract in each batch
+        """
+        for i in range(0, len(paths), batch_size):
+            batch = paths[i:i + batch_size]
+            subprocess.check_call(
+                ['7z', 'x', '-o' + output_dir, root] + batch,
+                stdout=subprocess.DEVNULL)
 
 class ZipFile(LocalFile):
   """File inside a zip archive."""

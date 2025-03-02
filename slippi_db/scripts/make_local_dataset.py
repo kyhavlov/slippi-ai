@@ -121,7 +121,7 @@ def main(_):
     print(f"({character}): {count}")
   print("")
   print("Player/Character Pairings:")
-  for (name, character), count in player_character_counts.most_common(n=200):
+  for (name, character), count in player_character_counts.most_common(n=100):
     print(f"{name} ({character}): {count}")
 
   print("\n")

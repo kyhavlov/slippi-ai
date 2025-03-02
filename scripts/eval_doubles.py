@@ -138,8 +138,8 @@ def main(_):
         logging.info(f'step_time: {step_timer.mean_time():.3f}')
         #for i, player in gamestate.players:
         #  logging.info(f'gamestate: {pformat(player)}')
-        for port, player in gamestate.players.items():
-          logging.info(f'port {port} x: {player.position.x} y: {player.position.y}')
+        #for port, player in gamestate.players.items():
+        #  logging.info(f'port {port} x: {player.position.x} y: {player.position.y}')
 
   except BaseException as e:
     print(f"exception: {repr(e)}\n{traceback.format_exc()}")

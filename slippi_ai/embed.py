@@ -404,6 +404,7 @@ def make_player_embedding(
       ("shield_strength", FloatEmbedding("shield_size", scale=shield_scale)),
       ("on_ground", embed_bool),
       ("is_dead", embed_bool),
+      ("stocks_left", FloatEmbedding("percent", scale=0.25)),
     ]
 
     if with_controller:
@@ -437,6 +438,8 @@ class PlayerConfig:
 # embed_stage = EnumEmbedding(enums.Stage, size=64, dtype=np.uint8)
 embed_stage = OneHotEmbedding('Stage', size=64, dtype=np.uint8)
 
+embed_randall_phase = FloatEmbedding("randall_phase", scale=1/1200.)
+
 _PORTS = (0, 1)
 # _PLAYERS = tuple(f'p{p}' for p in _PORTS)
 # _SWAP_MAP = dict(zip(_PLAYERS, reversed(_PLAYERS)))
@@ -450,6 +453,8 @@ def make_game_embedding(player_config={}):
       p2=embed_player,
       p3=embed_player,
       stage=embed_stage,
+      randall_phase=embed_randall_phase,
+      is_teams=embed_bool,
   )
 
   return struct_embedding_from_nt("game", embedding)

@@ -44,6 +44,7 @@ class Player(NamedTuple):
   shield_strength: np.float32
   on_ground: np.bool_
   is_dead: np.bool_
+  stocks_left: np.uint8
   controller: Controller
 
 class Game(NamedTuple):
@@ -52,6 +53,8 @@ class Game(NamedTuple):
   p2: Player
   p3: Player
   stage: np.uint8
+  randall_phase: np.float32
+  is_teams: np.bool_
 
 # maps pyarrow types back to NamedTuples
 PA_TO_NT = {}

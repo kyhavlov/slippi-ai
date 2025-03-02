@@ -526,6 +526,7 @@ class Agent:
       opponent_port: int,
       teammate_port: int,
       config: dict,  # use train.Config instead
+      is_singles: bool = False,
       port: tp.Optional[int] = None,
       controller: tp.Optional[melee.Controller] = None,
       name_change_mode: NameChangeMode = NameChangeMode.FIXED,
@@ -543,7 +544,12 @@ class Agent:
     self.teammate_port = teammate_port
     # Append the two players that aren't ourself or our teammate
     self.players += tuple(p for p in (1, 2, 3, 4) if p not in self.players)
-    #print("agent players: ", self._port, self.players)
+
+    self._is_singles = is_singles
+    if is_singles:
+      self.players = (self._port, opponent_port)
+    print("agent players: ", self._port, self.players)
+
     self.config = config
     self.name_change_mode = name_change_mode
     self._pressed_start = False
@@ -595,18 +601,19 @@ class Agent:
     send_controller(self._controller, action)
 
     # stock stealing hack
-    if game.p0.is_dead:
-      self._dead_frame += 1
-      if not self._pressed_start and self._dead_frame >= 120 and self.teammate_port in gamestate.players and gamestate.players[self.teammate_port].stock > 1:
-        logging.info("p0 is dead, stock stealing from %d, %s", self.teammate_port, gamestate.players)
-        logging.info("pressing start")
-        self._controller.press_button(enums.Button.BUTTON_START)
-        self._pressed_start = True
-      elif self._pressed_start:
-        self._controller.release_button(enums.Button.BUTTON_START)
-        self._pressed_start = False
-    else:
-      self._dead_frame = 0
+    if not self._is_singles:
+      if game.p0.is_dead:
+        self._dead_frame += 1
+        if not self._pressed_start and self._dead_frame >= 120 and self.teammate_port in gamestate.players and gamestate.players[self.teammate_port].stock > 1:
+          logging.info("p0 is dead, stock stealing from %d, %s", self.teammate_port, gamestate.players)
+          logging.info("pressing start")
+          self._controller.press_button(enums.Button.BUTTON_START)
+          self._pressed_start = True
+        elif self._pressed_start:
+          self._controller.release_button(enums.Button.BUTTON_START)
+          self._pressed_start = False
+      else:
+        self._dead_frame = 0
 
     return sample_outputs
 
@@ -616,6 +623,7 @@ def build_agent(
     name: str = nametags.DEFAULT_NAME,
     port: tp.Optional[int] = None,
     controller: tp.Optional[melee.Controller] = None,
+    is_singles: bool = False,
     state: Optional[dict] = None,
     path: Optional[str] = None,
     tag: Optional[str] = None,
@@ -629,6 +637,7 @@ def build_agent(
       port=port,
       opponent_port=opponent_port,
       teammate_port=teammate_port,
+      is_singles=is_singles,
       config=state['config'],
       # The rest are passed through to build_delayed_agent
       state=state,

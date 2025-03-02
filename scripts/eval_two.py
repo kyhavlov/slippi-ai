@@ -66,6 +66,7 @@ def main(_):
       agent = eval_lib.build_agent(
           port=port,
           opponent_port=opponent_port,
+          is_singles=True,
           console_delay=DOLPHIN.value['online_delay'],
           **PLAYERS[port].value['ai'],
       )

@@ -83,7 +83,7 @@ class Dolphin:
       render: Optional[bool] = None,  # Render even when running headless.
       connect_code: Optional[str] = None,
       teams_connect_code: Optional[str] = None,
-      desired_teams: Mapping[int, int] = None,
+      desired_teams: Mapping[int, int] = {},
       **console_kwargs,
   ) -> None:
     self._players = players
@@ -118,23 +118,12 @@ class Dolphin:
 
     slippi_port = slippi_port or portpicker.pick_unused_port()
 
-    self.menu_helper = melee.MenuHelper()
+    self.menu_helper = melee.MenuHelper(is_singles=len(players) == 2)
 
     print("blocking_input ", blocking_input)
     print("polling_mode ", console_timeout is not None)
     print("polling_timeout ", console_timeout)
     print("console_kwargs ", console_kwargs)
-
-    '''
-    yes: <Character.CPTFALCON: 2>, <Character.MARTH: 18>, <Character.FOX: 1>, <Character.DK: 3>
-    yes: <Character.JIGGLYPUFF: 15>, <Character.CPTFALCON: 2>, <Character.FOX: 1>, <Character.MARTH: 18>
-    yes: <Character.CPTFALCON: 2>, <Character.JIGGLYPUFF: 15>, <Character.MARTH: 18>, <Character.FOX: 1>
-    no: <Character.PEACH: 9>, <Character.JIGGLYPUFF: 15>, <Character.SHEIK: 7>, <Character.PEACH: 9>
-    yes: <Character.SHEIK: 7>, <Character.FOX: 1>, <Character.FOX: 1>, <Character.JIGGLYPUFF: 15> (pokemon)
-    yes: <Character.YOSHI: 14>, <Character.MARTH: 18>, <Character.FOX: 1>, <Character.CPTFALCON: 2> (dreamland)
-    yes: <Character.FALCO: 22>, <Character.MARTH: 18>, <Character.SHEIK: 7>, <Character.JIGGLYPUFF: 15> (battlefield)
-    yes: <Character.JIGGLYPUFF: 15>, <Character.MARTH: 18>, <Character.CPTFALCON: 2>, <Character.FALCO: 22> (dreamland)
-    '''
 
     console = melee.Console(
         path=path,
@@ -207,7 +196,9 @@ class Dolphin:
 
     if is_menu_state(gamestate) and not self._prev_menu_state:
       #print("menu state transition, shuffling characters")
-      self.menu_helper.done_selecting_character = {1: False, 2: False, 3: False, 4: False}
+      self.menu_helper.done_selecting_character = {}
+      for port, player in self._players.items():
+        self.menu_helper.done_selecting_character[port] = False
 
       new_characters = []
       for i, (controller, player) in enumerate(self._menuing_controllers):
@@ -229,7 +220,7 @@ class Dolphin:
             connect_code=self._connect_code,
             teams_connect_code=self._teams_connect_code,
             desired_teams=self._desired_teams,
-            offline_teams=self._desired_teams and not self._teams_connect_code,
+            offline_teams=self._desired_teams and not self._teams_connect_code and len(self._players) == 4,
             autostart=self._autostart and i == 0 and menu_frames > 180,
             swag=False,
             costume=i,
@@ -257,6 +248,7 @@ class Dolphin:
               connect_code=self._connect_code,
               teams_connect_code=self._teams_connect_code,
               desired_teams=self._desired_teams,
+              offline_teams=self._desired_teams and not self._teams_connect_code and len(self._players) == 4,
               autostart=self._autostart and i == 0 and menu_frames > 180,
               swag=False,
               costume=i,

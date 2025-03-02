@@ -150,32 +150,58 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
 
   banned_counts = collections.Counter()
 
-  for row in meta_rows:
-    if len(row['players']) != 4:
-      print("not a 2v2 game")
-      continue
+  invalid_team_id_count = 0
 
+  for row in meta_rows:
     replay_meta = ReplayMeta.from_metadata(row)
     replay_path = os.path.join(config.data_dir, replay_meta.slp_md5)
 
-    if not config.swap:
-      is_banned = False
-      for name in [replay_meta.p0.name, replay_meta.p1.name,
-                   replay_meta.p2.name, replay_meta.p3.name]:
-        if nametags.is_banned_name(name):
-          banned_counts[name] += 1
-          is_banned = True
+    # for singles games, generate two replays (one for each player). 
+    # each replay will have the self player as p0 and the opponent randomized
+    # as either p2 or p3 seeded by the replay_meta.slp_md5 value
+    if replay_meta.is_singles:
+      # Use the last byte of MD5 hash to determine opponent position
+      hash_val = int(replay_meta.slp_md5[-1], 16)
+      opponent_idx = 2 if hash_val % 2 == 0 else 3
 
-      if is_banned:
-        continue
+      # For each player (0 and 1)
+      for player_index in range(2):
+        players = [replay_meta.p0, replay_meta.p1]
+        player = players[player_index]
+        opponent = players[1 - player_index]
 
-      if (replay_meta.p0.character not in allowed_characters
-          or replay_meta.p1.character not in allowed_opponents
-          or replay_meta.p2.character not in allowed_opponents
-          or replay_meta.p3.character not in allowed_opponents):
-        continue
+        # Check if player's character is allowed
+        if player.character not in allowed_characters:
+          continue
 
-      replays.append(ReplayInfo(replay_path, 0, 0, replay_meta.p0.name, replay_meta))
+        # Check if opponent's character is allowed
+        if opponent.character not in allowed_opponents:
+          continue
+
+        # Check for banned names
+        if nametags.is_banned_name(player.name):
+          banned_counts[player.name] += 1
+          continue
+
+        # Create empty teammate and remaining opponent slots
+        empty_player = PlayerMeta(character=0, name='', team=0)
+
+        # Create replay info with player as p0, empty p1, and opponent in either p2 or p3
+        replays.append(ReplayInfo(
+            replay_path,
+            main_player_index=0,  # Always 0 since we swap in swap_players
+            teammate_index=1,     # Always 1 since we swap in swap_players
+            main_player_name=player.name,
+            meta=ReplayMeta(
+                p0=player,
+                p1=empty_player,
+                p2=opponent if opponent_idx == 2 else empty_player,
+                p3=opponent if opponent_idx == 3 else empty_player,
+                stage=replay_meta.stage,
+                slp_md5=replay_meta.slp_md5,
+                is_singles=True
+            )
+        ))
 
       continue
 
@@ -211,10 +237,11 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
       if teammate_index != -1:
         replays.append(ReplayInfo(replay_path, player_index, teammate_index, players[player_index].name, replay_meta))
       else:
-        print("invalid team ids (3v1?): ", replay_path)
+        invalid_team_id_count += 1
 
       #print("added replay", row['name'], player_index, players[player_index].name, players[player_index].character, teammate_index)
 
+  print("invalid team id game count (3v1?): ", invalid_team_id_count)
   print('Banned names:', banned_counts)
 
   return replays
