@@ -204,7 +204,10 @@ def compute_rewards(
 
   # Zero-sum rewards ensure there can be no collusion.
   if not np.any(game.is_teams):
-    rewards = player_reward(game.p0, game.p2) - player_reward(game.p2, game.p0)
+    if np.any(game.p3.is_dead):
+      rewards = player_reward(game.p0, game.p2) - player_reward(game.p2, game.p0)
+    else:
+      rewards = player_reward(game.p0, game.p3) - player_reward(game.p3, game.p0)
     assert np.all(rewards > -6)
     assert np.all(rewards < 6)
   else:

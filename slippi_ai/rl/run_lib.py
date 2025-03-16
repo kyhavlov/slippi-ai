@@ -61,6 +61,7 @@ class ActorConfig:
   inner_batch_size: int = 1
   gpu_inference: bool = True
   use_fake_envs: bool = False
+  enable_singles: bool = False
 
 @dataclasses.dataclass
 class AgentConfig:
@@ -437,6 +438,7 @@ def run(config: Config):
     env_kwargs.update(
         num_steps=config.actor.num_env_steps,
         inner_batch_size=config.actor.inner_batch_size,
+        enable_singles=config.actor.enable_singles,
     )
     print('num steps', config.actor.num_env_steps)
 

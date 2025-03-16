@@ -67,6 +67,14 @@ def get_game(
     singles_opponent_port: int = 2,
 ) -> Game:
   ports = ports or sorted(game.players)
+  
+  assert singles_opponent_port == 2 or singles_opponent_port == 3, \
+      f"Invalid singles_opponent_port: {singles_opponent_port}. Must be 2 or 3."
+
+  # Debug logging for singles mode
+  '''if len(ports) == 2:
+    print(f"get_game for singles mode - ports: {ports}, singles_opponent_port: {singles_opponent_port}")
+    print(f"Players in game: {list(game.players.keys())}")'''
 
   players = {}
   for i, p in enumerate(ports):
@@ -81,20 +89,28 @@ def get_game(
   if len(game.players) == 0:
     print("================== NO PLAYERS LEFT IN GAME ====================")
 
-  # clone p3 or p4 if one of the opponents is dead
-  '''if len(ports) == 4:
-    if np.sum(players['p2'].is_dead) > 0:
-      players['p2'] = players['p3']
-    elif np.sum(players['p3'].is_dead) > 0:
-      players['p3'] = players['p2']'''
+  # For singles mode, create a proper 4-player structure
   if len(ports) == 2:
+    #print(f"Creating dummy players for singles mode - current players: {list(players.keys())}")
+    
+    # Create a dead player for empty slots
     state = melee.PlayerState()
     state.action = melee.Action.DEAD_DOWN
     empty_player = get_player(state)._replace(is_dead=True)
-    players[f'p2'] = empty_player
-    players[f'p3'] = empty_player
-    players[f'p{singles_opponent_port}'] = players[f'p1']
-    players[f'p1'] = empty_player
+    
+    # Save the original players
+    p0 = players['p0']
+    p1 = players['p1']
+    
+    # Clear and rebuild the players dictionary with the correct mapping
+    players = {
+        'p0': p0,                                # Self (port 1)
+        'p1': empty_player,                      # Teammate (empty in singles)
+        'p2': p1 if singles_opponent_port == 2 else empty_player,  # Opponent 1
+        'p3': p1 if singles_opponent_port == 3 else empty_player,  # Opponent 2
+    }
+    
+    #print(f"Final players after singles mode processing: {list(players.keys())}")
 
   return Game(
       stage=game.stage.value,
