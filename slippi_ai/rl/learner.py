@@ -284,6 +284,8 @@ class Learner:
 
       ppo_objective = tf.minimum(rhos * advantages, clipped_rhos * advantages)
 
+      print("current kl_teacher weight in learner: ", self._config.kl_teacher_weight)
+
       weighted_losses = [
           - self._config.policy_gradient_weight * ppo_objective,
           self._config.ppo.beta * actor_kl,

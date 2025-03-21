@@ -29,9 +29,9 @@ from absl import app
 from absl import flags
 import fancyflags as ff
 
-from melee import Character
 from slippi_ai import eval_lib, flag_utils, utils
 from slippi_ai import dolphin as dolphin_lib
+from slippi_ai.rl import run_lib
 
 PORTS = (1, 2, 3, 4)
 
@@ -56,31 +56,7 @@ DOLPHIN = ff.DEFINE_dict(
 
 FLAGS = flags.FLAGS
 
-CHARACTER_WEIGHTINGS = {
-      Character.FOX: 2000,
-      Character.FALCO: 500,
-      Character.MARTH: 500,
-      Character.SHEIK: 750,
-      Character.PEACH: 1000,
-      Character.CPTFALCON: 500,
-      Character.JIGGLYPUFF: 500,
-      Character.PIKACHU: 200,
-      Character.YOSHI: 200,
-      Character.POPO: 50,
-      Character.SAMUS: 50,
-      Character.DK: 50,
-      Character.LUIGI: 50,
-      Character.DOC: 25,
-      Character.MARIO: 25,
-      Character.YLINK: 25,
-      Character.LINK: 25,
-      Character.GAMEANDWATCH: 25,
-      Character.NESS: 5,
-      Character.ROY: 5,
-      Character.MEWTWO: 5,
-      Character.PICHU: 5,
-      Character.BOWSER: 5,
-}
+CHARACTER_WEIGHTINGS = run_lib.CHARACTER_WEIGHTINGS
 
 def main(_):
   eval_lib.disable_gpus()
@@ -95,6 +71,8 @@ def main(_):
   for port, teammate_port in zip(PORTS, reversed(PORTS)):
     player = players[port]
     if isinstance(player, dolphin_lib.AI):
+      '''if port == 1 or port == 4:'''
+      #player.character_weight_table = CHARACTER_WEIGHTINGS
       agent = eval_lib.build_agent(
           port=port,
           teammate_port=teammate_port,

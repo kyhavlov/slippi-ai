@@ -150,3 +150,17 @@ setup.sh
 .vscode
 saved_models/
 pickled_models/
+
+bot-replays/
+bot*.json
+*.AppImage
+*.iso
+scripts/*.ps1
+scripts/*doubles*.sh
+scripts/*singles*.sh
+singlestest.json
+sync_to_d2.sh
+tmp/
+git
+env.bat
+data/

@@ -96,6 +96,7 @@ def get_game(
     # Create a dead player for empty slots
     state = melee.PlayerState()
     state.action = melee.Action.DEAD_DOWN
+    state.position = melee.Position(100, 100)
     empty_player = get_player(state)._replace(is_dead=True)
     
     # Save the original players

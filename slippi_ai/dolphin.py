@@ -120,10 +120,11 @@ class Dolphin:
 
     self.menu_helper = melee.MenuHelper(is_singles=len(players) == 2)
 
-    print("blocking_input ", blocking_input)
+    '''print("blocking_input ", blocking_input)
     print("polling_mode ", console_timeout is not None)
     print("polling_timeout ", console_timeout)
-    print("console_kwargs ", console_kwargs)
+    print("console_kwargs ", console_kwargs)'''
+    # print("starting dolphin with slippi_port = ", slippi_port)
 
     console = melee.Console(
         path=path,
@@ -193,6 +194,8 @@ class Dolphin:
     #   And can warn you if it's taking too long
     #if self.console.processingtime * 1000 > 12:
     #    print("WARNING: Last frame took " + str(self.console.processingtime*1000) + "ms to process.")
+    if gamestate.menu_state is melee.Menu.SUDDEN_DEATH:
+      raise Exception("SUDDEN DEATH")
 
     if is_menu_state(gamestate) and not self._prev_menu_state:
       #print("menu state transition, shuffling characters")

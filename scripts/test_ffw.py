@@ -23,6 +23,8 @@ PORTS = (1, 2)
 dolphin_config = dolphin_lib.DolphinConfig(
     headless=True,
     console_timeout=10,
+    save_replays=True,
+    disable_audio=True,
 )
 DOLPHIN = ff.DEFINE_dict(
     'dolphin', **flag_utils.get_flags_from_default(dolphin_config))
@@ -35,7 +37,7 @@ DEBUG = flags.DEFINE_bool('debug', False, 'Enter ipdb on error.')
 @dataclasses.dataclass
 class EnvConfig:
   rollout_length: int = 300
-  num_envs: int = 8
+  num_envs: int = 1
   run_async: bool = True
   inner_batch_size: int = 1
 
@@ -52,6 +54,7 @@ def test(
   env_kwargs = dict(
       num_envs=env_config.num_envs,
       num_retries=0,
+      swap_ports=False,
   )
   if env_config.run_async:
     env_kwargs.update(

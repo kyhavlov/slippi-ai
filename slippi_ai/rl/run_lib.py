@@ -718,7 +718,19 @@ def run(config: Config):
 
     logging.info('Main training loop')
 
+    '''initial_weight = 0.0025
+    final_weight = 0.002
+    total_reduction_steps = 100
+
+    initial_step = step
+    final_step = initial_step + total_reduction_steps'''
+
     for i in range(config.runtime.max_step):
+      # anneal the kl_teacher_weight from initial_weight to final_weight over total_reduction_steps
+      '''if step >= initial_step and step <= final_step:
+        config.learner.kl_teacher_weight = initial_weight - ((initial_weight - final_weight) / total_reduction_steps) * (step - initial_step)
+        print("lowered kl_teacher weight: ", config.learner.kl_teacher_weight)'''
+
       with step_profiler:
         if i > 0 and reset_interval and i % reset_interval == 0:
           logging.info('Resetting environments')

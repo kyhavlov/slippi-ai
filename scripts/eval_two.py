@@ -24,6 +24,7 @@ python scripts/eval_two.py \
 
 import logging
 import os
+import melee
 
 from absl import app
 from absl import flags
@@ -44,6 +45,7 @@ dolphin_config = dolphin_lib.DolphinConfig(
     infinite_time=False,
     path=os.environ.get('DOLPHIN_PATH'),
     iso=os.environ.get('ISO_PATH'),
+    blocking_input=True,
 )
 DOLPHIN = ff.DEFINE_dict(
     'dolphin', **flag_utils.get_flags_from_default(dolphin_config))

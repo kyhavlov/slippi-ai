@@ -499,8 +499,6 @@ def build_delayed_agent(
   else:
     name_code = [get_name_code(state, n) for n in name]
 
-  print("building agent, async = ", async_inference)
-
   agent_class = AsyncDelayedAgent if async_inference else DelayedAgent
   return agent_class(
       state=state,
@@ -548,7 +546,7 @@ class Agent:
     self._is_singles = is_singles
     if is_singles:
       self.players = (self._port, opponent_port)
-    print("agent players: ", self._port, self.players)
+    # print("agent players: ", self._port, self.players)
 
     self.config = config
     self.name_change_mode = name_change_mode
@@ -591,6 +589,11 @@ class Agent:
 
     needs_reset = np.array([new_game])
     game = get_game(gamestate, ports=self.players)
+
+    '''if gamestate.frame == 60:
+      print("characters by port: ", {'p0': game.p0.character, 'p1': game.p1.character,
+        'p2': game.p2.character, 'p3': game.p3.character})'''
+
     game = utils.map_nt(lambda x: np.expand_dims(x, 0), game)
 
     sample_outputs = self._agent.step(game, needs_reset)

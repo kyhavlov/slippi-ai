@@ -58,7 +58,8 @@ class Environment:
     if len(players) != 4:
       raise ValueError('Environment requires exactly 4 players.')
     
-    print("Creating environment on ", socket.gethostname())
+    print("Creating environment on", socket.gethostname(), "with slippi_port:", dolphin_kwargs.get('slippi_port'), 
+          "and slippi_port2:", dolphin_kwargs.get('slippi_port2'))
     print("enable_singles: ", enable_singles)
 
     self._enable_singles = enable_singles
@@ -82,20 +83,16 @@ class Environment:
                                   desired_teams={1: 0, 2: 1, 3: 1, 4: 0})
       self._dolphin = dolphin.Dolphin(**actual_dolphin_kwargs)
     else:
-      # For singles mode, we need to set the teams differently
+      slippi_port2 = dolphin_kwargs.get('slippi_port2')
+      dolphin_kwargs.pop('slippi_port2', None)  # remove slippi_port2 from dolphin_kwargs
+
       dolphin1_kwargs = dict(dolphin_kwargs, players={1: players[1], 2: players[2]})
       self._dolphin = dolphin.Dolphin(**dolphin1_kwargs)
-      dolphin_kwargs.update(slippi_port=portpicker.pick_unused_port())
+      dolphin_kwargs.update(slippi_port=slippi_port2)
       dolphin2_kwargs = dict(dolphin_kwargs, players={1: players[3], 2: players[4]})
       self._dolphin2 = dolphin.Dolphin(**dolphin2_kwargs)
 
     self._dead_frame = {port: 0 for port in ports}
-
-    '''self._opponents: Mapping[int, int] = {}
-
-    for port, opponent_port in zip(actual_ports, reversed(actual_ports)):
-      if isinstance(actual_players[port], dolphin.AI):
-        self._opponents[port] = opponent_port'''
 
     self._prev_state: Optional[GameState] = None
     self._prev_state2: Optional[GameState] = None
@@ -279,11 +276,15 @@ class BatchedEnvironment:
 
     if swap_ports and num_envs % 2 != 0:
       raise ValueError('swap_ports=True requires an even number of environments.')
+    
+    print("batched env, enable_singles: ", enable_singles, "slippi_ports: ", slippi_ports)
 
     envs: list[SafeEnvironment] = []
     for i in range(num_envs):
       dolphin_kwargs_i = dolphin_kwargs.copy()
-      dolphin_kwargs_i.update(slippi_port=slippi_ports[i])
+      dolphin_kwargs_i.update(slippi_port=slippi_ports[i*2])
+      if enable_singles:
+        dolphin_kwargs_i.update(slippi_port2=slippi_ports[i*2 + 1])
       env = SafeEnvironment(
           dolphin_kwargs_i, num_retries=num_retries,
           swap_ports=swap_ports and i >= num_envs // 2,
@@ -543,18 +544,27 @@ class AsyncBatchedEnvironmentMP:
     self._dolphin_kwargs = dolphin_kwargs
 
     self._envs: list[AsyncEnvMP] = []
-    slippi_ports = utils.find_open_udp_ports(num_envs)
+    slippi_ports = utils.find_open_udp_ports(num_envs + num_envs // 2)
+    print("master slippi port list: ", slippi_ports)
+    idx = 0
     for i in range(self._outer_batch_size):
+      port_count = inner_batch_size if not (enable_singles and i % 2 == 0) else inner_batch_size * 2
+      env_ports = slippi_ports[idx:idx + port_count]
+      print("slippi_ports for env ", i, ": ", env_ports)
       env = AsyncEnvMP(
           dolphin_kwargs=dolphin_kwargs,
           num_envs=inner_batch_size,
           batch_time=(num_steps > 0),
-          slippi_ports=self._slice(i, slippi_ports),
+          slippi_ports=env_ports,
           num_retries=num_retries,
           swap_ports=swap_ports,
           enable_singles=enable_singles and i % 2 == 0,
       )
       self._envs.append(env)
+      idx += inner_batch_size
+      if enable_singles and i % 2 == 0:
+        # skip the next env since it will be singles mode
+        idx += inner_batch_size
 
     self._num_steps = num_steps
     self._action_queue: list[Controllers] = []
