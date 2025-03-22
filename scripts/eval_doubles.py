@@ -46,7 +46,7 @@ dolphin_config = dolphin_lib.DolphinConfig(
     path=os.environ.get('DOLPHIN_PATH'),
     iso=os.environ.get('ISO_PATH'),
     save_replays=True,
-    disable_audio=True,
+    disable_audio=False,
     blocking_input=True,
     #replay_dir="/mnt/c/Users/kyleh/git/slippi-ai/bot-replays",
     #slippi_port=51441,
@@ -89,6 +89,8 @@ def main(_):
   dolphin = dolphin_lib.Dolphin(
       players=players,
       desired_teams={1: 0, 2: 1, 3: 1, 4: 0},
+      #dolphin_home_path="/tmp/legacydubstest",
+      #tmp_home_directory=False,
       **dolphin_lib.DolphinConfig.kwargs_from_flags(DOLPHIN.value),
   )
 

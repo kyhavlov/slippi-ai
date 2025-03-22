@@ -59,6 +59,14 @@ class AI(Player):
   def menuing_kwargs(self) -> Dict:
       return dict(character_selected=self.character)
 
+class RemoteAI(Player):
+
+  def controller_type(self) -> melee.ControllerType:
+    return melee.ControllerType.STANDARD
+
+  def menuing_kwargs(self) -> Dict:
+      return {}
+
 def is_menu_state(gamestate: melee.GameState) -> bool:
   return gamestate.menu_state not in [melee.Menu.IN_GAME, melee.Menu.SUDDEN_DEATH]
 
@@ -84,6 +92,7 @@ class Dolphin:
       connect_code: Optional[str] = None,
       teams_connect_code: Optional[str] = None,
       desired_teams: Mapping[int, int] = {},
+      existing_dolphin: bool = False,
       **console_kwargs,
   ) -> None:
     self._players = players
@@ -118,7 +127,9 @@ class Dolphin:
 
     slippi_port = slippi_port or portpicker.pick_unused_port()
 
-    self.menu_helper = melee.MenuHelper(is_singles=len(players) == 2)
+    # if we have remote players, dont wait for them to select characters
+    remote_players = [port for port, player in players.items() if isinstance(player, RemoteAI)]
+    self.menu_helper = melee.MenuHelper(is_singles=len(players) == 2, remote_players=remote_players)
 
     '''print("blocking_input ", blocking_input)
     print("polling_mode ", console_timeout is not None)
@@ -152,17 +163,19 @@ class Dolphin:
     for port, player in players.items():
       controller = melee.Controller(
           console, port, player.controller_type())
-      self.controllers[port] = controller
+      if not isinstance(player, RemoteAI):
+        self.controllers[port] = controller
       if isinstance(player, Human):
         self._autostart = False
-      else:
+      elif not isinstance(player, RemoteAI):
         self._menuing_controllers.append((controller, player))
 
-    console.run(
-        iso_path=iso,
-        environment_vars=env_vars,
-        platform=platform,
-    )
+    if not existing_dolphin:
+      console.run(
+          iso_path=iso,
+          environment_vars=env_vars,
+          platform=platform,
+      )
 
     logging.info('Connecting to console...')
     #import time
@@ -201,7 +214,8 @@ class Dolphin:
       #print("menu state transition, shuffling characters")
       self.menu_helper.done_selecting_character = {}
       for port, player in self._players.items():
-        self.menu_helper.done_selecting_character[port] = False
+        if isinstance(player, AI):
+          self.menu_helper.done_selecting_character[port] = False
 
       new_characters = []
       for i, (controller, player) in enumerate(self._menuing_controllers):
@@ -298,6 +312,7 @@ class DolphinConfig:
   log_level: int = 3  # WARN; 0 to disable
   log_types: list[str] = dataclasses.field(default_factory=['SLIPPI'].copy)
   dump: DumpConfig = _field(DumpConfig)  # For framedumping.
+  existing_dolphin: bool = False  # If true, don't run dolphin. Use existing dolphin instance.
 
   # For online play
   connect_code: Optional[str] = None

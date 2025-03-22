@@ -670,7 +670,7 @@ AGENT_FLAGS = dict(
 )
 
 PLAYER_FLAGS = dict(
-    type=ff.Enum('ai', ('ai', 'human', 'cpu'), 'Player type.'),
+    type=ff.Enum('ai', ('ai', 'human', 'cpu', 'remoteai'), 'Player type.'),
     character=ff.EnumClass(
         melee.Character.FOX, melee.Character,
         'Character selected by agent or CPU.'),
@@ -696,6 +696,8 @@ def get_player(
     return dolphin.Human()
   elif type == 'cpu':
     return dolphin.CPU(character, level)
+  elif type == 'remoteai':
+    return dolphin.RemoteAI()
 
 
 def update_character(player: dolphin.AI, config: dict):
