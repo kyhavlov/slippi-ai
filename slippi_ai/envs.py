@@ -282,7 +282,7 @@ class BatchedEnvironment:
     envs: list[SafeEnvironment] = []
     for i in range(num_envs):
       dolphin_kwargs_i = dolphin_kwargs.copy()
-      dolphin_kwargs_i.update(slippi_port=slippi_ports[i*2])
+      dolphin_kwargs_i.update(slippi_port=slippi_ports[i])
       if enable_singles:
         dolphin_kwargs_i.update(slippi_port2=slippi_ports[i*2 + 1])
       env = SafeEnvironment(
@@ -443,6 +443,10 @@ class AsyncEnvMP:
         args=(builder_kwargs, child_conn),
         kwargs=dict(batch_time=batch_time))
     self._process.start()
+    
+    # Performance instrumentation
+    self._send_profiler = utils.Profiler()
+    self._recv_profiler = utils.Profiler()
 
   def stop(self):
     self.begin_stop()
@@ -481,7 +485,8 @@ class AsyncEnvMP:
 
   def send(self, controllers: tp.Union[Controllers, list[Controllers]]):
     try:
-      self._parent_conn.send(controllers)
+      with self._send_profiler:
+        self._parent_conn.send(controllers)
     except BrokenPipeError:
       # Attempt to retrieve exception from pipe.
       while True:
@@ -499,14 +504,9 @@ class AsyncEnvMP:
 
   def recv(self) -> EnvOutput:
     # TODO: ensure that enough data has been pushed?
-    recv_profiler = utils.Profiler()
     try:
-      output = self._recv()
-      '''with recv_profiler:
+      with self._recv_profiler:
         output = self._recv()
-
-      print("recv time: ", recv_profiler.mean_time())'''
-
     except ConnectionResetError as e:
       self.ensure_stopped()
       raise EnvError("run_env process died")
@@ -548,8 +548,8 @@ class AsyncBatchedEnvironmentMP:
     print("master slippi port list: ", slippi_ports)
     idx = 0
     for i in range(self._outer_batch_size):
-      port_count = inner_batch_size if not (enable_singles and i % 2 == 0) else inner_batch_size * 2
-      env_ports = slippi_ports[idx:idx + port_count]
+      port_count = 1 #inner_batch_size if not (enable_singles and i % 2 == 0) else inner_batch_size * 2
+      env_ports = slippi_ports[idx:idx + inner_batch_size]
       print("slippi_ports for env ", i, ": ", env_ports)
       env = AsyncEnvMP(
           dolphin_kwargs=dolphin_kwargs,
@@ -570,6 +570,16 @@ class AsyncBatchedEnvironmentMP:
     self._action_queue: list[Controllers] = []
     self._state_queue = collections.deque()
     self._num_in_transit = 1  # take into account initial state
+    
+    # Performance instrumentation
+    self._env_wait_profiler = utils.Profiler()  # Time waiting for envs to respond
+    self._serialization_in_profiler = utils.Profiler()  # Time spent processing received data
+    self._serialization_out_profiler = utils.Profiler()  # Time spent preparing data to send
+    self._total_receive_profiler = utils.Profiler()  # Total time spent in _receive()
+    self._last_pop_time = None  # Timestamp of last pop() call
+    self._controller_wait_times = []  # Time between pop() and push()
+    self._step_counter = 0  # Counter for periodic logging
+    self._log_frequency = 2000  # Log performance stats every N steps
 
   def qsize(self):
     return self._num_in_transit + len(self._state_queue)
@@ -599,21 +609,34 @@ class AsyncBatchedEnvironmentMP:
 
   def _flush(self):
     # Returns a time-indexed list of controller dictionaries.
-    get_action = lambda i: utils.map_single_structure(
-        lambda x: self._slice(i, x), self._action_queue)
+    with self._serialization_out_profiler:
+      get_action = lambda i: utils.map_single_structure(
+          lambda x: self._slice(i, x), self._action_queue)
 
-    for i, env in enumerate(self._envs):
-      env.send(get_action(i))
+      for i, env in enumerate(self._envs):
+        env.send(get_action(i))
 
     self._num_in_transit += len(self._action_queue)
     self._action_queue.clear()
 
   def push(self, controllers: Controllers):
+    # Measure time gap from pop to push (model thinking time)
+    if self._last_pop_time is not None:
+        wait_time = time.perf_counter() - self._last_pop_time
+        self._controller_wait_times.append(wait_time)
+        self._last_pop_time = None
+    
+    self._step_counter += 1
+    if self._step_counter >= self._log_frequency:
+        self._log_performance_stats()
+        self._step_counter = 0
+    
     if self._num_steps == 0:
-      get_action = lambda i: utils.map_single_structure(
-          lambda x: self._slice(i, x), controllers)
-      for i, env in enumerate(self._envs):
-        env.send(get_action(i))
+      with self._serialization_out_profiler:
+        get_action = lambda i: utils.map_single_structure(
+            lambda x: self._slice(i, x), controllers)
+        for i, env in enumerate(self._envs):
+          env.send(get_action(i))
       self._num_in_transit += 1
       return
 
@@ -622,27 +645,31 @@ class AsyncBatchedEnvironmentMP:
       self._flush()
 
   def _receive(self):
-    #start = time.perf_counter()
-
-    if self._num_steps == 0:
-      outputs = [env.recv() for env in self._envs]
-      output = utils.concat_nest_nt(outputs)
-      self._state_queue.appendleft(output)
-      self._num_in_transit -= 1
-    else:
-      batch_major = [env.recv() for env in self._envs]
-      time_major = zip(*batch_major)
-      for batch in time_major:
-        self._state_queue.appendleft(utils.concat_nest_nt(batch))
-        self._num_in_transit -= 1
-
-    #total = time.perf_counter() - start
-    #print("receive time: ", total)
+    with self._total_receive_profiler:
+      if self._num_steps == 0:
+        with self._env_wait_profiler:
+          outputs = [env.recv() for env in self._envs]
+        
+        with self._serialization_in_profiler:
+          output = utils.concat_nest_nt(outputs)
+          self._state_queue.appendleft(output)
+          self._num_in_transit -= 1
+      else:
+        with self._env_wait_profiler:
+          batch_major = [env.recv() for env in self._envs]
+        
+        with self._serialization_in_profiler:
+          time_major = zip(*batch_major)
+          for batch in time_major:
+            self._state_queue.appendleft(utils.concat_nest_nt(batch))
+            self._num_in_transit -= 1
 
   def pop(self) -> EnvOutput:
     if not self._state_queue:
       self._receive()
-    return self._state_queue.pop()
+    result = self._state_queue.pop()
+    self._last_pop_time = time.perf_counter()
+    return result
 
   def peek_n(self, n: int) -> list[EnvOutput]:
     while len(self._state_queue) < n:
@@ -653,6 +680,55 @@ class AsyncBatchedEnvironmentMP:
     if not self._state_queue:
       self._receive()
     return self._state_queue[-1]
+
+  def _log_performance_stats(self):
+    """Log performance statistics periodically."""
+    # Skip if we don't have enough data
+    if (self._env_wait_profiler.num_calls == 0 or 
+        not self._controller_wait_times):
+        return
+        
+    # Calculate mean waiting time for model input
+    '''controller_wait = sum(self._controller_wait_times) / len(self._controller_wait_times)
+    self._controller_wait_times = []  # Reset list
+    
+    # Calculate average serialization times from individual envs
+    env_send_times = [env._send_profiler.mean_time() * 1000 for env in self._envs 
+                     if env._send_profiler.num_calls > 0]
+    env_recv_times = [env._recv_profiler.mean_time() * 1000 for env in self._envs 
+                     if env._recv_profiler.num_calls > 0]
+    
+    avg_env_send = sum(env_send_times) / len(env_send_times) if env_send_times else 0
+    avg_env_recv = sum(env_recv_times) / len(env_recv_times) if env_recv_times else 0
+    
+    # Log the performance stats
+    logging.info(
+        f"Env performance stats (avg ms, queue: {len(self._state_queue)}, in_transit: {self._num_in_transit}):\n"
+        f"  Env wait time: {self._env_wait_profiler.mean_time() * 1000:.2f}\n"
+        f"  Recv serialization: {self._serialization_in_profiler.mean_time() * 1000:.2f}\n"
+        f"  Send serialization: {self._serialization_out_profiler.mean_time() * 1000:.2f}\n"
+        f"  Total receive time: {self._total_receive_profiler.mean_time() * 1000:.2f}\n"
+        f"  Env send time: {avg_env_send:.2f}\n"
+        f"  Env recv time: {avg_env_recv:.2f}\n"
+        f"  Controller wait time: {controller_wait * 1000:.2f}"
+    )
+    
+    # Periodically reset profilers (every 10 logs)'''
+    if self._step_counter % (self._log_frequency * 10) == 0:
+        self._reset_profilers()
+  
+  def _reset_profilers(self):
+    """Reset all profilers to avoid accumulating data over very long periods."""
+    logging.info("Resetting performance profilers")
+    self._env_wait_profiler = utils.Profiler()
+    self._serialization_in_profiler = utils.Profiler()
+    self._serialization_out_profiler = utils.Profiler()
+    self._total_receive_profiler = utils.Profiler()
+    
+    # Reset profilers in child environments
+    for env in self._envs:
+        env._send_profiler = utils.Profiler()
+        env._recv_profiler = utils.Profiler()
 
 import ray
 import socket
@@ -833,11 +909,12 @@ class AsyncBatchedEnvironmentRay:
 
   def _flush(self):
     # Returns a time-indexed list of controller dictionaries.
-    get_action = lambda i: utils.map_single_structure(
-        lambda x: self._slice(i, x), self._action_queue)
+    with self._serialization_out_profiler:
+      get_action = lambda i: utils.map_single_structure(
+          lambda x: self._slice(i, x), self._action_queue)
 
-    for i, env in enumerate(self._envs):
-      env.multi_step.remote(get_action(i))
+      for i, env in enumerate(self._envs):
+        env.multi_step.remote(get_action(i))
 
     self._num_in_transit += len(self._action_queue)
     self._action_queue.clear()

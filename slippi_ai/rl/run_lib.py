@@ -676,8 +676,11 @@ def run(config: Config):
     )
     pickled_state = pickle.dumps(combined_state)
 
-    logging.info('saving state to %s', pickle_path)
-    with open(pickle_path, 'wb') as f:
+    save_path = pickle_path 
+    if step % 100 == 0:
+      save_path = pickle_path + '_' + str(step)
+    logging.info('saving state to %s', save_path)
+    with open(save_path, 'wb') as f:
       f.write(pickled_state)
 
     # TODO: save to s3?
