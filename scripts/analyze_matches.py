@@ -13,6 +13,7 @@ Example usage:
     python analyze_matches.py --view=agent_pair_comps --agent1=Ralph --agent2=Darkatma
     python analyze_matches.py --view=agent_pair_comps --agent1=all --agent2=Ralph
     python analyze_matches.py --view=agent_pair_comps --agent1=all --agent2=all --min-matches=10
+    python analyze_matches.py --view=char_agent_winrates --sort-by=trueskill --min-matches=5
 """
 
 import os
@@ -280,15 +281,47 @@ def analyze_agent_team_winrates(matches: List[Dict], filter_model: Optional[str]
     # Sort by win rate (descending)
     return sorted(results, key=lambda x: x["win_rate"], reverse=True)
 
-def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
+def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str] = None, min_matches: int = 1, sort_by: str = "win_rate") -> List[Dict]:
     """
     Analyze character + agent name combination win rates from match data.
+    
+    Args:
+        matches: List of match dictionaries
+        filter_model: Optional model to filter results for
+        min_matches: Minimum number of matches required for inclusion
+        sort_by: Field to sort results by ("win_rate" or "trueskill")
     
     Returns:
         List of dictionaries with character + agent name win rate statistics.
     """
     char_agent_stats = defaultdict(lambda: {"wins": 0, "losses": 0})
     
+    # For TrueSkill calculation
+    import trueskill
+    env = trueskill.TrueSkill()
+    char_agent_ratings = {}
+    
+    # First, collect all character+agent combos that appear in any match
+    all_char_agent_combos = set()
+    for match in matches:
+        # Process all combos regardless of filtering
+        for i in range(len(match["winner_chars"])):
+            if i < len(match["winner_names"]):  # Ensure index is valid
+                char = match["winner_chars"][i]
+                agent = match["winner_names"][i]
+                all_char_agent_combos.add((char, agent))
+        
+        for i in range(len(match["loser_chars"])):
+            if i < len(match["loser_names"]):  # Ensure index is valid
+                char = match["loser_chars"][i]
+                agent = match["loser_names"][i]
+                all_char_agent_combos.add((char, agent))
+    
+    # Initialize ratings for all combos
+    for combo in all_char_agent_combos:
+        char_agent_ratings[combo] = env.create_rating()
+    
+    # Now collect stats with appropriate filtering
     for match in matches:
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
@@ -299,21 +332,77 @@ def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str]
         
         # Process winner combinations
         for i in range(len(match["winner_chars"])):
-            char = match["winner_chars"][i]
-            agent = match["winner_names"][i]
-            combo = (char, agent)
-            
-            if not filter_model or winner == filter_model:
-                char_agent_stats[combo]["wins"] += 1
+            if i < len(match["winner_names"]):  # Ensure index is valid
+                char = match["winner_chars"][i]
+                agent = match["winner_names"][i]
+                combo = (char, agent)
+                
+                if not filter_model or winner == filter_model:
+                    char_agent_stats[combo]["wins"] += 1
             
         # Process loser combinations
         for i in range(len(match["loser_chars"])):
-            char = match["loser_chars"][i]
-            agent = match["loser_names"][i]
-            combo = (char, agent)
+            if i < len(match["loser_names"]):  # Ensure index is valid
+                char = match["loser_chars"][i]
+                agent = match["loser_names"][i]
+                combo = (char, agent)
+                
+                if not filter_model or loser == filter_model:
+                    char_agent_stats[combo]["losses"] += 1
+    
+    # Process matches again to update TrueSkill ratings
+    for match in matches:
+        winner = extract_model_basename(match["winner"])
+        loser = extract_model_basename(match["loser"])
+        
+        # Skip if filtering by model and neither matches
+        if filter_model and filter_model not in (winner, loser):
+            continue
+        
+        # Create lists to hold the ratings for the winners and losers
+        winner_ratings = []
+        winner_combos = []
+        loser_ratings = []
+        loser_combos = []
+        
+        # Get winner character+agent combinations and their ratings
+        for i in range(len(match["winner_chars"])):
+            if i < len(match["winner_names"]):  # Ensure index is valid
+                char = match["winner_chars"][i]
+                agent = match["winner_names"][i]
+                combo = (char, agent)
+                winner_combos.append(combo)
+                winner_ratings.append(char_agent_ratings[combo])
+        
+        # Get loser character+agent combinations and their ratings
+        for i in range(len(match["loser_chars"])):
+            if i < len(match["loser_names"]):  # Ensure index is valid
+                char = match["loser_chars"][i]
+                agent = match["loser_names"][i]
+                combo = (char, agent)
+                loser_combos.append(combo)
+                loser_ratings.append(char_agent_ratings[combo])
+        
+        # Skip ratings update if there are no valid combinations
+        if not winner_ratings or not loser_ratings:
+            continue
+        
+        # Update ratings based on the match outcome
+        rating_groups = [winner_ratings, loser_ratings]
+        ranks = [0, 1]  # Lower rank means better performance
+        
+        try:
+            updated_ratings = env.rate(rating_groups, ranks=ranks)
             
-            if not filter_model or loser == filter_model:
-                char_agent_stats[combo]["losses"] += 1
+            # Update the ratings dictionary with the new ratings
+            for i, combo in enumerate(winner_combos):
+                char_agent_ratings[combo] = updated_ratings[0][i]
+            
+            for i, combo in enumerate(loser_combos):
+                char_agent_ratings[combo] = updated_ratings[1][i]
+        except Exception as e:
+            print(f"Warning: Error updating ratings for match ({str(e)})")
+            continue
     
     # Calculate win rates and format results
     results = []
@@ -322,6 +411,9 @@ def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str]
         if total >= min_matches:
             win_rate = calculate_win_percentage(stats["wins"], total)
             ci = confidence_interval(win_rate, total)
+            rating = char_agent_ratings[combo]
+            trueskill_value = rating.mu - 3 * rating.sigma  # Conservative estimate
+            
             results.append({
                 "character": combo[0],
                 "agent": combo[1],
@@ -329,11 +421,17 @@ def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str]
                 "losses": stats["losses"],
                 "total": total,
                 "win_rate": win_rate,
-                "confidence": ci
+                "confidence": ci,
+                "trueskill": trueskill_value,
+                "mu": rating.mu,
+                "sigma": rating.sigma
             })
     
-    # Sort by win rate (descending)
-    return sorted(results, key=lambda x: x["win_rate"], reverse=True)
+    # Sort by specified field (descending)
+    if sort_by == "trueskill":
+        return sorted(results, key=lambda x: x["trueskill"], reverse=True)
+    else:  # Default to win_rate
+        return sorted(results, key=lambda x: x["win_rate"], reverse=True)
 
 def calculate_trueskill(matches: List[Dict], filter_model: Optional[str] = None) -> List[Dict]:
     """
@@ -454,15 +552,16 @@ def print_agent_team_winrates(results: List[Dict]):
         print(f"{result['agent_team']:<30} {result['wins']:<7} {result['losses']:<7} {result['total']:<7} "
               f"{result['win_rate']:.1f}%    ±{result['confidence']:.1f}%")
 
-def print_char_agent_winrates(results: List[Dict]):
+def print_char_agent_winrates(results: List[Dict], sort_by: str = "win_rate"):
     """Print character + agent combination win rates in a nicely formatted table."""
-    print("\n=== Character + Agent Combination Win Rates ===")
-    print(f"{'Character':<15} {'Agent':<20} {'Wins':<7} {'Losses':<7} {'Total':<7} {'Win Rate':<10} {'95% CI':<10}")
-    print("-" * 80)
+    sort_method = "TrueSkill rating" if sort_by == "trueskill" else "win rate"
+    print(f"\n=== Character + Agent Combination Win Rates (sorted by {sort_method}) ===")
+    print(f"{'Character':<15} {'Agent':<20} {'Wins':<7} {'Losses':<7} {'Total':<7} {'Win Rate':<10} {'95% CI':<10} {'TrueSkill':<10}")
+    print("-" * 90)
     
     for result in results:
         print(f"{result['character']:<15} {result['agent']:<20} {result['wins']:<7} {result['losses']:<7} {result['total']:<7} "
-              f"{result['win_rate']:.1f}%    ±{result['confidence']:.1f}%")
+              f"{result['win_rate']:.1f}%    ±{result['confidence']:.1f}%    {result['trueskill']:.2f}")
 
 def print_trueskill_ratings(results: List[Dict]):
     """Print TrueSkill ratings in a nicely formatted table."""
@@ -481,7 +580,56 @@ def get_available_models(matches: List[Dict]) -> List[str]:
         models.add(extract_model_basename(match["loser"]))
     return sorted(list(models))
 
-def analyze_agent_pair_comps(matches: List[Dict], agent1: str, agent2: str, filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
+def calculate_overall_char_comp_winrates(matches: List[Dict], filter_model: Optional[str] = None) -> Dict[Tuple[str, str], float]:
+    """
+    Calculate the overall win rates for each character composition across all agent pairs.
+    
+    Args:
+        matches: List of match dictionaries
+        filter_model: Optional filter for specific model
+        
+    Returns:
+        Dictionary mapping character composition tuples to their overall win rates
+    """
+    # Track stats for each character composition
+    comp_stats = defaultdict(lambda: {"wins": 0, "losses": 0})
+    
+    for match in matches:
+        winner = extract_model_basename(match["winner"])
+        loser = extract_model_basename(match["loser"])
+        
+        # Skip if filtering by model and neither matches
+        if filter_model and filter_model not in (winner, loser):
+            continue
+        
+        # Process all character pairs in the winner team
+        winner_chars = match["winner_chars"]
+        for i in range(len(winner_chars)):
+            for j in range(i+1, len(winner_chars)):
+                # We need to ensure consistent ordering for character compositions
+                char_comp = tuple(sorted([winner_chars[i], winner_chars[j]]))
+                comp_stats[char_comp]["wins"] += 1
+        
+        # Process all character pairs in the loser team
+        loser_chars = match["loser_chars"]
+        for i in range(len(loser_chars)):
+            for j in range(i+1, len(loser_chars)):
+                # We need to ensure consistent ordering for character compositions
+                char_comp = tuple(sorted([loser_chars[i], loser_chars[j]]))
+                comp_stats[char_comp]["losses"] += 1
+    
+    # Calculate win rates for each character composition
+    overall_winrates = {}
+    for comp, stats in comp_stats.items():
+        total = stats["wins"] + stats["losses"]
+        if total > 0:
+            win_rate = calculate_win_percentage(stats["wins"], total)
+            overall_winrates[comp] = win_rate
+    
+    return overall_winrates
+
+def analyze_agent_pair_comps(matches: List[Dict], agent1: str, agent2: str, overall_winrates: Dict[Tuple[str, str], float] = None, 
+                             filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
     """
     Analyze character compositions used by a pair of agents when playing together.
     Differentiates which agent played which character.
@@ -490,6 +638,7 @@ def analyze_agent_pair_comps(matches: List[Dict], agent1: str, agent2: str, filt
         matches: List of match dictionaries
         agent1: First agent name
         agent2: Second agent name
+        overall_winrates: Dictionary of overall win rates for each character composition
         filter_model: Optional filter for specific model
         min_matches: Minimum number of matches required for inclusion in results
         
@@ -543,6 +692,17 @@ def analyze_agent_pair_comps(matches: List[Dict], agent1: str, agent2: str, filt
         if total >= min_matches:
             win_rate = calculate_win_percentage(stats["wins"], total)
             ci = confidence_interval(win_rate, total)
+            
+            # Calculate difference from overall win rate if available
+            diff_from_overall = None
+            if overall_winrates is not None:
+                # Need to find the overall win rate for this character composition
+                # We need to sort the characters to match the key in overall_winrates
+                sorted_chars = tuple(sorted([comp[0], comp[1]]))
+                if sorted_chars in overall_winrates:
+                    overall_wr = overall_winrates[sorted_chars]
+                    diff_from_overall = win_rate - overall_wr
+            
             results.append({
                 "agent1_char": comp[0],
                 "agent2_char": comp[1],
@@ -552,7 +712,8 @@ def analyze_agent_pair_comps(matches: List[Dict], agent1: str, agent2: str, filt
                 "losses": stats["losses"],
                 "total": total,
                 "win_rate": win_rate,
-                "confidence": ci
+                "confidence": ci,
+                "diff_from_overall": diff_from_overall
             })
     
     # Sort by total games (descending), then by win rate (descending)
@@ -561,13 +722,18 @@ def analyze_agent_pair_comps(matches: List[Dict], agent1: str, agent2: str, filt
 def print_agent_pair_comps(results: List[Dict], agent1: str, agent2: str):
     """Print character compositions used by a pair of agents in a nicely formatted table."""
     print(f"\n=== Character Compositions for {agent1} + {agent2} ===")
-    print(f"{'Character Assignment':<40} {'Games':<7} {'Wins':<7} {'Losses':<7} {'Win Rate':<10} {'95% CI':<10}")
-    print("-" * 85)
+    print(f"{'Character Assignment':<40} {'Games':<7} {'Wins':<7} {'Losses':<7} {'Win Rate':<10} {'95% CI':<10} {'vs Avg':<10}")
+    print("-" * 95)
     
     for result in results:
         char_assignment = f"{agent1} ({result['agent1_char']}) + {agent2} ({result['agent2_char']})"
+        diff_str = ""
+        if result["diff_from_overall"] is not None:
+            diff = result["diff_from_overall"]
+            diff_str = f"{diff:+.1f}%" if diff != 0 else "±0.0%"
+        
         print(f"{char_assignment:<40} {result['total']:<7} {result['wins']:<7} {result['losses']:<7} "
-              f"{result['win_rate']:.1f}%    ±{result['confidence']:.1f}%")
+              f"{result['win_rate']:.1f}%    ±{result['confidence']:.1f}%    {diff_str:<10}")
     
     # Print total count and overall win rate
     total_games = sum(result["total"] for result in results)
@@ -576,11 +742,12 @@ def print_agent_pair_comps(results: List[Dict], agent1: str, agent2: str):
     overall_win_rate = calculate_win_percentage(total_wins, total_games)
     overall_ci = confidence_interval(overall_win_rate, total_games)
     
-    print("-" * 85)
+    print("-" * 95)
     print(f"{'Overall':<40} {total_games:<7} {total_wins:<7} {total_losses:<7} "
           f"{overall_win_rate:.1f}%    ±{overall_ci:.1f}%")
 
-def analyze_all_agent_pair_comps(matches: List[Dict], specific_agent: Optional[str] = None, filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
+def analyze_all_agent_pair_comps(matches: List[Dict], specific_agent: Optional[str] = None, 
+                                filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
     """
     Analyze character compositions used by all agent pairs when playing together.
     
@@ -593,6 +760,9 @@ def analyze_all_agent_pair_comps(matches: List[Dict], specific_agent: Optional[s
     Returns:
         List of dictionaries with composition statistics for all agent pairs
     """
+    # Calculate overall character composition win rates for comparison
+    overall_winrates = calculate_overall_char_comp_winrates(matches, filter_model)
+    
     # First, identify all agent pairs that appear in the data
     agent_pairs = set()
     
@@ -631,7 +801,7 @@ def analyze_all_agent_pair_comps(matches: List[Dict], specific_agent: Optional[s
     
     for agent_pair in sorted(agent_pairs):
         agent1, agent2 = agent_pair
-        results = analyze_agent_pair_comps(matches, agent1, agent2, filter_model, min_matches)
+        results = analyze_agent_pair_comps(matches, agent1, agent2, overall_winrates, filter_model, min_matches)
         
         if results:  # Only include pairs that have results meeting min_matches criteria
             # Add agent pair info to each result
@@ -641,13 +811,13 @@ def analyze_all_agent_pair_comps(matches: List[Dict], specific_agent: Optional[s
             all_results.extend(results)
     
     # Sort by agent pair, then by total games (descending)
-    return sorted(all_results, key=lambda x: (x["agent_pair"], -x["total"]))
+    return sorted(all_results, key=lambda x: (x["agent_pair"], -x["diff_from_overall"]))
 
 def print_all_agent_pair_comps(results: List[Dict]):
     """Print character compositions used by all agent pairs in a nicely formatted table."""
     print("\n=== Character Compositions for All Agent Pairs ===")
-    print(f"{'Agent Pair':<25} {'Character Assignment':<60} {'Games':<7} {'Wins':<7} {'Losses':<7} {'Win Rate':<10} {'95% CI':<10}")
-    print("-" * 110)
+    print(f"{'Agent Pair + Characters':<60} {'Games':<7} {'Wins':<7} {'Losses':<7} {'Win Rate':<10} {'95% CI':<10} {'vs Avg':<10}")
+    print("-" * 120)
     
     current_pair = None
     pair_totals = defaultdict(lambda: {"games": 0, "wins": 0, "losses": 0})
@@ -667,25 +837,31 @@ def print_all_agent_pair_comps(results: List[Dict]):
                 prev_totals = pair_totals[current_pair]
                 prev_win_rate = calculate_win_percentage(prev_totals["wins"], prev_totals["games"])
                 prev_ci = confidence_interval(prev_win_rate, prev_totals["games"])
-                print(f"{'':<25} {'SUBTOTAL':<60} {prev_totals['games']:<7} {prev_totals['wins']:<7} "
+                print(f"{'SUBTOTAL':<60} {prev_totals['games']:<7} {prev_totals['wins']:<7} "
                       f"{prev_totals['losses']:<7} {prev_win_rate:.1f}%    ±{prev_ci:.1f}%")
-                print("-" * 110)
+                print("-" * 120)
             
             current_pair = agent_pair
         
         # Display character assignment
         char_assignment = f"{result['agent1']} ({result['agent1_char']}) + {result['agent2']} ({result['agent2_char']})"
         
-        print(f"{agent_pair if agent_pair != current_pair else '':<25} {char_assignment:<60} "
+        # Format the difference from overall win rate
+        diff_str = ""
+        if result["diff_from_overall"] is not None:
+            diff = result["diff_from_overall"]
+            diff_str = f"{diff:+.1f}%" if diff != 0 else "±0.0%"
+        
+        print(f"{char_assignment:<60} "
               f"{result['total']:<7} {result['wins']:<7} {result['losses']:<7} "
-              f"{result['win_rate']:.1f}%    ±{result['confidence']:.1f}%")
+              f"{result['win_rate']:.1f}%    ±{result['confidence']:.1f}%    {diff_str:<10}")
     
     # Print subtotal for last pair
     if current_pair is not None:
         last_totals = pair_totals[current_pair]
         last_win_rate = calculate_win_percentage(last_totals["wins"], last_totals["games"])
         last_ci = confidence_interval(last_win_rate, last_totals["games"])
-        print(f"{'':<25} {'SUBTOTAL':<40} {last_totals['games']:<7} {last_totals['wins']:<7} "
+        print(f"{'SUBTOTAL':<60} {last_totals['games']:<7} {last_totals['wins']:<7} "
               f"{last_totals['losses']:<7} {last_win_rate:.1f}%    ±{last_ci:.1f}%")
     
     # Print grand total
@@ -695,8 +871,8 @@ def print_all_agent_pair_comps(results: List[Dict]):
     overall_win_rate = calculate_win_percentage(total_wins, total_games)
     overall_ci = confidence_interval(overall_win_rate, total_games)
     
-    print("=" * 110)
-    print(f"{'GRAND TOTAL':<25} {'':<40} {total_games:<7} {total_wins:<7} {total_losses:<7} "
+    print("=" * 120)
+    print(f"{'GRAND TOTAL':<60} {total_games:<7} {total_wins:<7} {total_losses:<7} "
           f"{overall_win_rate:.1f}%    ±{overall_ci:.1f}%")
 
 def get_unique_agents(matches: List[Dict], filter_model: Optional[str] = None) -> List[str]:
@@ -760,6 +936,12 @@ def main():
         "--agent2",
         help="Second agent name for agent pair composition analysis, or 'all' for all agents"
     )
+    parser.add_argument(
+        "--sort-by",
+        choices=["win_rate", "trueskill"],
+        default="win_rate",
+        help="Field to sort character + agent combinations by"
+    )
     
     args = parser.parse_args()
     
@@ -810,8 +992,8 @@ def main():
         print_agent_team_winrates(results)
     
     if args.view == "char_agent_winrates" or args.view == "all":
-        results = analyze_char_agent_winrates(matches, filter_model, args.min_matches)
-        print_char_agent_winrates(results)
+        results = analyze_char_agent_winrates(matches, filter_model, args.min_matches, args.sort_by)
+        print_char_agent_winrates(results, args.sort_by)
     
     if args.view == "trueskill" or args.view == "all":
         try:
@@ -829,6 +1011,9 @@ def main():
             print("Example: python analyze_matches.py --view=agent_pair_comps --agent1=all --agent2=Ralph")
             print("Example: python analyze_matches.py --view=agent_pair_comps --agent1=all --agent2=all --min-matches=10")
             return
+
+        # Calculate overall character composition win rates for comparison
+        overall_winrates = calculate_overall_char_comp_winrates(matches, filter_model)
         
         # Handle the 'all' wildcard
         if args.agent1.lower() == 'all' and args.agent2.lower() == 'all':
@@ -854,7 +1039,7 @@ def main():
             print_all_agent_pair_comps(results)
         else:
             # Neither is 'all' - analyze the specific pair
-            results = analyze_agent_pair_comps(matches, args.agent1, args.agent2, filter_model, args.min_matches)
+            results = analyze_agent_pair_comps(matches, args.agent1, args.agent2, overall_winrates, filter_model, args.min_matches)
             if not results:
                 print(f"\nNo games found where {args.agent1} and {args.agent2} played together" + 
                       (f" in model {filter_model}" if filter_model else ""))
