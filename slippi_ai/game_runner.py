@@ -193,6 +193,7 @@ class GameRunnerActor:
             "blocking_input": True,
             "fullscreen": False,
             "emulation_speed": 0.0,
+            "stage": melee.Stage.RANDOM_STAGE,
         }
         
         dolphin = dolphin_lib.Dolphin(

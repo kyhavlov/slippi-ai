@@ -636,25 +636,25 @@ def run(config: Config):
     if metrics is None:
       return
 
-    logging.info('\nStep: ' + str(step))
+    logging.info('Step: ' + str(step))
 
     timings: dict = metrics['timings']
     timing_str = ', '.join(
         ['{k}: {v:.3f}'.format(k=k, v=v) for k, v in timings.items()])
-    print(timing_str)
+    logging.info(timing_str)
 
     ko_diff = metrics.get('ko_diff')
     if ko_diff is not None:
-      print(f'KO_diff_per_minute: {ko_diff:.3f}')
+      logging.info(f'KO_diff_per_minute: {ko_diff:.3f}')
 
     learner_metrics = metrics['learner']
     pre_update = learner_metrics['ppo_step']['0']
     mean_actor_kl = pre_update['actor_kl']['mean']
     max_actor_kl = pre_update['actor_kl']['max']
-    print(f'actor_kl: mean={mean_actor_kl:.3g} max={max_actor_kl:.3g}')
+    logging.info(f'actor_kl: mean={mean_actor_kl:.3g} max={max_actor_kl:.3g}')
     teacher_kl = pre_update['teacher_kl']
-    print(f'teacher_kl: {teacher_kl:.3g}')
-    print(f'uev: {learner_metrics["value"]["uev"]:.3f}')
+    logging.info(f'teacher_kl: {teacher_kl:.3g}')
+    logging.info(f'uev: {learner_metrics["value"]["uev"]:.3f}')
 
   maybe_flush = utils.Periodically(flush, config.runtime.log_interval)
 
@@ -721,18 +721,21 @@ def run(config: Config):
 
     logging.info('Main training loop')
 
-    '''initial_weight = 0.0025
-    final_weight = 0.002
-    total_reduction_steps = 100
+    '''initial_weight = 0.001
+    final_weight = 0.0001
+    total_reduction_steps = 1000
 
-    initial_step = step
+    initial_step = 400
     final_step = initial_step + total_reduction_steps'''
 
     for i in range(config.runtime.max_step):
       # anneal the kl_teacher_weight from initial_weight to final_weight over total_reduction_steps
-      '''if step >= initial_step and step <= final_step:
+      '''if step >= initial_step and step < final_step:
         config.learner.kl_teacher_weight = initial_weight - ((initial_weight - final_weight) / total_reduction_steps) * (step - initial_step)
-        print("lowered kl_teacher weight: ", config.learner.kl_teacher_weight)'''
+        print("lowered kl_teacher weight: ", config.learner.kl_teacher_weight)
+      elif step >= final_step:
+        config.learner.kl_teacher_weight = final_weight
+        print("using final kl_teacher weight: ", config.learner.kl_teacher_weight)'''
 
       with step_profiler:
         if i > 0 and reset_interval and i % reset_interval == 0:

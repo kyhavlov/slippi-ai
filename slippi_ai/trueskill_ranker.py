@@ -85,6 +85,18 @@ class ModelRanker:
             self.ratings[model_name] = trueskill.Rating()
         return self.ratings[model_name]
     
+    def ensure_model_registered(self, model_name: str):
+        """Ensure a model has a TrueSkill rating created for it.
+        
+        This is similar to get_rating, but doesn't return the rating.
+        It's useful for initialization when you just want to make sure
+        the model is registered in the system.
+        """
+        if model_name not in self.ratings:
+            self.ratings[model_name] = trueskill.Rating()
+            # Save the ratings after adding a new model
+            self.save_ratings()
+    
     def update_rating(self, 
                      winner_model: str, 
                      loser_model: str, 
