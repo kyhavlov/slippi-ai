@@ -3,7 +3,7 @@
 ## Mission & Scope
 - This is a SSBM ai project started by vladfi1 and forked by me with modifications to support 2v2.
 - Goal: keep pipeline maintainable for human + LLM contributors spanning data prep, imitation, RL, evaluation, and analytics.
-- Default branch currently targets the doubles extension; legacy singles code remains but may diverge.
+- Currently targets the doubles extension; legacy singles code remains but may diverge.
 
 ## Systems Overview
 - **Data ingestion** – parse Slippi replays into parquet + metadata (`slippi_db/parse_local.py:1`) feeding imitation datasets in `data/`.
@@ -80,6 +80,13 @@
 - Normalize script duplication (`scripts/online_doubles*.sh`) into param-driven templates.
 - Document dashboard API contract and hard-coded URL in `slippi_ai/match_reporting.py:6`.
 - Evaluate migrating from TensorFlow to JAX/PyTorch if long-term maintenance demands (requires major refactor).
+
+## Roadmap
+- Pull in some of the upstream improvements from https://github.com/vladfi1/slippi-ai on the imitation-dev branch: item/projectile embeddings, nana embedding per-player, randall embedding (have one currently but it's probably incorrectly done/suboptimal), support for balancing replay data per-character during imitation learning. Probably other small improvements as well in the history of that branch.
+- Double check that the player embeddings are properly voided for the singles games we use for imitation training. This would be in both the replay pre-processing and the IL code to double check the gamestate the model gets makes it obvious in some way that the player is not there/eliminated. I added an 'is_teams' embedding at some point but i'm not sure it's well done.
+- Add support for splitting training between some % singles and some % doubles games during RL. Last time i looked into this it was tricky because of how the batches from the envs are lined up/prepared, and having envs of different sizes (2 vs 4 players each) seemed to present complications. This should be doable though, but it will take some care and testing.
+- Set up a script to load a trained model and run a replay through it in order to log its value function from one player's perspective throughout the game. Emit a readable graph as well.
+- Experiment with smaller network size for faster inference/training.
 
 ## Quick Reference
 - Launch imitation: `./scripts/imitation_doubles.sh --config.dataset.meta_path=data/meta.json`
