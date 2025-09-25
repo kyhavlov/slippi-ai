@@ -26,12 +26,51 @@ def main(_):
             replay_path = os.path.join(data_dir, 'Parsed', replay_meta.slp_md5)
 
             def make_replay_info(port: int):
-                return ReplayInfo(replay_path, port, 1, replay_meta.p0.name, replay_meta)
+                teammate_index = 1
+                other_ports = tuple(i for i in range(4) if i not in (port, teammate_index))
+                return ReplayInfo(
+                    replay_path,
+                    port,
+                    teammate_index,
+                    replay_meta.p0.name,
+                    replay_meta,
+                    other_ports,
+                )
 
-            info_list = [ReplayInfo(replay_path, 0, 1, replay_meta.p0.name, replay_meta),
-                            ReplayInfo(replay_path, 1, 0, replay_meta.p1.name, replay_meta),
-                            ReplayInfo(replay_path, 2, 3, replay_meta.p1.name, replay_meta),
-                            ReplayInfo(replay_path, 3, 2, replay_meta.p1.name, replay_meta)]
+            info_list = [
+                ReplayInfo(
+                    replay_path,
+                    0,
+                    1,
+                    replay_meta.p0.name,
+                    replay_meta,
+                    tuple(i for i in range(4) if i not in (0, 1)),
+                ),
+                ReplayInfo(
+                    replay_path,
+                    1,
+                    0,
+                    replay_meta.p1.name,
+                    replay_meta,
+                    tuple(i for i in range(4) if i not in (1, 0)),
+                ),
+                ReplayInfo(
+                    replay_path,
+                    2,
+                    3,
+                    replay_meta.p1.name,
+                    replay_meta,
+                    tuple(i for i in range(4) if i not in (2, 3)),
+                ),
+                ReplayInfo(
+                    replay_path,
+                    3,
+                    2,
+                    replay_meta.p1.name,
+                    replay_meta,
+                    tuple(i for i in range(4) if i not in (3, 2)),
+                ),
+            ]
             
             '''info_list = [ReplayInfo(replay_path, 0, 2, replay_meta.p0.name, replay_meta),
                             ReplayInfo(replay_path, 1, 3, replay_meta.p1.name, replay_meta)]'''

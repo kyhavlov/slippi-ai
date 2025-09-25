@@ -75,6 +75,7 @@ class ReplayInfo(NamedTuple):
   teammate_index: int
   main_player_name: str
   meta: Union[ReplayMeta, Tuple[()]] = ()
+  opponent_order: Tuple[int, int] = (2, 3)
 
   @property
   def main_player(self) -> PlayerMeta:
@@ -160,47 +161,59 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
     # each replay will have the self player as p0 and the opponent randomized
     # as either p2 or p3 seeded by the replay_meta.slp_md5 value
     if replay_meta.is_singles:
-      # Use the last byte of MD5 hash to determine opponent position
-      hash_val = int(replay_meta.slp_md5[-1], 16)
-      opponent_idx = 2 if hash_val % 2 == 0 else 3
+      players = [replay_meta.p0, replay_meta.p1]
 
-      # For each player (0 and 1)
-      for player_index in range(2):
-        players = [replay_meta.p0, replay_meta.p1]
-        player = players[player_index]
+      # Promote each player to the p0 slot while keeping teammate empty (p1) and
+      # the opponent in the remaining visible slot after swapping.
+      for player_index, player in enumerate(players):
         opponent = players[1 - player_index]
 
-        # Check if player's character is allowed
         if player.character not in allowed_characters:
           continue
 
-        # Check if opponent's character is allowed
         if opponent.character not in allowed_opponents:
           continue
 
-        # Check for banned names
         if nametags.is_banned_name(player.name):
           banned_counts[player.name] += 1
           continue
 
-        # Create empty teammate and remaining opponent slots
         empty_player = PlayerMeta(character=0, name='', team=0)
 
-        # Create replay info with player as p0, empty p1, and opponent in either p2 or p3
+        if player_index == 0:
+          main_index = 0
+        else:
+          main_index = 2
+
+        teammate_index = 1
+        other_ports = [i for i in range(4) if i not in (main_index, teammate_index)]
+        assert len(other_ports) == 2
+
+        hash_val = int(replay_meta.slp_md5[-1], 16)
+        opponent_order = tuple(other_ports if hash_val % 2 == 0 else reversed(other_ports))
+
+        meta_slots = [empty_player, empty_player, empty_player, empty_player]
+        meta_slots[main_index] = player
+        meta_slots[opponent_order[0]] = opponent
+        meta_slots[opponent_order[1]] = empty_player
+
+        meta = ReplayMeta(
+            p0=meta_slots[0],
+            p1=meta_slots[1],
+            p2=meta_slots[2],
+            p3=meta_slots[3],
+            stage=replay_meta.stage,
+            slp_md5=replay_meta.slp_md5,
+            is_singles=True,
+        )
+
         replays.append(ReplayInfo(
             replay_path,
-            main_player_index=0,  # Always 0 since we swap in swap_players
-            teammate_index=1,     # Always 1 since we swap in swap_players
+            main_player_index=main_index,
+            teammate_index=teammate_index,
             main_player_name=player.name,
-            meta=ReplayMeta(
-                p0=player,
-                p1=empty_player,
-                p2=opponent if opponent_idx == 2 else empty_player,
-                p3=opponent if opponent_idx == 3 else empty_player,
-                stage=replay_meta.stage,
-                slp_md5=replay_meta.slp_md5,
-                is_singles=True
-            )
+            meta=meta,
+            opponent_order=opponent_order,
         ))
 
       continue
@@ -235,14 +248,23 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
       teammate_index = next((i for i, p in enumerate(players) if p.team == team_id and i != player_index), -1)
 
       if teammate_index != -1:
-        replays.append(ReplayInfo(replay_path, player_index, teammate_index, players[player_index].name, replay_meta))
+        other_ports = tuple(i for i in range(4) if i not in (player_index, teammate_index))
+        assert len(other_ports) == 2
+        replays.append(ReplayInfo(
+            replay_path,
+            player_index,
+            teammate_index,
+            players[player_index].name,
+            replay_meta,
+            other_ports,
+        ))
       else:
         invalid_team_id_count += 1
 
       #print("added replay", row['name'], player_index, players[player_index].name, players[player_index].character, teammate_index)
 
-  print("invalid team id game count (3v1?): ", invalid_team_id_count)
-  print('Banned names:', banned_counts)
+  #print("invalid team id game count (3v1?): ", invalid_team_id_count)
+  #print('Banned names:', banned_counts)
 
   return replays
 
@@ -262,16 +284,6 @@ def train_test_split(
     assert all(info.meta.slp_md5 in filenames_set for info in replays)
   else:
     raise ValueError("Please provide a metadata file.")
-    if not (config.allowed_characters == 'all'
-            and config.allowed_opponents == 'all'):
-      raise ValueError(
-          "Can't filter by character without metadata. "
-          "Please provide a metadata file.")
-
-    for filename in filenames:
-      replay_path = os.path.join(config.data_dir, filename)
-      replays.append(ReplayInfo(replay_path, False))
-      replays.append(ReplayInfo(replay_path, True))
 
   # TODO: stable partition
   rng = random.Random(config.seed)
@@ -373,11 +385,14 @@ class TrajectoryManager:
 
     return Chunk(states, ChunkMeta(start, end, self.info))
 
-# swap info.main_player_index and info.teammate_index to p0 and p1
-# of game and put the other 2 players in p2 and p3
+# swap players to the ports specified by the given ReplayInfo
 def swap_players(game: Game, info: ReplayInfo) -> Game:
-  # make a list of the ports in 0-3 that aren't the main player or teammate
-  opponent_ports = [i for i in range(4) if i not in [info.main_player_index, info.teammate_index]]
+  # make a list of the ports specified for opponents
+  if info.opponent_order is not None:
+    opponent_ports = info.opponent_order
+  else:
+    opponent_ports = tuple(i for i in range(4)
+                           if i not in (info.main_player_index, info.teammate_index))
 
   p0 = getattr(game, f'p{info.main_player_index}')
   p1 = getattr(game, f'p{info.teammate_index}')

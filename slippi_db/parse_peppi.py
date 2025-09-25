@@ -127,32 +127,19 @@ def from_peppi(game: peppi_py.Game) -> types.GAME_TYPE:
     assert not was_nan'''
 
   if len(game.start['players']) == 2:
-    players['p2'] = zero_out_namedtuple(players['p0'])
-    players['p2'].is_dead.fill(True)
-    players['p3'] = zero_out_namedtuple(players['p0'])
-    players['p3'].is_dead.fill(True)
+    player0 = players['p0']
+    player1 = players['p1']
 
-    '''print(players['p0'])
-    print(len(players['p0'].x))
-    print(len(players['p0'].shield_strength))
-    print('=========================================')
-    print('=========================================')
-    print('=========================================')
-    print(players['p1'])
-    print(len(players['p1'].x))
-    print(len(players['p1'].shield_strength))
-    print('=========================================')
-    print('=========================================')
-    print('=========================================')
-    print(players['p2'])
-    print(len(players['p2'].x))
-    print(len(players['p2'].shield_strength))
-    print('=========================================')
-    print('=========================================')
-    print('=========================================')
-    print(players['p3'])
-    print(len(players['p3'].x))
-    print(len(players['p3'].shield_strength))'''
+    empty_player = zero_out_namedtuple(player0)
+    empty_player.is_dead.fill(True)
+
+    players = {
+        'p0': player0,
+        'p1': empty_player,
+        'p2': player1,
+        'p3': zero_out_namedtuple(player0),
+    }
+    players['p3'].is_dead.fill(True)
 
   stage = melee.enums.to_internal_stage(game.start['stage'])
   stage = np.full([len(frames)], stage.value, dtype=np.uint8)

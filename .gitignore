@@ -166,6 +166,8 @@ git
 env.bat
 data/
 *.slp
+!tests/data/replays/test_singles_game.slp
+!tests/data/replays/test_doubles_game.slp
 discordbot/
 dashboard/melee_data
 archived_models/
@@ -177,3 +179,4 @@ match_data/
 *.csv
 *.png
 .linuxvenv/
+.oldvenv/
