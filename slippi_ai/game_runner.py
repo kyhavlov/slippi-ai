@@ -91,6 +91,12 @@ class GameRunnerActor:
             
             # Run the game and get results
             result = self._run_game_loop(dolphin, agents)
+
+            # wait for game to transition to menu
+            while dolphin.next_gamestate().menu_state == melee.Menu.IN_GAME:
+                time.sleep(0.01)
+            
+            time.sleep(1)
             
             # Add metadata to result
             result.update({

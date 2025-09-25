@@ -131,12 +131,6 @@ class Dolphin:
     remote_players = [port for port, player in players.items() if isinstance(player, RemoteAI)]
     self.menu_helper = melee.MenuHelper(is_singles=len(players) == 2, remote_players=remote_players)
 
-    '''print("blocking_input ", blocking_input)
-    print("polling_mode ", console_timeout is not None)
-    print("polling_timeout ", console_timeout)
-    print("console_kwargs ", console_kwargs)'''
-    # print("starting dolphin with slippi_port = ", slippi_port)
-
     console = melee.Console(
         path=path,
         online_delay=online_delay,
@@ -178,8 +172,7 @@ class Dolphin:
       )
 
     logging.info('Connecting to console...')
-    #import time
-    #time.sleep(6000)
+
     if not console.connect():
       import os
       logging.error(
@@ -207,11 +200,8 @@ class Dolphin:
     #   And can warn you if it's taking too long
     #if self.console.processingtime * 1000 > 12:
     #    print("WARNING: Last frame took " + str(self.console.processingtime*1000) + "ms to process.")
-    if gamestate.menu_state is melee.Menu.SUDDEN_DEATH:
-      raise Exception("SUDDEN DEATH")
 
     if is_menu_state(gamestate) and not self._prev_menu_state:
-      #print("menu state transition, shuffling characters")
       self.menu_helper.done_selecting_character = {}
       for port, player in self._players.items():
         if isinstance(player, AI):
@@ -223,7 +213,7 @@ class Dolphin:
           player.shuffle_character()
           new_characters.append(player.character)
       
-      print(f"shuffled characters for next game: {new_characters}")
+      print(f"shuffled characters for next game: {new_characters} port: {self.console.slippi_port}")
 
     self._prev_menu_state = is_menu_state(gamestate)
 
@@ -313,10 +303,12 @@ class DolphinConfig:
   log_types: list[str] = dataclasses.field(default_factory=['SLIPPI'].copy)
   dump: DumpConfig = _field(DumpConfig)  # For framedumping.
   existing_dolphin: bool = False  # If true, don't run dolphin. Use existing dolphin instance.
+  force_lan_ip: Optional[str] = None  # Force Slippi LAN IP
 
   # For online play
   connect_code: Optional[str] = None
   user_json_path: Optional[str] = None
+  user_json_path2: Optional[str] = None
 
   def to_kwargs(self) -> dict:
     kwargs = dataclasses.asdict(self)

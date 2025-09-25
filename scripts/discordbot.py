@@ -377,10 +377,14 @@ def get_valid_playstyle_choices():
 class ChannelRestrictedCommandTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Check if the interaction is from an allowed channel"""
+        # Allow commands through direct messages
+        if interaction.guild is None:
+            return True
+
         # Allow interactions in the 'phillip-connect' channel
         if interaction.channel and interaction.channel.name == 'phillip-connect':
             return True
-            
+
         # Inform the user if they're in the wrong channel
         await interaction.response.send_message(
             "Commands can only be used in the #phillip-connect channel.", 
@@ -467,6 +471,7 @@ class DiscordBot(commands.Bot):
                 name="Basic Commands",
                 value="`/play1` - Start a game with one AI agent\n"
                       "`/play2` - Start a game with two AI agents\n"
+                      "`/play3` - Start a game with three AI agents\n"
                       "`/stop` - Stop your current game session\n"
                       "`/status` - Show current bot status",
                 inline=False
@@ -481,7 +486,7 @@ class DiscordBot(commands.Bot):
             
             embed.add_field(
                 name="How to Play",
-                value="Use `/play1` or `/play2` with your connect code, create a direct lobby, and wait for the AI to join.",
+                value="Use `/play1`, `/play2`, or `/play3` with your connect code, create a direct lobby, and wait for the AI to join.",
                 inline=False
             )
             
@@ -495,20 +500,41 @@ class DiscordBot(commands.Bot):
         
         # Reload models command (admin only)
         @self.tree.command(name="reload", description="Reload available models (Admin only)")
-        async def reload_command(interaction: discord.Interaction):
+        @app_commands.describe(
+            default_model="Optional: Set a new default model"
+        )
+        async def reload_command(interaction: discord.Interaction, default_model: str = None):
             if not self.is_admin(interaction):
                 await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
                 return
                 
             with self.lock:
                 self._reload_models()
-            models_str = ", ".join(self._models)
-            embed = discord.Embed(
-                title="Available Agents",
-                description=models_str,
-                color=discord.Color.green()
-            )
-            await interaction.response.send_message(embed=embed)
+                
+                # Update default model if provided and valid
+                if default_model:
+                    if default_model in self._models:
+                        self._default_agent_name = default_model
+                        await interaction.response.send_message(f"Models reloaded. Default model set to {default_model}")
+                    else:
+                        # Invalid model name provided
+                        models_str = ", ".join(self._models)
+                        await interaction.response.send_message(f"Models reloaded. Invalid default model '{default_model}'. Available models: {models_str}")
+                        return
+                else:
+                    # No default model provided, just show available models
+                    models_str = ", ".join(self._models)
+                    embed = discord.Embed(
+                        title="Available Agents",
+                        description=models_str,
+                        color=discord.Color.green()
+                    )
+                    embed.add_field(
+                        name="Default Agent",
+                        value=self._default_agent_name,
+                        inline=False
+                    )
+                    await interaction.response.send_message(embed=embed)
         
         # List agents command
         @self.tree.command(name="agents", description="List available AI agents")
@@ -555,7 +581,6 @@ class DiscordBot(commands.Bot):
                 self._stop_sessions([self._sessions[user_id]])
                 await interaction.response.send_message(f'Stopped playing against {interaction.user.name}')
         
-        # Update the /play command to make the character parameter required
         @self.tree.command(name="play1", description="Start a game with one AI agent")
         @app_commands.describe(
             connect_code="Your Slippi lobby code (no # needed)",
@@ -594,6 +619,12 @@ class DiscordBot(commands.Bot):
                         'Sorry, too many sessions already active.', 
                         ephemeral=True
                     )
+                    return
+
+                # Validate the connect code
+                is_valid, error_message = self._is_valid_connect_code(connect_code)
+                if not is_valid:
+                    await interaction.response.send_message(error_message, ephemeral=True)
                     return
 
                 # Just use the connect code as provided - no # needed for doubles
@@ -653,7 +684,6 @@ class DiscordBot(commands.Bot):
                     personalities={port: playstyle}
                 )
         
-        # Update the /play2 command to correctly handle team colors for both agents
         @self.tree.command(name="play2", description="Start a game with two AI agents")
         @app_commands.describe(
             connect_code="Your Slippi lobby code",
@@ -705,6 +735,12 @@ class DiscordBot(commands.Bot):
                         'Sorry, too many sessions already active.', 
                         ephemeral=True
                     )
+                    return
+
+                # Validate the connect code
+                is_valid, error_message = self._is_valid_connect_code(connect_code)
+                if not is_valid:
+                    await interaction.response.send_message(error_message, ephemeral=True)
                     return
 
                 # Just use the connect code as provided - no # needed for doubles
@@ -785,6 +821,182 @@ class DiscordBot(commands.Bot):
                     agents={1: agent1_name, 2: agent2_name},  # Using logical ports as keys
                     team_colors=team_colors,
                     personalities={1: playstyle1, 2: playstyle2}
+                )
+        
+        @self.tree.command(name="play3", description="Start a game with three AI agents")
+        @app_commands.describe(
+            connect_code="Your Slippi lobby code",
+            character1="Character for first agent",
+            team1="Team color for first agent",
+            character2="Character for second agent",
+            team2="Team color for second agent",
+            character3="Character for third agent",
+            team3="Team color for third agent",
+            playstyle1="Playstyle for first agent",
+            playstyle2="Playstyle for second agent",
+            playstyle3="Playstyle for third agent"
+        )
+        @app_commands.choices(team1=[
+            app_commands.Choice(name="Red", value="red"),
+            app_commands.Choice(name="Blue", value="blue"),
+            app_commands.Choice(name="Green", value="green"),
+        ])
+        @app_commands.choices(team2=[
+            app_commands.Choice(name="Red", value="red"),
+            app_commands.Choice(name="Blue", value="blue"),
+            app_commands.Choice(name="Green", value="green"),
+        ])
+        @app_commands.choices(team3=[
+            app_commands.Choice(name="Red", value="red"),
+            app_commands.Choice(name="Blue", value="blue"),
+            app_commands.Choice(name="Green", value="green"),
+        ])
+        @app_commands.choices(character1=get_valid_character_choices())
+        @app_commands.choices(character2=get_valid_character_choices())
+        @app_commands.choices(character3=get_valid_character_choices())
+        @app_commands.choices(playstyle1=get_valid_playstyle_choices())
+        @app_commands.choices(playstyle2=get_valid_playstyle_choices())
+        @app_commands.choices(playstyle3=get_valid_playstyle_choices())
+        async def play3_command(
+            interaction: discord.Interaction, 
+            connect_code: str, 
+            character1: str,
+            team1: str,
+            character2: str,
+            team2: str,
+            character3: str,
+            team3: str,
+            playstyle1: str = "Master Player",
+            playstyle2: str = "Master Player",
+            playstyle3: str = "Master Player",
+        ):
+            with self.lock:
+                user_id = interaction.user.id
+
+                if user_id in self._sessions:
+                    await interaction.response.send_message(
+                        f'{interaction.user.name}, you are already playing', 
+                        ephemeral=True
+                    )
+                    return
+
+                await self._gc_sessions()
+
+                if len(self._sessions) >= self._max_sessions:
+                    await interaction.response.send_message(
+                        'Sorry, too many sessions already active.', 
+                        ephemeral=True
+                    )
+                    return
+
+                # Validate the connect code
+                is_valid, error_message = self._is_valid_connect_code(connect_code)
+                if not is_valid:
+                    await interaction.response.send_message(error_message, ephemeral=True)
+                    return
+
+                # Just use the connect code as provided - no # needed for doubles
+                connect_code = connect_code.upper()
+                self._play_codes[user_id] = connect_code
+                
+                # Convert team color strings to numbers
+                team_color_map = {"red": 0, "blue": 1, "green": 2}
+                team1_num = team_color_map.get(team1.lower(), 0)  # Default to red if not found
+                team2_num = team_color_map.get(team2.lower(), 0)  # Default to red if not found
+                team3_num = team_color_map.get(team3.lower(), 0)  # Default to red if not found
+
+                # Convert character strings to enums
+                char1_enum = None
+                if character1:
+                    try:
+                        char1_enum = Character[character1]
+                        char1_display = character1.replace('_', ' ').title()
+                    except (KeyError, ValueError):
+                        char1_enum = get_character_from_name(character1)
+                        char1_display = char1_enum.name.replace('_', ' ').title()
+                else:
+                    char1_enum = Character.FOX
+                    char1_display = "Fox"
+                    
+                char2_enum = None
+                if character2:
+                    try:
+                        char2_enum = Character[character2]
+                        char2_display = character2.replace('_', ' ').title()
+                    except (KeyError, ValueError):
+                        char2_enum = get_character_from_name(character2)
+                        char2_display = char2_enum.name.replace('_', ' ').title()
+                else:
+                    char2_enum = Character.FOX
+                    char2_display = "Fox"
+                
+                char3_enum = None
+                if character3:
+                    try:
+                        char3_enum = Character[character3]
+                        char3_display = character3.replace('_', ' ').title()
+                    except (KeyError, ValueError):
+                        char3_enum = get_character_from_name(character3)
+                        char3_display = char3_enum.name.replace('_', ' ').title()
+                else:
+                    char3_enum = Character.FOX
+                    char3_display = "Fox"
+                
+                # Get agent names (using port index only for selecting different agents)
+                agent1_name = self._get_opponent(user_id, 1)
+                agent2_name = self._get_opponent(user_id, 2)
+                agent3_name = self._get_opponent(user_id, 3)
+                
+                message = f"Connecting to {interaction.user.name} ({connect_code}) with:\n" \
+                         f"- Agent {agent1_name} with team color {team1} playing {char1_display} using playstyle: {playstyle1}\n" \
+                         f"- Agent {agent2_name} with team color {team2} playing {char2_display} using playstyle: {playstyle2}\n" \
+                         f"- Agent {agent3_name} with team color {team3} playing {char3_display} using playstyle: {playstyle3}"
+                logging.info(message)
+                
+                # Tell the user we're processing
+                await interaction.response.send_message(message)
+
+                # Create agent instances (each with its own Dolphin)
+                agent1 = self._create_agent_instance(
+                    connect_code,
+                    team1_num,
+                    self._get_agent_kwargs(user_id, 1, agent1_name, playstyle1),
+                    character=char1_enum
+                )
+                
+                agent2 = self._create_agent_instance(
+                    connect_code,
+                    team2_num,
+                    self._get_agent_kwargs(user_id, 2, agent2_name, playstyle2),
+                    character=char2_enum,
+                    is_second_agent=True
+                )
+                
+                agent3 = self._create_agent_instance(
+                    connect_code,
+                    team3_num,
+                    self._get_agent_kwargs(user_id, 3, agent3_name, playstyle3),
+                    character=char3_enum,
+                    is_second_agent=True,
+                    user_json_path='./bot3-user.json'
+                )
+                
+                # Create session with all three agents (using logical ports 1, 2, and 3 as keys)
+                agents = {1: agent1, 2: agent2, 3: agent3}
+                session = self._start_session(agents)
+                
+                # Store the team colors keyed by logical ports (these are just for display purposes)
+                team_colors = {1: team1_num, 2: team2_num, 3: team3_num}
+                
+                self._sessions[user_id] = SessionInfo(
+                    session=session,
+                    start_time=datetime.datetime.now(),
+                    discord_name=interaction.user.name,
+                    discord_id=user_id,
+                    connect_code=connect_code,
+                    agents={1: agent1_name, 2: agent2_name, 3: agent3_name},
+                    team_colors=team_colors,
+                    personalities={1: playstyle1, 2: playstyle2, 3: playstyle3}
                 )
         
         # Status command
@@ -978,6 +1190,20 @@ class DiscordBot(commands.Bot):
     async def close(self):
         self.shutdown()
         await super().close()
+
+    def _is_valid_connect_code(self, connect_code: str) -> Tuple[bool, str]:
+        """
+        Validate the connect code.
+        Returns a tuple of (is_valid, error_message).
+        If the code is valid, error_message will be empty.
+        """
+        connect_code = connect_code.upper()
+        
+        # Check if the connect code starts with EC or WC
+        if connect_code.startswith(('EC', 'WC')):
+            return False, f"Connect codes starting with EC or WC are not allowed. Please use a different connect code."
+            
+        return True, ""
 
 # Modify the main function to use the bot's run method
 def main(_):

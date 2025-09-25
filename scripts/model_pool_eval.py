@@ -80,6 +80,7 @@ flags.DEFINE_string("dolphin_path", None, "Path to Slippi Dolphin executable", r
 flags.DEFINE_string("dolphin_iso", None, "Path to SSBM ISO file", required=True)
 flags.DEFINE_bool("dolphin_headless", False, "Run Dolphin in headless mode")
 flags.DEFINE_float("novelty_weight", 1.0, "Weight for preferring newer/unknown models (higher = stronger preference)")
+flags.DEFINE_float("skill_bias_weight", 0.0, "Weight for preferring matches between high-skill models (higher = stronger preference)")
 
 class ModelPoolEvaluator:
     """Manages a pool of games between different models."""
@@ -91,7 +92,8 @@ class ModelPoolEvaluator:
                  max_parallel_games: int = 2,
                  display_interval: int = 10,
                  randomize_characters: bool = True,
-                 novelty_weight: float = 1.0):
+                 novelty_weight: float = 1.0,
+                 skill_bias_weight: float = 0.0):
         self.model_dir = model_dir
         self.model_pattern = model_pattern
         self.output_dir = output_dir
@@ -99,6 +101,7 @@ class ModelPoolEvaluator:
         self.display_interval = display_interval
         self.randomize_characters = randomize_characters
         self.novelty_weight = novelty_weight
+        self.skill_bias_weight = skill_bias_weight
         
         # Create output directories
         os.makedirs(output_dir, exist_ok=True)
@@ -407,7 +410,7 @@ class ModelPoolEvaluator:
         """
         games_played = self.model_games_played.get(model, 0)
         # Exponential decay function: higher for fewer games played
-        return math.exp(-0.1 * games_played)
+        return math.exp(-0.02 * games_played)
     
     def _calculate_matchup_score(self, model1: str, model2: str) -> float:
         """Calculate a score for this matchup based on exploration/exploitation criteria."""
@@ -432,12 +435,28 @@ class ModelPoolEvaluator:
             novelty2 = self._get_model_novelty_score(model2)
             novelty_score = (novelty1 + novelty2) / 2
             
+            # Calculate skill score - higher for matchups between high-skill models
+            skill_score = 0
+            if self.skill_bias_weight > 0:
+                rating1 = self._get_model_rating(model1)
+                rating2 = self._get_model_rating(model2)
+                # Average rating of the two models, normalized to a 0-1 scale
+                # Higher ratings will result in higher skill scores
+                avg_rating = (rating1 + rating2) / 2
+                base_rating = 25.0  # Default initial rating in TrueSkill
+                skill_score = max(0, (avg_rating - base_rating) / 10.0)  # Scale to reasonable range
+                
+                # Log the skill score if it's significant
+                if skill_score > 0.1 and self.skill_bias_weight > 0:
+                    logging.debug(f"Skill score for {os.path.basename(model1)} vs {os.path.basename(model2)}: {skill_score:.2f} (ratings: {rating1:.1f}, {rating2:.1f})")
+            
             # Calculate final score as weighted sum of components
             score = (
                 self.exploration_weight * (uncertainty1 + uncertainty2) +
                 self.similarity_weight * rating_similarity +
                 self.diversity_weight * diversity_score +
-                self.novelty_weight * novelty_score
+                self.novelty_weight * novelty_score +
+                self.skill_bias_weight * skill_score
             )
             
             return score
@@ -469,8 +488,6 @@ class ModelPoolEvaluator:
                     score = self._calculate_matchup_score(model1, model2)
                     matchup_scores[(model1, model2)] = score
         
-        #logging.info(f"Matchup scores: {matchup_scores}")
-        
         # Convert scores to probabilities using softmax with temperature
         max_score = max(matchup_scores.values()) if matchup_scores else 0
         exp_scores = {
@@ -501,6 +518,13 @@ class ModelPoolEvaluator:
             logging.debug(f"  Score: {matchup_scores[selected_matchup]:.2f}")
             logging.debug(f"  Probability: {matchup_probs[selected_matchup]:.4f}")
             logging.debug(f"  Temperature: {temperature:.2f}")
+            
+            # Add skill bias info if enabled
+            if self.skill_bias_weight > 0:
+                rating1 = self._get_model_rating(selected_matchup[0])
+                rating2 = self._get_model_rating(selected_matchup[1])
+                avg_rating = (rating1 + rating2) / 2
+                logging.debug(f"  Average rating: {avg_rating:.2f} (skill bias: {self.skill_bias_weight:.2f})")
             
             # Update the matchup count for next time
             self._update_matchup_count(selected_matchup[0], selected_matchup[1])
@@ -667,6 +691,8 @@ class ModelPoolEvaluator:
                             logging.info(f"Current model selection parameters:")
                             logging.info(f"  Temperature: {self._get_current_temperature():.2f}")
                             logging.info(f"  Games played: {self.game_count}")
+                            logging.info(f"  Novelty weight: {self.novelty_weight:.2f}")
+                            logging.info(f"  Skill bias weight: {self.skill_bias_weight:.2f}")
                             
                             # Log matchup counts for the top models
                             try:
@@ -759,7 +785,8 @@ def main(_):
         max_parallel_games=FLAGS.max_parallel_games,
         display_interval=FLAGS.display_interval,
         randomize_characters=FLAGS.randomize_characters,
-        novelty_weight=FLAGS.novelty_weight
+        novelty_weight=FLAGS.novelty_weight,
+        skill_bias_weight=FLAGS.skill_bias_weight
     )
     
     # Run the evaluation

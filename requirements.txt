@@ -16,3 +16,4 @@ ray
 discord
 trueskill
 tensorflow[and-cuda]
+Flask>=2.0

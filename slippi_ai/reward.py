@@ -157,9 +157,7 @@ def compute_rewards(
     bad_ledge_grabs = get_bad_ledge_grabs(player, opponent).astype(np.float32)
     ledge_grab_penalties = ledge_grab_penalty * bad_ledge_grabs
 
-    # Use the provided stage parameter instead of the global game.stage
-    stage_to_use = game_stage if game_stage is not None else game.stage
-    stalling = is_stalling_offstage(player, stage_to_use)[1:]
+    stalling = is_stalling_offstage(player, game.stage)[1:]
     stalling_penalties = (stalling_penalty / 60) * stalling.astype(np.float32)
 
     last_stock_loss = np.where(
@@ -183,6 +181,10 @@ def compute_rewards(
     bad_ledge_grabs += get_bad_ledge_grabs_team(team[1], opponents).astype(np.float32)
     ledge_grab_penalties = ledge_grab_penalty * bad_ledge_grabs
 
+    stalling1 = (stalling_penalty / 60) * is_stalling_offstage(team[0], game.stage)[1:].astype(np.float32)
+    stalling2 = (stalling_penalty / 60) * is_stalling_offstage(team[1], game.stage)[1:].astype(np.float32)
+    stalling_penalties = stalling1 + stalling2
+
     # add extra penalties for losing last stock and 2nd to last stock
     team1_stocks = np.array(team[0].stocks_left + team[1].stocks_left)
 
@@ -201,73 +203,20 @@ def compute_rewards(
     # Combine stock penalties
     stock_penalties = second_last_stock_loss + last_stock_loss
 
-    # ignore ledge_grab_penalties and stalling_penalties for now in doubles
-    return -(deaths + damages + ledge_grab_penalties)/2.0 - stock_penalties
+    return -(deaths + damages + ledge_grab_penalties + stalling_penalties)/2.0 - stock_penalties
 
-  # Check if we have a batch dimension (more than one game)
-  is_batched = len(game.is_teams.shape) > 1
-  
-  if is_batched:
-    # For batched games, we need to handle each batch element separately
-    batch_size = game.is_teams.shape[1]
-    T = game.p0.action.shape[0] - 1  # rewards are T-1
-    rewards = np.zeros((T, batch_size), dtype=np.float32)
-    
-    for b in range(batch_size):
-      # Create a player slice function that skips controller
-      def slice_player(player):
-        player_dict = {}
-        for field in player._fields:
-          if field == 'controller':
-            # Skip the controller field since it's not used in reward calculations
-            player_dict[field] = None
-          else:
-            # For all other fields, slice along the batch dimension
-            player_dict[field] = getattr(player, field)[:, b]
-        return Player(**player_dict)
-      
-      # Create a single-game slice for this batch element
-      single_game = Game(
-          p0=slice_player(game.p0),
-          p1=slice_player(game.p1),
-          p2=slice_player(game.p2),
-          p3=slice_player(game.p3),
-          stage=game.stage[:, b],
-          randall_phase=game.randall_phase[:, b],
-          is_teams=game.is_teams[:, b]
-      )
-      
-      # Now calculate reward for this single game
-      if not np.any(single_game.is_teams):
-        # Singles game - check which opponent is active
-        if np.any(single_game.p3.is_dead):
-          single_rewards = player_reward(single_game.p0, single_game.p2, single_game.stage) - player_reward(single_game.p2, single_game.p0, single_game.stage)
-        else:
-          single_rewards = player_reward(single_game.p0, single_game.p3, single_game.stage) - player_reward(single_game.p3, single_game.p0, single_game.stage)
-      else:
-        # Doubles game
-        team1 = [single_game.p0, single_game.p1]
-        team2 = [single_game.p2, single_game.p3]
-        single_rewards = team_reward(team1, team2) - team_reward(team2, team1)
-      
-      rewards[:, b] = single_rewards
-  else:
-    # Single game case (no batch dimension)
-    if not np.any(game.is_teams):
-      if np.any(game.p3.is_dead):
-        rewards = player_reward(game.p0, game.p2) - player_reward(game.p2, game.p0)
-      else:
-        rewards = player_reward(game.p0, game.p3) - player_reward(game.p3, game.p0)
-    else:
-      # Doubles game
-      team1 = [game.p0, game.p1]
-      team2 = [game.p2, game.p3]
-      rewards = team_reward(team1, team2) - team_reward(team2, team1)
+  # separate players into teams so we can calculate reward from the
+  # main player/team1's perspective
+  team1 = [game.p0, game.p1]
+  team2 = [game.p2, game.p3]
+
+  rewards = team_reward(team1, team2) - team_reward(team2, team1)
+
+  assert np.all(rewards > -6)
+  assert np.all(rewards < 6)
 
   # sanity checks
   assert rewards.dtype == np.float32
-  assert np.all(rewards > -6)
-  assert np.all(rewards < 6)
 
   if False:
     print("damage ratio: ", damage_ratio, "action shape", game.p0.action.shape)

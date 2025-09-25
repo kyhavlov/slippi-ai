@@ -1,0 +1,209 @@
+:root {
+    /* Light theme (default) */
+    --bg-color: #f4f4f4;
+    --text-color: #333;
+    --header-color: #0056b3;
+    --border-color: #ccc;
+    --table-bg: #fff;
+    --table-row-alt: #f9f9f9;
+    --table-header-bg: #e9ecef;
+    --table-border: #ddd;
+    --control-bg: #e0e0e0;
+    --link-color: #0056b3;
+    --link-hover: #003d80;
+    --info-color: #555;
+    --no-data-color: #888;
+    --positive-color: #2e7d32;
+    --negative-color: #c62828;
+    --button-bg: #0056b3;
+    --button-text: white;
+    --selected-row-bg: #e0f0ff;
+    --box-shadow: rgba(0, 0, 0, 0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        /* Dark theme */
+        --bg-color: #121212;
+        --text-color: #e0e0e0;
+        --header-color: #64b5f6;
+        --border-color: #444;
+        --table-bg: #1e1e1e;
+        --table-row-alt: #262626;
+        --table-header-bg: #333;
+        --table-border: #444;
+        --control-bg: #333;
+        --link-color: #64b5f6;
+        --link-hover: #90caf9;
+        --info-color: #b0b0b0;
+        --no-data-color: #909090;
+        --positive-color: #4caf50;
+        --negative-color: #f44336;
+        --button-bg: #4285f4;
+        --button-text: white;
+        --selected-row-bg: #253047;
+        --box-shadow: rgba(0, 0, 0, 0.3);
+    }
+}
+
+body { 
+    font-family: sans-serif; 
+    line-height: 1.5; 
+    padding: 20px; 
+    background-color: var(--bg-color); 
+    color: var(--text-color); 
+}
+
+h1, h2, h3 { 
+    color: var(--header-color); 
+    border-bottom: 1px solid var(--border-color); 
+    padding-bottom: 5px; 
+    margin-top: 30px; 
+}
+
+h1 { margin-top: 0; }
+
+table { 
+    border-collapse: collapse; 
+    width: 100%; 
+    margin-bottom: 20px; 
+    background-color: var(--table-bg); 
+    box-shadow: 0 2px 3px var(--box-shadow);
+}
+
+th, td { 
+    border: 1px solid var(--table-border); 
+    padding: 10px; 
+    text-align: left; 
+}
+
+th { 
+    background-color: var(--table-header-bg); 
+    font-weight: bold; 
+}
+
+tr:nth-child(even) { 
+    background-color: var(--table-row-alt); 
+}
+
+.filter-nav { 
+    margin-bottom: 0; 
+    padding: 0; 
+    flex: 1;
+}
+
+.filter-nav a { 
+    margin-right: 15px; 
+    text-decoration: none; 
+    color: var(--link-color); 
+    font-weight: bold; 
+}
+
+.filter-nav a.active { 
+    text-decoration: underline; 
+    color: var(--link-hover);
+}
+
+.info { 
+    margin-bottom: 15px; 
+    font-style: italic; 
+    color: var(--info-color); 
+}
+
+.no-data { 
+    color: var(--no-data-color); 
+    font-style: italic; 
+    margin-top: 10px; 
+}
+
+/* Layout styles */
+.main-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 30px;
+}
+
+.character-section {
+    display: flex;
+    gap: 30px;
+}
+
+.character-stats {
+    flex: 1;
+    min-width: 400px;
+}
+
+.character-details {
+    flex: 1;
+    min-width: 400px;
+    display: none; /* Initially hidden */
+}
+
+.stats-layout { 
+    display: grid; 
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); 
+    gap: 30px; 
+}
+
+/* Interactive elements */
+.character-link {
+    cursor: pointer;
+    color: var(--link-color);
+    text-decoration: underline;
+}
+
+.character-link:hover {
+    color: var(--link-hover);
+}
+
+.positive-diff {
+    color: var(--positive-color);
+}
+
+.negative-diff {
+    color: var(--negative-color);
+}
+
+.selected-character {
+    font-weight: bold;
+    color: var(--link-color);
+    background-color: var(--selected-row-bg);
+}
+
+.filter-controls {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    background-color: var(--control-bg);
+    padding: 10px;
+    border-radius: 5px;
+    margin-bottom: 20px;
+}
+
+.min-games-filter {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.min-games-filter input {
+    width: 60px;
+    padding: 5px;
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    background-color: var(--table-bg);
+    color: var(--text-color);
+}
+
+.min-games-filter button {
+    padding: 5px 10px;
+    background-color: var(--button-bg);
+    color: var(--button-text);
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.min-games-filter button:hover {
+    background-color: var(--link-hover);
+} 

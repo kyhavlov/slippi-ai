@@ -9,11 +9,13 @@ win rates, agent name win rates, and agent name team composition win rates.
 Example usage:
     python analyze_matches.py --data-file=../eval/model_pool_results/match_records.json --view=character_winrates
     python analyze_matches.py --view=agent_winrates --filter-model=rl_doubles_v4_355.pkl
+    python analyze_matches.py --view=agent_winrates --filter-model=rl_doubles_v4_355.pkl --filter-model=rl_doubles_v4_356.pkl
     python analyze_matches.py --view=team_comp_winrates --min-matches=5
     python analyze_matches.py --view=agent_pair_comps --agent1=Ralph --agent2=Darkatma
     python analyze_matches.py --view=agent_pair_comps --agent1=all --agent2=Ralph
     python analyze_matches.py --view=agent_pair_comps --agent1=all --agent2=all --min-matches=10
     python analyze_matches.py --view=char_agent_winrates --sort-by=trueskill --min-matches=5
+    python analyze_matches.py --view=model_vs_model --model-a=rl_doubles_v4_355.pkl --model-b=rl_doubles_v4_356.pkl
 """
 
 import os
@@ -57,7 +59,7 @@ def confidence_interval(win_rate: float, n: int) -> float:
     # 95% confidence interval (1.96 is the z-score for 95% CI)
     return 1.96 * std_error * 100.0
 
-def analyze_character_winrates(matches: List[Dict], filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
+def analyze_character_winrates(matches: List[Dict], filter_models: Optional[List[str]] = None, min_matches: int = 1) -> List[Dict]:
     """
     Analyze character win rates from match data.
     
@@ -70,20 +72,20 @@ def analyze_character_winrates(matches: List[Dict], filter_model: Optional[str] 
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
             
-        # If filtering by model, only count wins/losses for that model
-        if filter_model:
-            if winner == filter_model:
+        # If filtering by models, only count wins/losses for those models
+        if filter_models:
+            if winner in filter_models:
                 # Add win for each winner character
                 for char in match["winner_chars"]:
                     char_stats[char]["wins"] += 1
                 # Add loss for each loser character
                 for char in match["loser_chars"]:
                     char_stats[char]["losses"] += 1
-            elif loser == filter_model:
+            elif loser in filter_models:
                 # Add loss for each loser character
                 for char in match["loser_chars"]:
                     char_stats[char]["losses"] += 1
@@ -116,7 +118,7 @@ def analyze_character_winrates(matches: List[Dict], filter_model: Optional[str] 
     # Sort by win rate (descending)
     return sorted(results, key=lambda x: x["win_rate"], reverse=True)
 
-def analyze_team_comp_winrates(matches: List[Dict], filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
+def analyze_team_comp_winrates(matches: List[Dict], filter_models: Optional[List[str]] = None, min_matches: int = 1) -> List[Dict]:
     """
     Analyze team composition win rates from match data.
     
@@ -129,20 +131,20 @@ def analyze_team_comp_winrates(matches: List[Dict], filter_model: Optional[str] 
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
         
         # Create sorted team compositions
         winner_comp = tuple(sorted(match["winner_chars"]))
         loser_comp = tuple(sorted(match["loser_chars"]))
         
-        # If filtering by model, only count wins/losses for that model
-        if filter_model:
-            if winner == filter_model:
+        # If filtering by models, only count wins/losses for those models
+        if filter_models:
+            if winner in filter_models:
                 team_stats[winner_comp]["wins"] += 1
                 team_stats[loser_comp]["losses"] += 1
-            elif loser == filter_model:
+            elif loser in filter_models:
                 team_stats[loser_comp]["losses"] += 1
                 team_stats[winner_comp]["wins"] += 1
         else:
@@ -169,7 +171,7 @@ def analyze_team_comp_winrates(matches: List[Dict], filter_model: Optional[str] 
     # Sort by win rate (descending)
     return sorted(results, key=lambda x: x["win_rate"], reverse=True)
 
-def analyze_agent_winrates(matches: List[Dict], filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
+def analyze_agent_winrates(matches: List[Dict], filter_models: Optional[List[str]] = None, min_matches: int = 1) -> List[Dict]:
     """
     Analyze agent name win rates from match data.
     
@@ -182,20 +184,20 @@ def analyze_agent_winrates(matches: List[Dict], filter_model: Optional[str] = No
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
         
-        # If filtering by model, only count wins/losses for that model
-        if filter_model:
-            if winner == filter_model:
+        # If filtering by models, only count wins/losses for those models
+        if filter_models:
+            if winner in filter_models:
                 # Add win for each winner agent
                 for agent in match["winner_names"]:
                     agent_stats[agent]["wins"] += 1
                 # Add loss for each loser agent
                 for agent in match["loser_names"]:
                     agent_stats[agent]["losses"] += 1
-            elif loser == filter_model:
+            elif loser in filter_models:
                 # Add loss for each loser agent
                 for agent in match["loser_names"]:
                     agent_stats[agent]["losses"] += 1
@@ -228,7 +230,7 @@ def analyze_agent_winrates(matches: List[Dict], filter_model: Optional[str] = No
     # Sort by win rate (descending)
     return sorted(results, key=lambda x: x["win_rate"], reverse=True)
 
-def analyze_agent_team_winrates(matches: List[Dict], filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
+def analyze_agent_team_winrates(matches: List[Dict], filter_models: Optional[List[str]] = None, min_matches: int = 1) -> List[Dict]:
     """
     Analyze agent name team composition win rates from match data.
     
@@ -241,20 +243,20 @@ def analyze_agent_team_winrates(matches: List[Dict], filter_model: Optional[str]
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
         
         # Create sorted team compositions
         winner_team = tuple(sorted(match["winner_names"]))
         loser_team = tuple(sorted(match["loser_names"]))
         
-        # If filtering by model, only count wins/losses for that model
-        if filter_model:
-            if winner == filter_model:
+        # If filtering by models, only count wins/losses for those models
+        if filter_models:
+            if winner in filter_models:
                 team_stats[winner_team]["wins"] += 1
                 team_stats[loser_team]["losses"] += 1
-            elif loser == filter_model:
+            elif loser in filter_models:
                 team_stats[loser_team]["losses"] += 1
                 team_stats[winner_team]["wins"] += 1
         else:
@@ -281,13 +283,13 @@ def analyze_agent_team_winrates(matches: List[Dict], filter_model: Optional[str]
     # Sort by win rate (descending)
     return sorted(results, key=lambda x: x["win_rate"], reverse=True)
 
-def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str] = None, min_matches: int = 1, sort_by: str = "win_rate") -> List[Dict]:
+def analyze_char_agent_winrates(matches: List[Dict], filter_models: Optional[List[str]] = None, min_matches: int = 1, sort_by: str = "win_rate") -> List[Dict]:
     """
     Analyze character + agent name combination win rates from match data.
     
     Args:
         matches: List of match dictionaries
-        filter_model: Optional model to filter results for
+        filter_models: Optional list of models to filter results for
         min_matches: Minimum number of matches required for inclusion
         sort_by: Field to sort results by ("win_rate" or "trueskill")
     
@@ -326,8 +328,8 @@ def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str]
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
         
         # Process winner combinations
@@ -337,7 +339,7 @@ def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str]
                 agent = match["winner_names"][i]
                 combo = (char, agent)
                 
-                if not filter_model or winner == filter_model:
+                if not filter_models or winner in filter_models:
                     char_agent_stats[combo]["wins"] += 1
             
         # Process loser combinations
@@ -347,7 +349,7 @@ def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str]
                 agent = match["loser_names"][i]
                 combo = (char, agent)
                 
-                if not filter_model or loser == filter_model:
+                if not filter_models or loser in filter_models:
                     char_agent_stats[combo]["losses"] += 1
     
     # Process matches again to update TrueSkill ratings
@@ -355,8 +357,8 @@ def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str]
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
         
         # Create lists to hold the ratings for the winners and losers
@@ -433,7 +435,7 @@ def analyze_char_agent_winrates(matches: List[Dict], filter_model: Optional[str]
     else:  # Default to win_rate
         return sorted(results, key=lambda x: x["win_rate"], reverse=True)
 
-def calculate_trueskill(matches: List[Dict], filter_model: Optional[str] = None) -> List[Dict]:
+def calculate_trueskill(matches: List[Dict], filter_models: Optional[List[str]] = None) -> List[Dict]:
     """
     Calculate TrueSkill ratings for agent names based on match outcomes.
     
@@ -454,8 +456,8 @@ def calculate_trueskill(matches: List[Dict], filter_model: Optional[str] = None)
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
         
         # Create or get ratings for winner agents
@@ -497,8 +499,8 @@ def calculate_trueskill(matches: List[Dict], filter_model: Optional[str] = None)
     # Convert ratings to a list of dictionaries
     results = []
     for agent, rating in ratings.items():
-        # Skip agents with no matches if filtering by model
-        if filter_model and agent_match_counts[agent] == 0:
+        # Skip agents with no matches if filtering by models
+        if filter_models and agent_match_counts[agent] == 0:
             continue
         
         results.append({
@@ -580,13 +582,13 @@ def get_available_models(matches: List[Dict]) -> List[str]:
         models.add(extract_model_basename(match["loser"]))
     return sorted(list(models))
 
-def calculate_overall_char_comp_winrates(matches: List[Dict], filter_model: Optional[str] = None) -> Dict[Tuple[str, str], float]:
+def calculate_overall_char_comp_winrates(matches: List[Dict], filter_models: Optional[List[str]] = None) -> Dict[Tuple[str, str], float]:
     """
     Calculate the overall win rates for each character composition across all agent pairs.
     
     Args:
         matches: List of match dictionaries
-        filter_model: Optional filter for specific model
+        filter_models: Optional list of models to filter for
         
     Returns:
         Dictionary mapping character composition tuples to their overall win rates
@@ -598,8 +600,8 @@ def calculate_overall_char_comp_winrates(matches: List[Dict], filter_model: Opti
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
         
         # Process all character pairs in the winner team
@@ -629,7 +631,7 @@ def calculate_overall_char_comp_winrates(matches: List[Dict], filter_model: Opti
     return overall_winrates
 
 def analyze_agent_pair_comps(matches: List[Dict], agent1: str, agent2: str, overall_winrates: Dict[Tuple[str, str], float] = None, 
-                             filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
+                             filter_models: Optional[List[str]] = None, min_matches: int = 1) -> List[Dict]:
     """
     Analyze character compositions used by a pair of agents when playing together.
     Differentiates which agent played which character.
@@ -639,7 +641,7 @@ def analyze_agent_pair_comps(matches: List[Dict], agent1: str, agent2: str, over
         agent1: First agent name
         agent2: Second agent name
         overall_winrates: Dictionary of overall win rates for each character composition
-        filter_model: Optional filter for specific model
+        filter_models: Optional list of models to filter results for
         min_matches: Minimum number of matches required for inclusion in results
         
     Returns:
@@ -651,8 +653,8 @@ def analyze_agent_pair_comps(matches: List[Dict], agent1: str, agent2: str, over
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
 
         # Check if the agent pair is in winner team
@@ -747,21 +749,21 @@ def print_agent_pair_comps(results: List[Dict], agent1: str, agent2: str):
           f"{overall_win_rate:.1f}%    ±{overall_ci:.1f}%")
 
 def analyze_all_agent_pair_comps(matches: List[Dict], specific_agent: Optional[str] = None, 
-                                filter_model: Optional[str] = None, min_matches: int = 1) -> List[Dict]:
+                                filter_models: Optional[List[str]] = None, min_matches: int = 1) -> List[Dict]:
     """
     Analyze character compositions used by all agent pairs when playing together.
     
     Args:
         matches: List of match dictionaries
         specific_agent: If specified, only analyze pairs that include this agent
-        filter_model: Optional filter for specific model
+        filter_models: Optional list of models to filter results for
         min_matches: Minimum number of matches required for inclusion in results
         
     Returns:
         List of dictionaries with composition statistics for all agent pairs
     """
     # Calculate overall character composition win rates for comparison
-    overall_winrates = calculate_overall_char_comp_winrates(matches, filter_model)
+    overall_winrates = calculate_overall_char_comp_winrates(matches, filter_models)
     
     # First, identify all agent pairs that appear in the data
     agent_pairs = set()
@@ -770,8 +772,8 @@ def analyze_all_agent_pair_comps(matches: List[Dict], specific_agent: Optional[s
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
             
         # Get all pairs of agents in the winner team
@@ -801,7 +803,7 @@ def analyze_all_agent_pair_comps(matches: List[Dict], specific_agent: Optional[s
     
     for agent_pair in sorted(agent_pairs):
         agent1, agent2 = agent_pair
-        results = analyze_agent_pair_comps(matches, agent1, agent2, overall_winrates, filter_model, min_matches)
+        results = analyze_agent_pair_comps(matches, agent1, agent2, overall_winrates, filter_models, min_matches)
         
         if results:  # Only include pairs that have results meeting min_matches criteria
             # Add agent pair info to each result
@@ -875,15 +877,15 @@ def print_all_agent_pair_comps(results: List[Dict]):
     print(f"{'GRAND TOTAL':<60} {total_games:<7} {total_wins:<7} {total_losses:<7} "
           f"{overall_win_rate:.1f}%    ±{overall_ci:.1f}%")
 
-def get_unique_agents(matches: List[Dict], filter_model: Optional[str] = None) -> List[str]:
+def get_unique_agents(matches: List[Dict], filter_models: Optional[List[str]] = None) -> List[str]:
     """Get a list of unique agent names in the match data."""
     agents = set()
     for match in matches:
         winner = extract_model_basename(match["winner"])
         loser = extract_model_basename(match["loser"])
         
-        # Skip if filtering by model and neither matches
-        if filter_model and filter_model not in (winner, loser):
+        # Skip if filtering by models and neither matches
+        if filter_models and not (winner in filter_models or loser in filter_models):
             continue
             
         for agent in match["winner_names"]:
@@ -892,6 +894,165 @@ def get_unique_agents(matches: List[Dict], filter_model: Optional[str] = None) -
             agents.add(agent)
     
     return sorted(list(agents))
+
+def calculate_win_probability(mu_a: float, sigma_a: float, mu_b: float, sigma_b: float) -> float:
+    """
+    Calculate the probability that model A will beat model B based on their TrueSkill ratings.
+    
+    Args:
+        mu_a: Mean skill value of model A
+        sigma_a: Uncertainty value of model A
+        mu_b: Mean skill value of model B
+        sigma_b: Uncertainty value of model B
+        
+    Returns:
+        Probability (0-100%) that model A will beat model B
+    """
+    try:
+        import trueskill
+        # Default beta value in the TrueSkill system (skill factor)
+        beta = trueskill.BETA
+        
+        # Calculate the win probability using the TrueSkill formula
+        # Φ((μA - μB) / sqrt(σA² + σB² + 2β²))
+        denominator = math.sqrt(sigma_a**2 + sigma_b**2 + 2 * beta**2)
+        if denominator == 0:  # Prevent division by zero
+            return 50.0  # Return even odds if the denominator is zero
+            
+        # Calculate the win probability (Φ is the CDF of the standard normal distribution)
+        probability = 100.0 * (0.5 + 0.5 * math.erf((mu_a - mu_b) / (denominator * math.sqrt(2))))
+        
+        return probability
+    except ImportError:
+        raise ImportError("TrueSkill analysis requires the 'trueskill' package. Please install it with: pip install trueskill")
+
+def model_vs_model_winrate(matches: List[Dict], model_a: str, model_b: str) -> Dict:
+    """
+    Calculate statistics and expected win rate between two specific models.
+    
+    Args:
+        matches: List of match dictionaries
+        model_a: First model name
+        model_b: Second model name
+        
+    Returns:
+        Dictionary with statistics about the matchup
+    """
+    try:
+        import trueskill
+        
+        # Initialize TrueSkill environment
+        env = trueskill.TrueSkill()
+        
+        # Calculate TrueSkill ratings for each model
+        model_ratings = {}
+        model_match_counts = {}
+        
+        # Count actual matches between these models
+        direct_matches = 0
+        model_a_wins = 0
+        model_b_wins = 0
+        
+        # Process all matches to calculate TrueSkill ratings
+        for match in matches:
+            winner = extract_model_basename(match["winner"])
+            loser = extract_model_basename(match["loser"])
+            
+            # Count direct matchups
+            if (winner == model_a and loser == model_b):
+                direct_matches += 1
+                model_a_wins += 1
+            elif (winner == model_b and loser == model_a):
+                direct_matches += 1
+                model_b_wins += 1
+            
+            # Initialize ratings if needed
+            for model in [winner, loser]:
+                if model not in model_ratings:
+                    model_ratings[model] = env.create_rating()
+                    model_match_counts[model] = 0
+                    
+            # Count matches for each model
+            model_match_counts[winner] += 1
+            model_match_counts[loser] += 1
+            
+            # Update ratings based on match outcome
+            winner_rating = [model_ratings[winner]]
+            loser_rating = [model_ratings[loser]]
+            
+            try:
+                updated_ratings = env.rate([winner_rating, loser_rating], ranks=[0, 1])
+                model_ratings[winner] = updated_ratings[0][0]
+                model_ratings[loser] = updated_ratings[1][0]
+            except Exception as e:
+                print(f"Warning: Error updating ratings for match ({str(e)})")
+                continue
+        
+        # Verify both models exist in our data
+        if model_a not in model_ratings:
+            return {"error": f"Model '{model_a}' not found in the match data"}
+        
+        if model_b not in model_ratings:
+            return {"error": f"Model '{model_b}' not found in the match data"}
+        
+        # Calculate expected win probability
+        mu_a = model_ratings[model_a].mu
+        sigma_a = model_ratings[model_a].sigma
+        mu_b = model_ratings[model_b].mu
+        sigma_b = model_ratings[model_b].sigma
+        
+        # Get win probability
+        win_probability = calculate_win_probability(mu_a, sigma_a, mu_b, sigma_b)
+        
+        # Calculate actual win rate from direct matches
+        actual_win_rate = calculate_win_percentage(model_a_wins, direct_matches) if direct_matches > 0 else None
+        
+        # Return result
+        return {
+            "model_a": model_a,
+            "model_b": model_b,
+            "mu_a": mu_a,
+            "sigma_a": sigma_a,
+            "mu_b": mu_b,
+            "sigma_b": sigma_b,
+            "expected_win_rate": win_probability,
+            "direct_matches": direct_matches,
+            "model_a_wins": model_a_wins,
+            "model_b_wins": model_b_wins,
+            "actual_win_rate": actual_win_rate,
+            "total_games_a": model_match_counts.get(model_a, 0),
+            "total_games_b": model_match_counts.get(model_b, 0)
+        }
+        
+    except ImportError:
+        raise ImportError("TrueSkill analysis requires the 'trueskill' package. Please install it with: pip install trueskill")
+
+def print_model_vs_model_winrate(result: Dict):
+    """Print the expected win rate between two models in a nicely formatted table."""
+    if "error" in result:
+        print(f"\nError: {result['error']}")
+        return
+        
+    print("\n=== Model vs Model Win Rate Prediction ===")
+    
+    # Print model details
+    print(f"Model A: {result['model_a']}")
+    print(f"  - Mu: {result['mu_a']:.2f}, Sigma: {result['sigma_a']:.2f}, Total games: {result['total_games_a']}")
+    
+    print(f"Model B: {result['model_b']}")
+    print(f"  - Mu: {result['mu_b']:.2f}, Sigma: {result['sigma_b']:.2f}, Total games: {result['total_games_b']}")
+    
+    print("\nTrueSkill-Based Prediction:")
+    print(f"  - Expected win rate for {result['model_a']}: {result['expected_win_rate']:.1f}%")
+    print(f"  - Expected win rate for {result['model_b']}: {100 - result['expected_win_rate']:.1f}%")
+    
+    # Print actual results if there were direct matches
+    if result['direct_matches'] > 0:
+        print(f"\nActual Head-to-Head Results ({result['direct_matches']} matches):")
+        print(f"  - {result['model_a']} wins: {result['model_a_wins']} ({result['actual_win_rate']:.1f}%)")
+        print(f"  - {result['model_b']} wins: {result['model_b_wins']} ({100 - result['actual_win_rate']:.1f}%)")
+    else:
+        print("\nNo direct matches between these models in the dataset.")
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze model pool evaluation match records.")
@@ -904,13 +1065,14 @@ def main():
         "--view",
         choices=["character_winrates", "team_comp_winrates", "agent_winrates", 
                  "agent_team_winrates", "char_agent_winrates", "trueskill", 
-                 "agent_pair_comps", "all"],
+                 "agent_pair_comps", "model_vs_model", "all"],
         default="all",
         help="Type of analysis to display"
     )
     parser.add_argument(
         "--filter-model",
-        help="Filter results for a specific model (filename only, not full path)"
+        action="append",
+        help="Filter results for specific models (file names only, not full paths)"
     )
     parser.add_argument(
         "--min-matches",
@@ -942,6 +1104,14 @@ def main():
         default="win_rate",
         help="Field to sort character + agent combinations by"
     )
+    parser.add_argument(
+        "--model-a",
+        help="First model for win rate prediction (model_vs_model view)"
+    )
+    parser.add_argument(
+        "--model-b",
+        help="Second model for win rate prediction (model_vs_model view)"
+    )
     
     args = parser.parse_args()
     
@@ -953,10 +1123,12 @@ def main():
         print(f"Error loading match data: {e}")
         return
     
-    # Apply filter model if provided
-    filter_model = args.filter_model
-    if filter_model:
-        print(f"Filtering results for model: {filter_model}")
+    # Apply filter models if provided
+    filter_models = args.filter_model
+    print("filter_models: ", filter_models)
+    if filter_models:
+        models_str = ", ".join(filter_models)
+        print(f"Filtering results for models: {models_str}")
     
     # List available models if requested
     if args.list_models:
@@ -968,7 +1140,7 @@ def main():
     
     # List available agents if requested
     if args.list_agents:
-        agents = get_unique_agents(matches, filter_model)
+        agents = get_unique_agents(matches, filter_models)
         print("\nAvailable agent names in the data:")
         for agent in agents:
             print(f"  {agent}")
@@ -976,28 +1148,28 @@ def main():
     
     # Run the requested analysis
     if args.view == "character_winrates" or args.view == "all":
-        results = analyze_character_winrates(matches, filter_model, args.min_matches)
+        results = analyze_character_winrates(matches, filter_models, args.min_matches)
         print_character_winrates(results)
     
     if args.view == "team_comp_winrates" or args.view == "all":
-        results = analyze_team_comp_winrates(matches, filter_model, args.min_matches)
+        results = analyze_team_comp_winrates(matches, filter_models, args.min_matches)
         print_team_comp_winrates(results)
     
     if args.view == "agent_winrates" or args.view == "all":
-        results = analyze_agent_winrates(matches, filter_model, args.min_matches)
+        results = analyze_agent_winrates(matches, filter_models, args.min_matches)
         print_agent_winrates(results)
     
     if args.view == "agent_team_winrates" or args.view == "all":
-        results = analyze_agent_team_winrates(matches, filter_model, args.min_matches)
+        results = analyze_agent_team_winrates(matches, filter_models, args.min_matches)
         print_agent_team_winrates(results)
     
     if args.view == "char_agent_winrates" or args.view == "all":
-        results = analyze_char_agent_winrates(matches, filter_model, args.min_matches, args.sort_by)
+        results = analyze_char_agent_winrates(matches, filter_models, args.min_matches, args.sort_by)
         print_char_agent_winrates(results, args.sort_by)
     
     if args.view == "trueskill" or args.view == "all":
         try:
-            results = calculate_trueskill(matches, filter_model)
+            results = calculate_trueskill(matches, filter_models)
             print_trueskill_ratings(results)
         except ImportError:
             print("\nError: TrueSkill analysis requires the 'trueskill' package.")
@@ -1013,38 +1185,48 @@ def main():
             return
 
         # Calculate overall character composition win rates for comparison
-        overall_winrates = calculate_overall_char_comp_winrates(matches, filter_model)
+        overall_winrates = calculate_overall_char_comp_winrates(matches, filter_models)
         
         # Handle the 'all' wildcard
         if args.agent1.lower() == 'all' and args.agent2.lower() == 'all':
             # Both agents are 'all' - analyze all agent pairs
-            results = analyze_all_agent_pair_comps(matches, None, filter_model, args.min_matches)
+            results = analyze_all_agent_pair_comps(matches, None, filter_models, args.min_matches)
             if not results:
                 print("\nNo agent pairs found that meet the minimum match criteria.")
                 return
             print_all_agent_pair_comps(results)
         elif args.agent1.lower() == 'all':
             # Only agent1 is 'all' - analyze all pairs with agent2
-            results = analyze_all_agent_pair_comps(matches, args.agent2, filter_model, args.min_matches)
+            results = analyze_all_agent_pair_comps(matches, args.agent2, filter_models, args.min_matches)
             if not results:
                 print(f"\nNo agent pairs with {args.agent2} found that meet the minimum match criteria.")
                 return
             print_all_agent_pair_comps(results)
         elif args.agent2.lower() == 'all':
             # Only agent2 is 'all' - analyze all pairs with agent1
-            results = analyze_all_agent_pair_comps(matches, args.agent1, filter_model, args.min_matches)
+            results = analyze_all_agent_pair_comps(matches, args.agent1, filter_models, args.min_matches)
             if not results:
                 print(f"\nNo agent pairs with {args.agent1} found that meet the minimum match criteria.")
                 return
             print_all_agent_pair_comps(results)
         else:
             # Neither is 'all' - analyze the specific pair
-            results = analyze_agent_pair_comps(matches, args.agent1, args.agent2, overall_winrates, filter_model, args.min_matches)
+            results = analyze_agent_pair_comps(matches, args.agent1, args.agent2, overall_winrates, filter_models, args.min_matches)
             if not results:
-                print(f"\nNo games found where {args.agent1} and {args.agent2} played together" + 
-                      (f" in model {filter_model}" if filter_model else ""))
+                filter_str = f" in models {', '.join(filter_models)}" if filter_models else ""
+                print(f"\nNo games found where {args.agent1} and {args.agent2} played together{filter_str}")
                 return
             print_agent_pair_comps(results, args.agent1, args.agent2)
+
+    if args.view == "model_vs_model":
+        if not args.model_a or not args.model_b:
+            print("\nError: --model-a and --model-b parameters are required for model_vs_model view.")
+            print("Example: python analyze_matches.py --view=model_vs_model --model-a=rl_doubles_v4_355.pkl --model-b=rl_doubles_v4_356.pkl")
+            return
+
+        # Calculate win probability between the two models
+        result = model_vs_model_winrate(matches, args.model_a, args.model_b)
+        print_model_vs_model_winrate(result)
 
 if __name__ == "__main__":
     main() 

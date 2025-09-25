@@ -601,6 +601,13 @@ class Agent:
     # Note: x.item() can return the wrong dtype, e.g. int instead of uint8.
     action = utils.map_nt(lambda x: x[0], action)
     action = self._agent.embed_controller.decode(action)
+
+    # Check if the game is over because one team ran out of stocks or timeout
+    game_over = (game.p0.stocks_left == 0 and game.p1.stocks_left == 0) or (game.p2.stocks_left == 0 and game.p3.stocks_left == 0)
+    if game_over or gamestate.frame >= 28799:
+      self._controller.release_all()
+      return sample_outputs
+
     send_controller(self._controller, action)
 
     # stock stealing hack
@@ -634,6 +641,8 @@ def build_agent(
 ) -> Agent:
   if state is None:
     state = load_state(path, tag)
+
+  logging.info("building agent with name: %s", name)
 
   return Agent(
       controller=controller,

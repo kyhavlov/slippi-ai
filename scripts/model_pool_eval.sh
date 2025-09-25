@@ -19,8 +19,10 @@ DOLPHIN_HEADLESS=True
 
 # Default parameters
 MAX_PARALLEL_GAMES=2
-DISPLAY_INTERVAL=10
+DISPLAY_INTERVAL=5
 RANDOMIZE_CHARS=True
+NOVELTY_WEIGHT=50.0
+SKILL_BIAS_WEIGHT=25.0
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -61,10 +63,18 @@ while [[ $# -gt 0 ]]; do
       DOLPHIN_HEADLESS="${1#*=}"
       shift
       ;;
+    --novelty-weight=*)
+      NOVELTY_WEIGHT="${1#*=}"
+      shift
+      ;;
+    --skill-bias=*)
+      SKILL_BIAS_WEIGHT="${1#*=}"
+      shift
+      ;;
     *)
       # Unknown option
       echo "Unknown option: $1"
-      echo "Usage: $0 [--model-dir=/path/to/models] [--model-pattern='*.pkl'] [--dolphin=/path/to/dolphin] [--iso=/path/to/iso] [--output-dir=/path/to/output] [--parallel=2] [--interval=10] [--randomize-chars=True] [--headless=True]"
+      echo "Usage: $0 [--model-dir=/path/to/models] [--model-pattern='*.pkl'] [--dolphin=/path/to/dolphin] [--iso=/path/to/iso] [--output-dir=/path/to/output] [--parallel=2] [--interval=10] [--randomize-chars=True] [--headless=True] [--novelty-weight=5.0] [--skill-bias=0.0]"
       exit 1
       ;;
   esac
@@ -84,6 +94,8 @@ echo "  - Parallel games: $MAX_PARALLEL_GAMES"
 echo "  - Display interval: $DISPLAY_INTERVAL"
 echo "  - Randomize characters: $RANDOMIZE_CHARS"
 echo "  - Headless mode: $DOLPHIN_HEADLESS"
+echo "  - Novelty weight: $NOVELTY_WEIGHT"
+echo "  - Skill bias weight: $SKILL_BIAS_WEIGHT"
 
 # Run the evaluation script
 python scripts/model_pool_eval.py \
@@ -96,4 +108,5 @@ python scripts/model_pool_eval.py \
   --output_dir="$OUTPUT_DIR" \
   --display_interval="$DISPLAY_INTERVAL" \
   --randomize_characters="$RANDOMIZE_CHARS" \
-  --novelty_weight=5.0
+  --novelty_weight="$NOVELTY_WEIGHT" \
+  --skill_bias_weight="$SKILL_BIAS_WEIGHT"

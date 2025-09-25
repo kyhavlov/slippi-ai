@@ -64,6 +64,7 @@ class RolloutWorker:
       damage_ratio: float = 0,  # For rewards.
       use_fake_envs: bool = False,
       use_ray_envs: bool = False,
+      agent_names: list[tuple[str, str]] = [],
   ):
     print("use_gpu = ", use_gpu)
     self._agents = {
@@ -92,6 +93,7 @@ class RolloutWorker:
     self._env_kwargs = env_kwargs
     self._async_envs = async_envs
     self._use_ray_envs = use_ray_envs
+    self._agent_names = agent_names
     self._build_env()
 
     self._damage_ratio = damage_ratio
@@ -141,7 +143,7 @@ class RolloutWorker:
       else:
         env_class = env_lib.AsyncBatchedEnvironmentMP
       self._env = env_class(
-          self._num_envs, self._dolphin_kwargs, **self._env_kwargs)
+          self._num_envs, self._dolphin_kwargs, agent_names=self._agent_names, **self._env_kwargs)
 
   def reset_env(self):
     self._env.stop()

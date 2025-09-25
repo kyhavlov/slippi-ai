@@ -48,7 +48,7 @@ def main(_):
       **DOLPHIN.value,
   )
 
-  agents: list[eval_lib.Agent] = []
+  agent: eval_lib.Agent
 
   # Warm up agent before starting game to prevent initial hiccup.
   if isinstance(player, dolphin_lib.AI):
@@ -60,36 +60,38 @@ def main(_):
         run_on_cpu=True,
         **PLAYER.value['ai'],
     )
-    agents.append(agent)
 
     eval_lib.update_character(player, agent.config)
 
   # Start game
+  with open(DOLPHIN.value['user_json_path']) as f:
+      user_json = json.load(f)
+
+  run_agent(agent, dolphin, user_json['connectCode'])
+
+def run_agent(agent: eval_lib.Agent, 
+              dolphin: dolphin_lib.Dolphin, 
+              connect_code: str):
   gamestate = dolphin.step()
 
-  if len(agents) == 1:
-    with open(DOLPHIN.value['user_json_path']) as f:
-      user_json = json.load(f)
-    connect_code = user_json['connectCode']
+  code_to_port = {
+      player.connectCode: port for port, player in gamestate.players.items()
+  }
 
-    code_to_port = {
-        player.connectCode: port for port, player in gamestate.players.items()
-    }
+  actual_port = code_to_port[connect_code]
+  teammate_port = 1
+  for port, player in gamestate.players.items():
+    if port == actual_port:
+      continue
+    if player.team_id == gamestate.players[actual_port].team_id:
+      teammate_port = port
+      break
+  agent.players = (int(actual_port), int(teammate_port))
+  agent.players += tuple(p for p in (1, 2, 3, 4) if p not in agent.players)
+  agent.teammate_port = teammate_port
 
-    actual_port = code_to_port[connect_code]
-    teammate_port = 1
-    for port, player in gamestate.players.items():
-      if port == actual_port:
-        continue
-      if player.team_id == gamestate.players[actual_port].team_id:
-        teammate_port = port
-        break
-    agent.players = (int(actual_port), int(teammate_port))
-    agent.players += tuple(p for p in (1, 2, 3, 4) if p not in agent.players)
-    agent.teammate_port = teammate_port
-
-    # Main loop
-    agent.start()
+  # Main loop
+  agent.start()
 
   try:
     num_frames = 0
@@ -106,38 +108,30 @@ def main(_):
       if CHECK_INPUTS.value and gamestate.frame != -123:
         assert gamestate.frame == prev_frame + 1
 
-      for agent in agents:
-        action: types.Controller = agent.step(gamestate).controller_state
-        action = utils.map_nt(lambda x: x[0], action)
-        action_queue.appendleft(action)
+      action: types.Controller = agent.step(gamestate).controller_state
+      action = utils.map_nt(lambda x: x[0], action)
+      action_queue.appendleft(action)
 
-        expected: types.Controller = action_queue.pop()
-        if expected is None:
-          continue
+      expected: types.Controller = action_queue.pop()
+      if expected is None:
+        continue
 
-        if gamestate.frame < 0:
-          continue
+      if gamestate.frame < 0:
+        continue
 
-        if actual_port in gamestate.players:
-          observed = agent._agent.embed_controller.from_state(
-              get_controller(gamestate.players[actual_port].controller_state))
+      if actual_port in gamestate.players:
+        observed = agent._agent.embed_controller.from_state(
+            get_controller(gamestate.players[actual_port].controller_state))
 
-          # deadzone can change observed stick values
-          if observed.buttons != expected.buttons:
-            frame = gamestate.frame + 123
-            if CHECK_INPUTS.value:
-              raise ValueError(f'Wrong controller seen on frame {frame}')
-            else:
-              logging.error(f'Wrong controller seen on frame {frame}')
+        # deadzone can change observed stick values
+        if observed.buttons != expected.buttons:
+          frame = gamestate.frame + 123
+          logging.error(f'Wrong controller seen on frame {frame}')
 
       num_frames += 1
 
-      if RUNTIME.value is not None and num_frames >= RUNTIME.value * 60:
-        break
-
   finally:
-    for agent in agents:
-      agent.stop()
+    agent.stop()
     dolphin.stop()
 
 if __name__ == '__main__':

@@ -83,6 +83,7 @@ def get_game(
     else:
       state = melee.PlayerState()
       state.action = melee.Action.DEAD_DOWN
+      state.position = melee.Position(0, -100)
       player = get_player(state)
       players[f'p{i}'] = player._replace(is_dead=True)
 
@@ -96,7 +97,7 @@ def get_game(
     # Create a dead player for empty slots
     state = melee.PlayerState()
     state.action = melee.Action.DEAD_DOWN
-    state.position = melee.Position(100, 100)
+    state.position = melee.Position(0, -100)
     empty_player = get_player(state)._replace(is_dead=True)
     
     # Save the original players
@@ -116,7 +117,7 @@ def get_game(
   return Game(
       stage=game.stage.value,
       randall_phase=game.frame % 1200,
-      is_teams=game.is_teams,
+      is_teams=True,
       **players,
   )
 

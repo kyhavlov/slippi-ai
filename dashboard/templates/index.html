@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Melee 2v2 Stats</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body>
+    <h1>Super Smash Bros. Melee 2v2 Stats</h1>
+
+    <div class="filter-controls">
+        <div class="filter-nav">
+            Filter by time period:
+            <a href="?period=all{{ '&min_games=' + min_games|string if min_games > 0 else '' }}" class="{{ 'active' if selected_period == 'all' else '' }}">All Time</a> |
+            <a href="?period=1d{{ '&min_games=' + min_games|string if min_games > 0 else '' }}" class="{{ 'active' if selected_period == '1d' else '' }}">Last Day</a> |
+            <a href="?period=2d{{ '&min_games=' + min_games|string if min_games > 0 else '' }}" class="{{ 'active' if selected_period == '2d' else '' }}">Last 2 Days</a> |
+            <a href="?period=7d{{ '&min_games=' + min_games|string if min_games > 0 else '' }}" class="{{ 'active' if selected_period == '7d' else '' }}">Last 7 Days</a> |
+            <a href="?period=30d{{ '&min_games=' + min_games|string if min_games > 0 else '' }}" class="{{ 'active' if selected_period == '30d' else '' }}">Last 30 Days</a>
+        </div>
+        
+        <form class="min-games-filter" method="get">
+            <label for="min-games">Min Games:</label>
+            <input type="number" id="min-games" name="min_games" value="{{ min_games }}" min="0">
+            <input type="hidden" name="period" value="{{ selected_period }}">
+            <button type="submit">Apply</button>
+        </form>
+    </div>
+
+    <div class="info">
+        Displaying stats for {{ filtered_matches_count }} matches (out of {{ total_matches }} total recorded). 
+        Period: {{ selected_period.replace('d', ' day(s)') if selected_period != 'all' else 'All Time' }}.
+        {% if min_games > 0 %}
+        Minimum games threshold: {{ min_games }}
+        {% endif %}
+    </div>
+
+    <div class="main-layout">
+        <!-- Character Win Rates (moved to top) -->
+        <div class="character-section">
+            <div class="character-stats">
+                <h2>Character Win Rates</h2>
+                {% if char_stats %}
+                    <table id="char-stats-table">
+                        <thead>
+                            <tr>
+                                <th>Character</th>
+                                <th>Win Rate (%)</th>
+                                <th>Wins</th>
+                                <th>Total Games</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for char, stats in char_stats.items() %}
+                            <tr data-character="{{ char }}" class="character-row">
+                                <td class="character-link">{{ char }}</td>
+                                <td>{{ stats.rate }}%</td>
+                                <td>{{ stats.wins }}</td>
+                                <td>{{ stats.games }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <p class="no-data">No character data available for this period.</p>
+                {% endif %}
+            </div>
+
+            <!-- Character Details Section (initially hidden) -->
+            <div id="character-details" class="character-details">
+                <h2 id="selected-character-name">Character Details</h2>
+                
+                <!-- Best Character Teammates -->
+                <h3>Best Character Teammates</h3>
+                <table id="teammate-stats">
+                    <thead>
+                        <tr>
+                            <th>Teammate Character</th>
+                            <th>Win Rate (%)</th>
+                            <th>Diff</th>
+                            <th>Wins</th>
+                            <th>Games</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- Will be populated by JavaScript -->
+                    </tbody>
+                </table>
+                
+                <!-- Best Players for Character -->
+                <h3>Best Players</h3>
+                <table id="player-stats">
+                    <thead>
+                        <tr>
+                            <th>Player</th>
+                            <th>Win Rate (%)</th>
+                            <th>Diff</th>
+                            <th>Wins</th>
+                            <th>Games</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- Will be populated by JavaScript -->
+                    </tbody>
+                </table>
+                
+                <!-- Worst Opponent Characters -->
+                <h3>Opponent Matchups</h3>
+                <table id="opponent-stats">
+                    <thead>
+                        <tr>
+                            <th>Opponent Character</th>
+                            <th>Win Rate (%)</th>
+                            <th>Diff</th>
+                            <th>Wins</th>
+                            <th>Games</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- Will be populated by JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Other Stats Sections -->
+        <div class="stats-layout">
+            <div class="stats-section">
+                <h2>Player Win Rates</h2>
+                {% if player_stats %}
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Player</th>
+                                <th>Win Rate (%)</th>
+                                <th>Wins</th>
+                                <th>Total Games</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for player, stats in player_stats.items() %}
+                            <tr>
+                                <td>{{ player }}</td>
+                                <td>{{ stats.rate }}%</td>
+                                <td>{{ stats.wins }}</td>
+                                <td>{{ stats.games }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <p class="no-data">No player data available for this period.</p>
+                {% endif %}
+            </div>
+
+            <div class="stats-section">
+                <h2>Player + Character Win Rates</h2>
+                {% if player_char_stats %}
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Player (Character)</th>
+                                <th>Win Rate (%)</th>
+                                <th>Wins</th>
+                                <th>Total Games</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for p_char, stats in player_char_stats.items() %}
+                            <tr>
+                                <td>{{ p_char }}</td>
+                                <td>{{ stats.rate }}%</td>
+                                <td>{{ stats.wins }}</td>
+                                <td>{{ stats.games }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <p class="no-data">No player+character data available for this period.</p>
+                {% endif %}
+            </div>
+
+            <div class="stats-section">
+                <h2>Team Composition (Chars) Win Rates</h2>
+                {% if team_stats %}
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Team Composition</th>
+                                <th>Win Rate (%)</th>
+                                <th>Wins</th>
+                                <th>Total Games</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for team_comp, stats in team_stats.items() %}
+                            <tr>
+                                <td>{{ team_comp }}</td>
+                                <td>{{ stats.rate }}%</td>
+                                <td>{{ stats.wins }}</td>
+                                <td>{{ stats.games }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <p class="no-data">No team composition data available for this period.</p>
+                {% endif %}
+            </div>
+
+            <div class="stats-section">
+                <h2>Player Pairing Win Rates</h2>
+                {% if pairing_stats %}
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Player Pairing</th>
+                                <th>Win Rate (%)</th>
+                                <th>Wins</th>
+                                <th>Total Games</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for pair, stats in pairing_stats.items() %}
+                            <tr>
+                                <td>{{ pair }}</td>
+                                <td>{{ stats.rate }}%</td>
+                                <td>{{ stats.wins }}</td>
+                                <td>{{ stats.games }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <p class="no-data">No player pairing data available for this period.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Pass data to JavaScript -->
+    <script>
+        // Character statistics data (passed from the server)
+        const charTeammateStats = {{ char_teammate_stats|tojson }};
+        const charPlayerStats = {{ char_player_stats|tojson }};
+        const charOpponentStats = {{ char_opponent_stats|tojson }};
+    </script>
+    
+    <!-- Load the JavaScript file -->
+    <script src="{{ url_for('static', filename='js/character-details.js') }}"></script>
+</body>
+</html>

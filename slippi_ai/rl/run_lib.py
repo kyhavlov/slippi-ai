@@ -167,6 +167,14 @@ CHARACTER_WEIGHTINGS = {
       Character.BOWSER: 50,
 }
 
+'''
+      Character.POPO: 200,
+      Character.GANONDORF: 200,
+      Character.SAMUS: 200,
+      Character.DK: 200,
+      Character.LUIGI: 200,
+'''
+
 class LearnerManager:
 
   def __init__(
@@ -389,17 +397,6 @@ def run(config: Config):
   learner.restore_from_imitation(rl_state['state'])
 
   PORT = 1
-  #ENEMY_PORT = 2
-
-  '''dolphin_kwargs = dict(
-      players={
-          PORT: dolphin_lib.AI(),
-          ENEMY_PORT: (
-              dolphin_lib.CPU() if config.opponent.type is OpponentType.CPU
-              else dolphin_lib.AI()),
-      },
-      **config.dolphin.to_kwargs(),
-  )'''
 
   # set ports 1-4 to AI
   dolphin_kwargs = dict(
@@ -451,6 +448,7 @@ def run(config: Config):
       async_envs=config.actor.async_envs,
       use_gpu=config.actor.gpu_inference,
       use_fake_envs=config.actor.use_fake_envs,
+      agent_names=name_configuration_batch,
       # Rewards are overridden in the learner.
   )
 
@@ -749,7 +747,11 @@ def run(config: Config):
         maybe_flush(step)
 
       step += 1
-      maybe_save(step)
+      if step % 100 == 0:
+        logging.info('saving checkpoint at step %d', step)
+        save(step)
+      else:
+        maybe_save(step)
 
     save(step)
 
