@@ -1,7 +1,7 @@
 pandas
 dm-sonnet
-git+https://github.com/vladfi1/libmelee.git@v0.38.0
 gdown
+tensorflow
 tensorflow_probability[tf]
 wandb
 git+https://github.com/mbr/simplekv.git
@@ -15,5 +15,5 @@ portpicker
 ray
 discord
 trueskill
-tensorflow[and-cuda]
 Flask>=2.0
+matplotlib

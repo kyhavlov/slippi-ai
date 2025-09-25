@@ -23,10 +23,9 @@
 - `discordbot/`, `bot*-user.json` – Netplay and streaming integration assets; keep credentials out of version control.
 
 ## Tooling & Dependencies
-- Python 3.8 environment (`environment.yaml:1`), TensorFlow 2.6 + Sonnet, ray, fancyflags/absl, wandb.
+- Python environment, TensorFlow + Sonnet, ray, fancyflags/absl, wandb.
 - GPU access assumed for training; RL scripts tuned for RTX 3080Ti but configurable via CLI.
 - External binaries kept in repo (Slippi AppImages, `SSBM.iso`) – do not redistribute; avoid accidental commits.
-- Dockerfile (`Dockerfile:1`) offers minimal ray + TF baseline; still requires manual peppi-py alignment for parsing.
 - Set `PYTHONPATH=.` when running scripts; wandb requires `WANDB_API_KEY`.
 
 ## Data & Asset Management
@@ -59,6 +58,7 @@
 ### 5. Analytics & Dashboard
 - Launch Flask app (`python dashboard/dashboard.py`) to visualize JSONL stats; data auto-appends per match submission.
 - `dashboard/static/` + `templates/` hold frontend; keep CSS/JS minimal for LLM diffs.
+- `python scripts/value_trace.py --model_path=... --replay_path=...` plots value-function predictions vs. realized rewards for a replay (outputs PNG + CSV).
 
 ## Testing & Validation
 - Python tests under `tests/` (e.g., `tests/networks_test.py:1`, `tests/rl_lib_test.py:1`); run via `pytest` or targeted scripts.
@@ -67,12 +67,13 @@
 - Prefer GPU-offline smoke runs before long jobs; set `CUDA_VISIBLE_DEVICES=""` for CPU-only sanity tests.
 
 ## Contribution Practices for LLMs
-1. **Start with reconnaissance** – use `find`, `grep`, `python -m compileall` to confirm context before editing.
-2. **Favor minimal, well-scoped diffs** – touch smallest module slice; update comments/docstrings sparingly.
-3. **Respect configs & flags** – new options should integrate with fancyflags/absl conventions; update example scripts.
-4. **Document large-impact changes** – extend this guide, adjust README, annotate scripts when altering workflows.
-5. **Validate** – run unit/smoke tests relevant to touched modules; note skipped tests and why.
-6. **Preserve data hygiene** – never commit regenerated parquet/checkpoints; add `.gitignore` rules when needed.
+1. **Start with reconnaissance** – use `find`, `rg`, `python -m compileall` to confirm context before editing.
+2. **Prefer ripgrep** – use `rg` for repo-wide searches; avoid raw `grep -R` so traversals stay fast.
+3. **Favor minimal, well-scoped diffs** – touch smallest module slice; update comments/docstrings sparingly.
+4. **Respect configs & flags** – new options should integrate with fancyflags/absl conventions; update example scripts.
+5. **Document large-impact changes** – extend this guide, adjust README, annotate scripts when altering workflows.
+6. **Validate** – run unit/smoke tests relevant to touched modules; note skipped tests and why.
+7. **Preserve data hygiene** – never commit regenerated parquet/checkpoints; add `.gitignore` rules when needed.
 
 ## Observed Opportunities / TODO Seeds
 - Consolidate singles/doubles env handling (feature flags in `slippi_ai/envs.py:80`).
@@ -82,10 +83,10 @@
 - Evaluate migrating from TensorFlow to JAX/PyTorch if long-term maintenance demands (requires major refactor).
 
 ## Roadmap
-- Pull in some of the upstream improvements from https://github.com/vladfi1/slippi-ai on the imitation-dev branch: item/projectile embeddings, nana embedding per-player, randall embedding (have one currently but it's probably incorrectly done/suboptimal), support for balancing replay data per-character during imitation learning. Probably other small improvements as well in the history of that branch.
+- Pull in some of the upstream improvements from https://github.com/vladfi1/slippi-ai on the imitation-dev branch: item/projectile embeddings, nana embedding per-player, randall embedding (have one currently but it's probably incorrectly done/suboptimal), support for balancing replay data per-character during imitation learning. Probably other small improvements as well in the history of that branch. When adding new embeddings or changing existing ones, follow the existing conventions of adding them as optional, configurable fields to maintain backwards compatibility with running older versions of models.
 - Double check that the player embeddings are properly voided for the singles games we use for imitation training. This would be in both the replay pre-processing and the IL code to double check the gamestate the model gets makes it obvious in some way that the player is not there/eliminated. I added an 'is_teams' embedding at some point but i'm not sure it's well done.
 - Add support for splitting training between some % singles and some % doubles games during RL. Last time i looked into this it was tricky because of how the batches from the envs are lined up/prepared, and having envs of different sizes (2 vs 4 players each) seemed to present complications. This should be doable though, but it will take some care and testing.
-- Set up a script to load a trained model and run a replay through it in order to log its value function from one player's perspective throughout the game. Emit a readable graph as well.
+- Set up a script to load a trained model and run a replay through it in order to log its value function from one player's perspective throughout the game. Emit a readable graph as well. (done, in scripts/value_trace.py)
 - Experiment with smaller network size for faster inference/training.
 
 ## Quick Reference

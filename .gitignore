@@ -174,3 +174,6 @@ models/
 eval/
 slippi_ai/nametags_banned.txt
 match_data/
+*.csv
+*.png
+.linuxvenv/
