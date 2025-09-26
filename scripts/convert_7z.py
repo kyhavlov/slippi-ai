@@ -2,6 +2,7 @@
 
 import itertools
 import os
+import shutil
 import subprocess
 import tempfile
 import typing as tp
@@ -29,9 +30,17 @@ def chunked(iterable: tp.Iterable[T], n: int) -> tp.Iterator[tp.Iterator[T]]:
 
     yield itertools.chain([first], chunk)
 
+class ExtractFileError(Exception):
+
+  def __init__(self, failed_file: str, log: str):
+    self.failed_file = failed_file
+    self.log = log
+    super().__init__(f'Failed to extract {failed_file}')
+
+
 def extract_file_list(
     path: str,
-    files: tp.Iterable[str],
+    files: tp.Sequence[str],
     output_dir: str,
 ) -> None:
   """Extract files from a 7z archive."""
@@ -43,10 +52,153 @@ def extract_file_list(
     input_list.seek(0)
 
     # TODO: is there a way to do this multithreaded?
-    subprocess.check_call(
+    result = subprocess.run(
         ['7z', 'x', path, f'@{input_list.name}'],
         cwd=output_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
+
+  if result.returncode == 0:
+    return
+
+  failed_file = _parse_failed_path(result.stdout, files)
+  if failed_file is None:
+    print(result.stdout)
+    raise subprocess.CalledProcessError(result.returncode, result.args)
+
+  raise ExtractFileError(failed_file, result.stdout)
+
+
+def _parse_failed_path(log: str, requested_files: tp.Sequence[str]) -> tp.Optional[str]:
+  lines = log.splitlines()
+
+  # try to find a line immediately following an ERROR marker
+  for idx, line in enumerate(lines):
+    if 'ERROR' not in line.upper():
+      continue
+    candidate_from_line = _extract_path_from_error_line(line)
+    if candidate_from_line and _looks_like_requested_file(candidate_from_line, requested_files):
+      return candidate_from_line
+    for follow in lines[idx + 1: idx + 4]:
+      candidate = follow.strip()
+      if _looks_like_requested_file(candidate, requested_files):
+        return candidate
+
+  # fallback: scan for any requested filename mentioned in the log
+  for candidate in reversed(lines):
+    candidate = candidate.strip()
+    if _looks_like_requested_file(candidate, requested_files):
+      return candidate
+
+  return None
+
+
+def _looks_like_requested_file(candidate: str, requested_files: tp.Sequence[str]) -> bool:
+  if not candidate:
+    return False
+  norm = _normalize_path(candidate)
+  for name in requested_files:
+    if norm.endswith(_normalize_path(name)):
+      return True
+  return False
+
+
+def _extract_path_from_error_line(line: str) -> tp.Optional[str]:
+  if not line:
+    return None
+  if ':' not in line:
+    return line.strip()
+  tail = line.rsplit(':', 1)[-1].strip()
+  return tail or None
+
+
+def _normalize_path(path: str) -> str:
+  return path.replace('\\', '/').lstrip('./')
+
+
+def _dir_has_files(path: str) -> bool:
+  for _dirpath, _dirnames, filenames in os.walk(path):
+    if filenames:
+      return True
+  return False
+
+
+def _list_extracted_files(root: str) -> dict[str, str]:
+  files: dict[str, str] = {}
+  for dirpath, _dirnames, filenames in os.walk(root):
+    for name in filenames:
+      rel_path = os.path.relpath(os.path.join(dirpath, name), root)
+      norm = _normalize_path(rel_path)
+      files[norm] = rel_path
+  return files
+
+
+def _remove_extracted_file(root: str, rel_path: str) -> None:
+  abs_path = os.path.join(root, rel_path)
+  if os.path.exists(abs_path):
+    os.remove(abs_path)
+    _cleanup_empty_dirs(os.path.dirname(abs_path), root)
+
+
+def _cleanup_empty_dirs(path: str, stop_dir: str) -> None:
+  stop_dir = os.path.abspath(stop_dir)
+  while path and os.path.abspath(path).startswith(stop_dir):
+    try:
+      os.rmdir(path)
+    except OSError:
+      break
+    if os.path.abspath(path) == stop_dir:
+      break
+    path = os.path.dirname(path)
+
+
+def _create_chunk_zip(
+    zip_path: str,
+    source_dir: str,
+    skipped_files: tp.Set[str],
+) -> bool:
+  cmd = ['7z', '-tzip', 'a', zip_path, '*']
+  while True:
+    files_map = _list_extracted_files(source_dir)
+    if not files_map:
+      print('No files left to zip in', source_dir)
+      if os.path.exists(zip_path):
+        os.remove(zip_path)
+      return False
+
+    if os.path.exists(zip_path):
+      os.remove(zip_path)
+
+    result = subprocess.run(
+        cmd,
+        cwd=source_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    if result.returncode == 0:
+      return True
+
+    failed = _parse_failed_path(result.stdout, list(files_map.keys()))
+    if failed is None:
+      print(result.stdout)
+      raise subprocess.CalledProcessError(result.returncode, cmd)
+
+    norm_failed = _normalize_path(failed)
+    rel_path = files_map.get(norm_failed)
+    skipped_files.add(norm_failed)
+
+    if rel_path is None:
+      print('7z reported failure on', failed,
+            'but file was not found in chunk; retrying without changes')
+      continue
+
+    print('Skipping file during zip due to error:', rel_path)
+    _remove_extracted_file(source_dir, rel_path)
+
 
 def convert(
     input_path: str,
@@ -58,6 +210,7 @@ def convert(
   input_path = os.path.abspath(input_path)
   output_path = os.path.abspath(output_path)
   archive = py7zr.SevenZipFile(input_path, 'r')
+  skipped_files: set[str] = set()
 
   # calculate optimal chunks
   folders = archive.header.main_streams.unpackinfo.folders
@@ -87,28 +240,94 @@ def convert(
   # relpaths = reversed(relpaths)
   # chunks = chunked(tqdm.tqdm(relpaths), chunk_size)
 
-  with tempfile.TemporaryDirectory() as zipdir:
+  archive_dir = os.path.dirname(input_path)
+  with tempfile.TemporaryDirectory(dir=archive_dir) as zipdir:
     zip_paths = []
+    if in_memory:
+      tmp_root = utils.get_tmp_dir(in_memory=True)
+    else:
+      tmp_root = archive_dir
+    if tmp_root is not None:
+      os.makedirs(tmp_root, exist_ok=True)
+
     for i, chunk in enumerate(tqdm.tqdm(chunks, smoothing=0)):
 
       # with tempfile.TemporaryDirectory() as tmpdir:
-      with tempfile.TemporaryDirectory(dir=utils.get_tmp_dir(in_memory=in_memory)) as tmpdir:
-        extract_file_list(input_path, chunk, tmpdir)
+      with tempfile.TemporaryDirectory(dir=tmp_root) as tmpdir:
+        remaining = list(chunk)
 
-        # zip all from tmpdir
+        while remaining:
+          try:
+            extract_file_list(input_path, remaining, tmpdir)
+            break
+          except ExtractFileError as err:
+            failed_file = err.failed_file
+            norm_failed = _normalize_path(failed_file)
+            match = next((r for r in remaining if _normalize_path(r) == norm_failed), None)
+            if match is None:
+              raise
+            skipped_files.add(norm_failed)
+            remaining.remove(match)
+            print('Skipping file due to extraction error:', match)
+            continue
+        else:
+          # nothing left to extract
+          pass
+
+        if not _dir_has_files(tmpdir):
+          print('No files extracted for chunk', i, '- skipping zip creation')
+          continue
+
         zip_path = os.path.join(zipdir, f'{i}.zip')
-        zip_paths.append(zip_path)
-        subprocess.check_call(['7z', '-tzip', 'a', zip_path, '*'], cwd=tmpdir)
+        if _create_chunk_zip(zip_path, tmpdir, skipped_files):
+          zip_paths.append(zip_path)
 
-    # combine all zip files
-    subprocess.check_call(['zipmerge', output_path, *zip_paths])
+    # combine all zip files, preferring zipmerge when available
+    if not zip_paths:
+      print('No zip chunks created for', input_path, '- producing empty archive')
+      with zipfile.ZipFile(output_path, 'w'):
+        pass
+    else:
+      zipmerge_path = shutil.which('zipmerge')
+      if zipmerge_path is not None:
+        try:
+          subprocess.check_call([zipmerge_path, output_path, *zip_paths])
+          return
+        except subprocess.CalledProcessError as exc:
+          print('zipmerge failed with', exc, '- falling back to Python merge')
 
-  zip_archive = zipfile.ZipFile(output_path)
-  for sf in archive.files:
-    if sf.is_directory:
-      continue
-    info = zip_archive.getinfo(sf.filename)
-    assert info.file_size == sf.uncompressed
+      _merge_zip_archives(zip_paths, output_path)
+
+
+def _merge_zip_archives(zip_paths: list[str], output_path: str) -> None:
+  # combine all zip files using Python fallback
+  with zipfile.ZipFile(output_path, 'w') as final_zip:
+    for zip_path in zip_paths:
+      with zipfile.ZipFile(zip_path, 'r') as chunk_zip:
+        for member in chunk_zip.infolist():
+          if member.is_dir():
+            final_zip.writestr(member, b'')
+            continue
+
+          member_copy = zipfile.ZipInfo(member.filename)
+          member_copy.date_time = member.date_time
+          member_copy.compress_type = member.compress_type
+          member_copy.comment = member.comment
+          member_copy.extra = member.extra
+          member_copy.internal_attr = member.internal_attr
+          member_copy.external_attr = member.external_attr
+          with chunk_zip.open(member, 'r') as src, final_zip.open(member_copy, 'w') as dst:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+
+  with zipfile.ZipFile(output_path) as zip_archive:
+    for sf in archive.files:
+      if sf.is_directory or _normalize_path(sf.filename) in skipped_files:
+        continue
+      info = zip_archive.getinfo(sf.filename)
+      assert info.file_size == sf.uncompressed
+
+  if skipped_files:
+    print('Skipped', len(skipped_files), 'files due to extraction errors')
 
   os.chdir(cwd)  # for line_profiler
 
@@ -142,7 +361,11 @@ def main(_):
 
         os.makedirs(target_dir, exist_ok=True)
         output_name = name.removesuffix('.7z') + '.zip'
-        targets.append((archive_path, os.path.join(target_dir, output_name)))
+        output_path = os.path.join(target_dir, output_name)
+        if os.path.exists(output_path):
+          print('Skipping', archive_path, '- output already exists at', output_path)
+          continue
+        targets.append((archive_path, output_path))
 
     if not targets:
       print('No .7z archives found under', input_path)
@@ -157,6 +380,9 @@ def main(_):
     os.makedirs(output_dir, exist_ok=True)
     output_name = os.path.basename(INPUT.value).removesuffix('.7z') + '.zip'
     output_path = os.path.join(output_dir, output_name)
+    if os.path.exists(output_path):
+      print('Skipping', INPUT.value, '- output already exists at', output_path)
+      return
     print('Converting', INPUT.value, 'to', output_path)
     convert(INPUT.value, output_path, max_chunk_size_gb=chunk_size)
 
