@@ -5,6 +5,7 @@ import pyarrow as pa
 
 import melee
 
+from slippi_ai import utils
 from slippi_ai.types import (
   GAME_TYPE,
   LIBMELEE_BUTTONS,
@@ -12,7 +13,11 @@ from slippi_ai.types import (
   Controller,
   Game,
   InvalidGameError,
+  Item,
+  Items,
+  Nana,
   Player,
+  Randall,
   Stick,
   nt_to_nest,
 )
@@ -34,31 +39,57 @@ def get_controller(cs: melee.ControllerState) -> Controller:
       buttons=get_buttons(cs.button),
   )
 
+_EMPTY_NANA = utils.map_nt(
+    lambda t: t(0),
+    utils.reify_tuple_type(Nana),
+)
+
+_EMPTY_ITEM = utils.map_nt(
+    lambda t: t(0),
+    utils.reify_tuple_type(Item),
+)
+
 def get_player(player: melee.PlayerState) -> Player:
   if player.action == melee.Action.UNKNOWN_ANIMATION:
     raise InvalidGameError('UNKNOWN_ANIMATION')
 
-  return Player(
-      percent=player.percent,
-      facing=player.facing,
-      x=player.position.x,
-      y=player.position.y,
-      action=player.action.value,
-      character=player.character.value,
-      jumps_left=player.jumps_left,
-      shield_strength=player.shield_strength,
-      on_ground=player.on_ground,
-      is_dead=player.stock == 0,
-      stocks_left=player.stock,
+  base = dict(
+      percent=np.uint16(player.percent),
+      facing=np.bool_(player.facing),
+      x=np.float32(player.position.x),
+      y=np.float32(player.position.y),
+      action=np.uint16(player.action.value),
+      invulnerable=np.bool_(player.invulnerable),
+      character=np.uint8(player.character.value),
+      jumps_left=np.uint8(player.jumps_left),
+      shield_strength=np.float32(player.shield_strength),
+      on_ground=np.bool_(player.on_ground),
+      is_dead=np.bool_(player.stock == 0),
+      stocks_left=np.uint8(player.stock),
       controller=get_controller(player.controller_state),
-      # v2.1.0
-      invulnerable=player.invulnerable,
-      # v3.5.0
-      # player.speed_air_x_self,
-      # player.speed_ground_x_self,
-      # player.speed_x_attack,
-      # player.speed_y_attack,
-      # player.speed_y_self,
+  )
+
+  if player.nana is not None:
+    nana_state = player.nana
+    nana = Nana(
+        exists=np.bool_(True),
+        percent=np.uint16(nana_state.percent),
+        facing=np.bool_(nana_state.facing),
+        x=np.float32(nana_state.position.x),
+        y=np.float32(nana_state.position.y),
+        action=np.uint16(nana_state.action.value),
+        invulnerable=np.bool_(nana_state.invulnerable),
+        character=np.uint8(nana_state.character.value),
+        jumps_left=np.uint8(nana_state.jumps_left),
+        shield_strength=np.float32(nana_state.shield_strength),
+        on_ground=np.bool_(nana_state.on_ground),
+    )
+  else:
+    nana = _EMPTY_NANA
+
+  return Player(
+      nana=nana,
+      **base,
   )
 
 def get_game(
@@ -115,8 +146,13 @@ def get_game(
     #print(f"Final players after singles mode processing: {list(players.keys())}")
 
   return Game(
-      stage=game.stage.value,
-      randall_phase=game.frame % 1200,
+      stage=np.uint8(game.stage.value),
+      randall_phase=np.float32(game.frame % 1200),
+      randall=Randall(
+          x=np.float32(0.0),
+          y=np.float32(0.0),
+      ),
+      items=Items(**{f'item_{i}': _EMPTY_ITEM for i in range(len(Items._fields))}),
       is_teams=True,
       **players,
   )

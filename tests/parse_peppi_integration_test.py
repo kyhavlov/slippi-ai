@@ -1,6 +1,7 @@
 import pathlib
 import unittest
 
+import numpy as np
 import peppi_py  # noqa: F401
 
 
@@ -49,6 +50,33 @@ class ParsePeppiIntegrationTest(unittest.TestCase):
     self.assertEqual(int(frame.p3.character[0]), 15)
     for port in (frame.p0, frame.p1, frame.p2, frame.p3):
       self.assertFalse(port.is_dead[0])
+
+  def test_items_replay_contains_projectiles(self):
+    path = self._replay_dir / 'test_items_game.slp'
+    game_array = parse_peppi.get_slp(str(path))
+    game = types.game_array_to_nt(game_array)
+
+    active_slots = []
+    for slot_name in types.Items._fields:
+      slot = getattr(game.items, slot_name)
+      if slot.exists.any():
+        active_slots.append(slot)
+
+    self.assertTrue(active_slots, 'Expected at least one item slot to be active')
+
+    # Spot-check the first active slot for reasonable projectile data
+    slot = active_slots[0]
+    exists_mask = slot.exists.astype(bool)
+    self.assertTrue(np.any(slot.type[exists_mask] > 0), msg='Active item has zero type id')
+
+    xy = np.stack([slot.x[exists_mask], slot.y[exists_mask]], axis=0)
+    self.assertTrue(np.any(np.abs(xy) > 0.0), msg='Active item has zero coordinates')
+
+    first_idx = np.flatnonzero(exists_mask)[0]
+    self.assertEqual(int(slot.type[first_idx]), 75)
+    self.assertEqual(int(slot.state[first_idx]), 3)
+    self.assertAlmostEqual(float(slot.x[first_idx]), -42.0, places=4)
+    self.assertAlmostEqual(float(slot.y[first_idx]), 5.996767, places=4)
 
 
 if __name__ == '__main__':

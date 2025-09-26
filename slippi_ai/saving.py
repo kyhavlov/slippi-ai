@@ -14,8 +14,9 @@ from slippi_ai import (
     embed,
     s3_lib,
 )
+from slippi_ai.flag_utils import dataclass_from_dict
 
-VERSION = 3
+VERSION = 4
 
 def upgrade_config(config: dict):
   """Upgrades a config to the latest version."""
@@ -56,6 +57,19 @@ def upgrade_config(config: dict):
     config['version'] = 3
     logging.warning('Upgraded config version 2 -> 3')
 
+  if config['version'] == 3:
+    embed_cfg = config['embed']
+    embed_cfg.setdefault('with_randall_xy', False)
+    if 'items' not in embed_cfg:
+      embed_cfg['items'] = dataclasses.asdict(embed.ItemsConfig())
+
+    player_cfg = embed_cfg.setdefault('player', {})
+    player_cfg.setdefault('with_nana', False)
+    player_cfg.setdefault('legacy_jumps_left', True)
+
+    config['version'] = 4
+    logging.warning('Upgraded config version 3 -> 4')
+
   assert config['version'] == VERSION
   return config
 
@@ -91,7 +105,10 @@ def policy_from_config(config: dict) -> policies.Policy:
       embed_controller=embed.get_controller_embedding(
           **config['embed']['controller']),
       embed_game=embed.make_game_embedding(
-          player_config=config['embed']['player']),
+          player_config=config['embed']['player'],
+          with_randall_xy=config['embed'].get('with_randall_xy', False),
+          items_config=dataclass_from_dict(
+              embed.ItemsConfig, config['embed'].get('items', {}))),
       **config['policy'],
   )
 

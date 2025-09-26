@@ -4,6 +4,7 @@ Converts SSBM types to Tensorflow types.
 
 import abc
 import dataclasses
+import enum
 import math
 from typing import (
     Any, Callable, Dict, Generic, Iterator, Mapping, NamedTuple, Optional, Sequence,
@@ -14,9 +15,21 @@ import numpy as np
 
 import tensorflow as tf
 import tensorflow_probability as tfp
+import sonnet as snt
 
 from slippi_ai import utils
-from slippi_ai.types import Buttons, Controller, Game, Nest, Player, Stick
+from slippi_ai.types import (
+    Buttons,
+    Controller,
+    Game,
+    Item,
+    Items,
+    Nana,
+    Nest,
+    Player,
+    Randall,
+    Stick,
+)
 from slippi_ai.controller_lib import LEGAL_BUTTONS
 from slippi_ai.data import Action, StateAction
 
@@ -277,7 +290,6 @@ class StructEmbedding(Embedding[NT, NT]):
       t = op(self.getter(struct, field), **kwargs)
       embed.append(t)
 
-    assert embed
     return tf.concat(axis=-1, values=embed)
 
   # def split(self, embedded: tf.Tensor) -> Mapping[str, tf.Tensor]:
@@ -368,6 +380,30 @@ def dict_embedding(
       getter=get_dict,
   )
 
+
+class MLPWrapper(Embedding[In, Out]):
+
+  def __init__(
+      self,
+      output_sizes: Sequence[int],
+      embed: Embedding[In, Out],
+  ):
+    self.name = f'MLP_{embed.name}'
+    self._output_sizes = output_sizes
+    self._embed = embed
+    self.size = output_sizes[-1]
+    self._mlp = snt.nets.MLP(
+        output_sizes, activate_final=True,
+        activation=tf.nn.relu,
+    )
+
+  def from_state(self, state: In) -> Out:
+    return self._embed.from_state(state)
+
+  def __call__(self, inputs: Out) -> tf.Tensor:
+    embedded = self._embed(inputs)
+    return self._mlp(embedded)
+
 # one larger than KIRBY_STONE_UNFORMING
 # embed_action = EnumEmbedding(enums.Action, size=0x18F, dtype=np.int16)
 embed_action = OneHotEmbedding('Action', size=0x18F, dtype=np.int32)
@@ -376,53 +412,91 @@ embed_action = OneHotEmbedding('Action', size=0x18F, dtype=np.int32)
 # embed_char = EnumEmbedding(enums.Character, size=0x21, dtype=np.uint8)
 embed_char = OneHotEmbedding('Character', size=0x21, dtype=np.uint8)
 
-# puff and kirby have 6 jumps
-embed_jumps_left = OneHotEmbedding("jumps_left", 6, dtype=np.uint8)
+# puff and kirby have 6 jumps in the legacy encoding
+legacy_embed_jumps_left = OneHotEmbedding(
+    "legacy_jumps_left", 6, dtype=np.uint8)
+# Allow an updated encoding with 7 bins when explicitly enabled
+embed_jumps_left = OneHotEmbedding("jumps_left", 7, dtype=np.uint8)
+
+
+def _base_player_embedding(
+    xy_scale: float,
+    shield_scale: float,
+    speed_scale: float,
+    with_speeds: bool,
+    legacy_jumps_left: bool,
+) -> list[tuple[str, Embedding]]:
+  embed_xy = FloatEmbedding("xy", scale=xy_scale)
+
+  embedding: list[tuple[str, Embedding]] = [
+      ("percent", FloatEmbedding("percent", scale=0.01)),
+      ("facing", BoolEmbedding("facing", off=-1.)),
+      ("x", embed_xy),
+      ("y", embed_xy),
+      ("action", embed_action),
+      ("character", embed_char),
+      ("invulnerable", embed_bool),
+      ("jumps_left", legacy_embed_jumps_left if legacy_jumps_left else embed_jumps_left),
+      ("shield_strength", FloatEmbedding("shield_size", scale=shield_scale)),
+      ("on_ground", embed_bool),
+      ("is_dead", embed_bool),
+      ("stocks_left", FloatEmbedding("stocks_left", scale=0.25)),
+  ]
+
+  if with_speeds:
+    embed_speed = FloatEmbedding("speed", scale=speed_scale)
+    embedding.extend([
+        ('speed_air_x_self', embed_speed),
+        ('speed_ground_x_self', embed_speed),
+        ('speed_y_self', embed_speed),
+        ('speed_x_attack', embed_speed),
+        ('speed_y_attack', embed_speed),
+    ])
+
+  return embedding
+
+
+def _make_nana_embedding(
+    base_embedding: list[tuple[str, Embedding]],
+    shield_scale: float,
+) -> StructEmbedding[Nana]:
+  nana_embedding = [
+      (name, embed)
+      for name, embed in base_embedding
+      if name not in ('is_dead', 'stocks_left')
+  ]
+  nana_embedding.append(('exists', embed_bool))
+  return ordered_struct_embedding("nana", nana_embedding, Nana)
+
 
 def make_player_embedding(
     xy_scale: float = 0.05,
     shield_scale: float = 0.01,
     speed_scale: float = 0.5,
     with_speeds: bool = False,
-    with_controller: bool = True,
+    with_controller: bool = False,
+    with_nana: bool = False,
+    legacy_jumps_left: bool = True,
 ) -> StructEmbedding[Player]:
-    embed_xy = FloatEmbedding("xy", scale=xy_scale)
+  base_embedding = _base_player_embedding(
+      xy_scale=xy_scale,
+      shield_scale=shield_scale,
+      speed_scale=speed_scale,
+      with_speeds=with_speeds,
+      legacy_jumps_left=legacy_jumps_left,
+  )
 
-    embedding = [
-      ("percent", FloatEmbedding("percent", scale=0.01)),
-      ("facing", BoolEmbedding("facing", off=-1.)),
-      ('x', embed_xy),
-      ('y', embed_xy),
-      ("action", embed_action),
-      # ("action_frame", FloatEmbedding("action_frame", scale=0.02)),
-      ("character", embed_char),
-      ("invulnerable", embed_bool),
-      # ("hitlag_frames_left", embedFrame),
-      # ("hitstun_frames_left", embedFrame),
-      ("jumps_left", embed_jumps_left),
-      # ("charging_smash", embedFloat),
-      ("shield_strength", FloatEmbedding("shield_size", scale=shield_scale)),
-      ("on_ground", embed_bool),
-      ("is_dead", embed_bool),
-      ("stocks_left", FloatEmbedding("percent", scale=0.25)),
-    ]
+  embedding = list(base_embedding)
 
-    if with_controller:
-      # TODO: make this configurable
-      embed_controller_default = get_controller_embedding()  # continuous sticks
-      embedding.append(('controller', embed_controller_default))
+  if with_controller:
+    embed_controller_default = get_controller_embedding()
+    embedding.append(('controller', embed_controller_default))
 
-    if with_speeds:
-      embed_speed = FloatEmbedding("speed", scale=speed_scale)
-      embedding.extend([
-          ('speed_air_x_self', embed_speed),
-          ('speed_ground_x_self', embed_speed),
-          ('speed_y_self', embed_speed),
-          ('speed_x_attack', embed_speed),
-          ('speed_y_attack', embed_speed),
-      ])
+  if with_nana:
+    embed_nana = _make_nana_embedding(base_embedding, shield_scale)
+    embedding.append(('nana', embed_nana))
 
-    return ordered_struct_embedding("player", embedding, Player)
+  return ordered_struct_embedding("player", embedding, Player)
 
 @dataclasses.dataclass
 class PlayerConfig:
@@ -433,6 +507,8 @@ class PlayerConfig:
   # don't use opponent's controller
   # our own will be embedded separately
   with_controller: bool = False
+  with_nana: bool = False
+  legacy_jumps_left: bool = True
 
 # future proof in case we want to play on wacky stages
 # embed_stage = EnumEmbedding(enums.Stage, size=64, dtype=np.uint8)
@@ -440,24 +516,104 @@ embed_stage = OneHotEmbedding('Stage', size=64, dtype=np.uint8)
 
 embed_randall_phase = FloatEmbedding("randall_phase", scale=1/1200.)
 
+
+class ItemsType(enum.Enum):
+  SKIP = 'skip'
+  FLAT = 'flat'
+  MLP = 'mlp'
+
+
+@dataclasses.dataclass
+class ItemsConfig:
+  type: ItemsType = ItemsType.SKIP
+  mlp_sizes: tuple[int, ...] = (128, 32)
+
+
+MAX_ITEM_TYPE = 0xEC
+MAX_ITEM_STATE = 11
+
+
+def make_item_embedding(xy_scale: float) -> StructEmbedding[Item]:
+  embed_xy = FloatEmbedding("item_xy", scale=xy_scale)
+  return struct_embedding_from_nt("item", Item(
+      exists=embed_bool,
+      type=OneHotEmbedding('ItemType', size=MAX_ITEM_TYPE + 1, dtype=np.int32),
+      state=OneHotEmbedding('ItemState', size=MAX_ITEM_STATE + 1, dtype=np.uint8),
+      x=embed_xy,
+      y=embed_xy,
+  ))
+
+
+def make_items_embedding(
+    items_config: ItemsConfig,
+    xy_scale: float,
+) -> Embedding[Items, Any]:
+  if items_config.type is ItemsType.SKIP:
+    return ordered_struct_embedding("items", [], Items)
+
+  embed_item_flat = make_item_embedding(xy_scale)
+
+  if items_config.type is ItemsType.FLAT:
+    embed_item = embed_item_flat
+  elif items_config.type is ItemsType.MLP:
+    embed_item = MLPWrapper(
+        output_sizes=items_config.mlp_sizes,
+        embed=embed_item_flat,
+    )
+  else:
+    raise ValueError(f"Unsupported items config type: {items_config.type}")
+
+  return ordered_struct_embedding(
+      "items",
+      [(field, embed_item) for field in Items._fields],
+      Items)
+
 _PORTS = (0, 1)
 # _PLAYERS = tuple(f'p{p}' for p in _PORTS)
 # _SWAP_MAP = dict(zip(_PLAYERS, reversed(_PLAYERS)))
 
-def make_game_embedding(player_config={}):
-  embed_player = make_player_embedding(**player_config)
+def make_game_embedding(
+    player_config: dict | PlayerConfig | None = None,
+    with_randall_xy: bool = False,
+    items_config: ItemsConfig = ItemsConfig(),
+):
+  if player_config is None:
+    player_config_dict: dict[str, Any] = {}
+  elif dataclasses.is_dataclass(player_config):
+    player_config_dict = dataclasses.asdict(player_config)
+  else:
+    player_config_dict = dict(player_config)
 
-  embedding = Game(
-      p0=embed_player,
-      p1=embed_player,
-      p2=embed_player,
-      p3=embed_player,
-      stage=embed_stage,
-      randall_phase=embed_randall_phase,
-      is_teams=embed_bool,
-  )
+  embed_player = make_player_embedding(**player_config_dict)
 
-  return struct_embedding_from_nt("game", embedding)
+  xy_scale = player_config_dict.get('xy_scale', 0.05)
+
+  embedding_fields: list[tuple[str, Embedding]] = [
+      ('p0', embed_player),
+      ('p1', embed_player),
+      ('p2', embed_player),
+      ('p3', embed_player),
+      ('stage', embed_stage),
+      ('randall_phase', embed_randall_phase),
+      ('is_teams', embed_bool),
+  ]
+
+  if with_randall_xy:
+    embed_xy = FloatEmbedding("randall_xy", scale=xy_scale)
+    embedding_fields.append((
+        'randall',
+        struct_embedding_from_nt(
+            "randall", Randall(x=embed_xy, y=embed_xy)),
+    ))
+
+  if items_config.type is not ItemsType.SKIP:
+    embed_items = make_items_embedding(
+        items_config=items_config,
+        xy_scale=xy_scale,
+    )
+    embedding_fields.append(('items', embed_items))
+
+  return ordered_struct_embedding("game", embedding_fields, Game)
 
 # don't use opponent's controller
 # our own will be exposed in the input
@@ -531,6 +687,8 @@ class ControllerConfig:
 class EmbedConfig:
   player: PlayerConfig = utils.field(PlayerConfig)
   controller: ControllerConfig = utils.field(ControllerConfig)
+  with_randall_xy: bool = False
+  items: ItemsConfig = utils.field(ItemsConfig)
 
 NAME_DTYPE = np.int32
 

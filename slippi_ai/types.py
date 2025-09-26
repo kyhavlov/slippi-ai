@@ -32,6 +32,20 @@ class Controller(NamedTuple):
   shoulder: np.float32
   buttons: Buttons
 
+class Nana(NamedTuple):
+  exists: np.bool_
+  percent: np.uint16
+  facing: np.bool_
+  x: np.float32
+  y: np.float32
+  action: np.uint16
+  invulnerable: np.bool_
+  character: np.uint8
+  jumps_left: np.uint8
+  shield_strength: np.float32
+  on_ground: np.bool_
+
+
 class Player(NamedTuple):
   percent: np.uint16
   facing: np.bool_
@@ -46,6 +60,29 @@ class Player(NamedTuple):
   is_dead: np.bool_
   stocks_left: np.uint8
   controller: Controller
+  nana: Nana
+
+
+class Randall(NamedTuple):
+  x: np.float32
+  y: np.float32
+
+
+MAX_ITEMS = 15
+
+
+class Item(NamedTuple):
+  exists: np.bool_
+  type: np.uint16
+  state: np.uint8
+  x: np.float32
+  y: np.float32
+
+
+Items = NamedTuple('Items', [
+    (f'item_{i}', Item) for i in range(MAX_ITEMS)
+])
+
 
 class Game(NamedTuple):
   p0: Player
@@ -54,10 +91,24 @@ class Game(NamedTuple):
   p3: Player
   stage: np.uint8
   randall_phase: np.float32
+  randall: Randall
+  items: Items
   is_teams: np.bool_
 
 # maps pyarrow types back to NamedTuples
 PA_TO_NT = {}
+
+
+def _zeros_for_type(t: type, length: int):
+  """Return a numpy nest matching the given type filled with zeros/False."""
+  if isinstance(t, type) and issubclass(t, tuple):
+    values = {
+        name: _zeros_for_type(t.__annotations__[name], length)
+        for name in t._fields
+    }
+    return t(**values)
+  else:
+    return np.zeros(length, dtype=t)
 
 @functools.lru_cache
 def nt_to_pa(nt: type) -> pa.StructType:
@@ -77,7 +128,11 @@ def nt_to_pa(nt: type) -> pa.StructType:
 BUTTONS_TYPE = nt_to_pa(Buttons)
 STICK_TYPE = nt_to_pa(Stick)
 CONTROLLER_TYPE = nt_to_pa(Controller)
+NANA_TYPE = nt_to_pa(Nana)
 PLAYER_TYPE = nt_to_pa(Player)
+RANDALL_TYPE = nt_to_pa(Randall)
+ITEM_TYPE = nt_to_pa(Item)
+ITEMS_TYPE = nt_to_pa(Items)
 GAME_TYPE = nt_to_pa(Game)
 
 def array_from_nest(val: Nest[np.ndarray]) -> pa.StructArray:
@@ -114,10 +169,13 @@ def array_to_nt(nt: type, val: pa.Array) -> Union[tuple, np.ndarray]:
   if issubclass(nt, tuple):
     assert isinstance(val.type, pa.StructType)
     result = {}
+    field_names = {field.name for field in val.type}
     for name in nt._fields:
-      result[name] = array_to_nt(
-          nt.__annotations__[name],
-          val.field(name))
+      field_type = nt.__annotations__[name]
+      if name in field_names:
+        result[name] = array_to_nt(field_type, val.field(name))
+      else:
+        result[name] = _zeros_for_type(field_type, len(val))
     return nt(**result)
 
   assert val.type.num_fields == 0

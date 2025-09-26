@@ -65,6 +65,14 @@
 - Shell harnesses (`tests/train_two.sh:1`, `tests/training_test.sh:1`) sanity-check CLI entrypoints.
 - `test_output.sh` and `test_imports.py` help verify environment imports without full training.
 - Prefer GPU-offline smoke runs before long jobs; set `CUDA_VISIBLE_DEVICES=""` for CPU-only sanity tests.
+- Test harnesses use `python -m unittest`, not `pytest`; keep that in mind when adding new tests or giving run instructions.
+- Dev installs currently rely on Vlad’s `peppi`/`peppi-py` `dev` branches (Rust nightly, edition2024). On a fresh env:
+  1. `rustup toolchain install nightly` (once) and either `export RUSTUP_TOOLCHAIN=nightly` for your shell or `rustup override set nightly` in a temp build dir.
+  2. Clone both repos:
+     * `git clone https://github.com/vladfi1/peppi.git` && `git checkout dev`
+     * `git clone https://github.com/vladfi1/peppi-py.git` && `git checkout dev`
+  3. From the venv: `pip install --upgrade /path/to/peppi-py` (the build uses the sibling `peppi` repo).
+  4. Verify with `python -m pip show peppi-py` (should report 0.8.2).
 
 ## Contribution Practices for LLMs
 1. **Start with reconnaissance** – use `find`, `rg`, `python -m compileall` to confirm context before editing.

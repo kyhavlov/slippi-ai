@@ -95,6 +95,45 @@ def _make_controller():
   )
 
 
+def _make_nana(dead: bool = True) -> types.Nana:
+  zeros_bool = np.zeros(1, dtype=np.bool_)
+  zeros_float = np.zeros(1, dtype=np.float32)
+  zeros_uint16 = np.zeros(1, dtype=np.uint16)
+  zeros_uint8 = np.zeros(1, dtype=np.uint8)
+
+  return types.Nana(
+      exists=zeros_bool.copy(),
+      percent=zeros_uint16.copy(),
+      facing=zeros_bool.copy(),
+      x=zeros_float.copy(),
+      y=zeros_float.copy(),
+      action=zeros_uint16.copy(),
+      invulnerable=zeros_bool.copy(),
+      character=zeros_uint8.copy(),
+      jumps_left=zeros_uint8.copy(),
+      shield_strength=zeros_float.copy(),
+      on_ground=np.logical_not(zeros_bool.copy()) if dead else np.ones(1, dtype=np.bool_),
+  )
+
+
+def _make_item() -> types.Item:
+  zeros_bool = np.zeros(1, dtype=np.bool_)
+  zeros_float = np.zeros(1, dtype=np.float32)
+  zeros_uint16 = np.zeros(1, dtype=np.uint16)
+  zeros_uint8 = np.zeros(1, dtype=np.uint8)
+  return types.Item(
+      exists=zeros_bool.copy(),
+      type=zeros_uint16.copy(),
+      state=zeros_uint8.copy(),
+      x=zeros_float.copy(),
+      y=zeros_float.copy(),
+  )
+
+
+def _make_items() -> types.Items:
+  return types.Items(**{f'item_{i}': _make_item() for i in range(types.MAX_ITEMS)})
+
+
 def _make_player(character: int, dead: bool = False) -> types.Player:
   zeros_float = np.zeros(1, dtype=np.float32)
   zeros_uint16 = np.zeros(1, dtype=np.uint16)
@@ -115,12 +154,18 @@ def _make_player(character: int, dead: bool = False) -> types.Player:
       is_dead=bool_val,
       stocks_left=np.full(1, 4 if not dead else 0, dtype=np.uint8),
       controller=_make_controller(),
+      nana=_make_nana(dead=True),
   )
 
 
 def _make_game() -> types.Game:
   stage = np.zeros(1, dtype=np.uint8)
   randall_phase = np.zeros(1, dtype=np.float32)
+  randall = types.Randall(
+      x=np.zeros(1, dtype=np.float32),
+      y=np.zeros(1, dtype=np.float32),
+  )
+  items = _make_items()
   is_teams = np.zeros(1, dtype=np.bool_)
 
   p0 = _make_player(1)
@@ -134,6 +179,8 @@ def _make_game() -> types.Game:
       p3=empty,
       stage=stage,
       randall_phase=randall_phase,
+      randall=randall,
+      items=items,
       is_teams=is_teams,
   )
 
@@ -504,6 +551,7 @@ class DataTest(unittest.TestCase):
           is_dead=np.full(1, False, dtype=np.bool_),
           stocks_left=np.full(1, 4, dtype=np.uint8),
           controller=controller,
+          nana=_make_nana(dead=False),
       )
 
     game = types.Game(
@@ -513,6 +561,11 @@ class DataTest(unittest.TestCase):
         p3=make_full_player(4),
         stage=np.zeros(1, dtype=np.uint8),
         randall_phase=np.zeros(1, dtype=np.float32),
+        randall=types.Randall(
+            x=np.zeros(1, dtype=np.float32),
+            y=np.zeros(1, dtype=np.float32),
+        ),
+        items=_make_items(),
         is_teams=np.ones(1, dtype=np.bool_),
     )
 

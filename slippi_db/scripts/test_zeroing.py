@@ -50,7 +50,21 @@ player = types.Player(
     shield_strength=np.float32(40.0),
     on_ground=np.bool_(True),
     is_dead=np.bool_(False),
+    stocks_left=np.uint8(3),
     controller=controller,
+    nana=types.Nana(
+        exists=np.bool_(False),
+        percent=np.uint16(0),
+        facing=np.bool_(False),
+        x=np.float32(0.0),
+        y=np.float32(0.0),
+        action=np.uint16(0),
+        invulnerable=np.bool_(False),
+        character=np.uint8(0),
+        jumps_left=np.uint8(0),
+        shield_strength=np.float32(0.0),
+        on_ground=np.bool_(True),
+    ),
 )
 
 zeroed_player = zero_out_namedtuple(player)
