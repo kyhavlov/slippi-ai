@@ -1,0 +1,312 @@
+{
+  "test_singles_game.slp": {
+    "frame_count": 13540,
+    "stage": 24,
+    "is_teams": false,
+    "samples": {
+      "0": {
+        "randall_phase": 0,
+        "players": {
+          "p0": {
+            "x": -38.8,
+            "y": 35.2,
+            "percent": 0.0,
+            "action": 322,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p1": {
+            "x": 0.0,
+            "y": 0.0,
+            "percent": 0.0,
+            "action": 0,
+            "stocks": 0,
+            "is_dead": true
+          },
+          "p2": {
+            "x": 38.8,
+            "y": 35.2,
+            "percent": 0.0,
+            "action": 322,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p3": {
+            "x": 0.0,
+            "y": 0.0,
+            "percent": 0.0,
+            "action": 0,
+            "stocks": 0,
+            "is_dead": true
+          }
+        }
+      },
+      "60": {
+        "randall_phase": 60,
+        "players": {
+          "p0": {
+            "x": -38.8,
+            "y": 35.3797,
+            "percent": 0.0,
+            "action": 324,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p1": {
+            "x": 0.0,
+            "y": 0.0,
+            "percent": 0.0,
+            "action": 0,
+            "stocks": 0,
+            "is_dead": true
+          },
+          "p2": {
+            "x": 38.8,
+            "y": 36.0061,
+            "percent": 0.0,
+            "action": 324,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p3": {
+            "x": 0.0,
+            "y": 0.0,
+            "percent": 0.0,
+            "action": 0,
+            "stocks": 0,
+            "is_dead": true
+          }
+        }
+      },
+      "600": {
+        "randall_phase": 600,
+        "players": {
+          "p0": {
+            "x": 3.8063,
+            "y": 0.0001,
+            "percent": 12.0,
+            "action": 70,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p1": {
+            "x": 0.0,
+            "y": 0.0,
+            "percent": 0.0,
+            "action": 0,
+            "stocks": 0,
+            "is_dead": true
+          },
+          "p2": {
+            "x": -3.8241,
+            "y": 23.0104,
+            "percent": 37.0,
+            "action": 85,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p3": {
+            "x": 0.0,
+            "y": 0.0,
+            "percent": 0.0,
+            "action": 0,
+            "stocks": 0,
+            "is_dead": true
+          }
+        }
+      },
+      "-1": {
+        "randall_phase": 339,
+        "players": {
+          "p0": {
+            "x": -224.2182,
+            "y": -95.998,
+            "percent": 114.0,
+            "action": 1,
+            "stocks": 0,
+            "is_dead": false
+          },
+          "p1": {
+            "x": 0.0,
+            "y": 0.0,
+            "percent": 0.0,
+            "action": 0,
+            "stocks": 0,
+            "is_dead": true
+          },
+          "p2": {
+            "x": -51.2941,
+            "y": 0.0001,
+            "percent": 47.0,
+            "action": 14,
+            "stocks": 1,
+            "is_dead": false
+          },
+          "p3": {
+            "x": 0.0,
+            "y": 0.0,
+            "percent": 0.0,
+            "action": 0,
+            "stocks": 0,
+            "is_dead": true
+          }
+        }
+      }
+    }
+  },
+  "test_doubles_game.slp": {
+    "frame_count": 45115,
+    "stage": 18,
+    "is_teams": true,
+    "samples": {
+      "0": {
+        "randall_phase": 0,
+        "players": {
+          "p0": {
+            "x": 40.0,
+            "y": 32.0,
+            "percent": 0.0,
+            "action": 322,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p1": {
+            "x": -40.0,
+            "y": 32.0,
+            "percent": 0.0,
+            "action": 322,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p2": {
+            "x": -40.0,
+            "y": 5.0,
+            "percent": 0.0,
+            "action": 322,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p3": {
+            "x": 40.0,
+            "y": 5.0,
+            "percent": 0.0,
+            "action": 322,
+            "stocks": 4,
+            "is_dead": false
+          }
+        }
+      },
+      "60": {
+        "randall_phase": 60,
+        "players": {
+          "p0": {
+            "x": 40.0,
+            "y": 32.2196,
+            "percent": 0.0,
+            "action": 324,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p1": {
+            "x": -40.0,
+            "y": 32.4043,
+            "percent": 0.0,
+            "action": 324,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p2": {
+            "x": -40.0,
+            "y": 5.6289,
+            "percent": 0.0,
+            "action": 324,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p3": {
+            "x": 40.0,
+            "y": 5.8061,
+            "percent": 0.0,
+            "action": 324,
+            "stocks": 4,
+            "is_dead": false
+          }
+        }
+      },
+      "600": {
+        "randall_phase": 600,
+        "players": {
+          "p0": {
+            "x": -79.7588,
+            "y": 0.0001,
+            "percent": 10.0,
+            "action": 80,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p1": {
+            "x": -76.9249,
+            "y": 20.9301,
+            "percent": 2.0,
+            "action": 25,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p2": {
+            "x": -41.2691,
+            "y": 0.0001,
+            "percent": 16.0,
+            "action": 40,
+            "stocks": 4,
+            "is_dead": false
+          },
+          "p3": {
+            "x": 63.9653,
+            "y": 0.0001,
+            "percent": 10.0,
+            "action": 18,
+            "stocks": 4,
+            "is_dead": false
+          }
+        }
+      },
+      "-1": {
+        "randall_phase": 714,
+        "players": {
+          "p0": {
+            "x": 0.0,
+            "y": 0.0,
+            "percent": 0.0,
+            "action": 0,
+            "stocks": 0,
+            "is_dead": true
+          },
+          "p1": {
+            "x": 0.0,
+            "y": 0.0,
+            "percent": 0.0,
+            "action": 0,
+            "stocks": 0,
+            "is_dead": true
+          },
+          "p2": {
+            "x": 113.6751,
+            "y": -104.8899,
+            "percent": 85.0,
+            "action": 366,
+            "stocks": 1,
+            "is_dead": false
+          },
+          "p3": {
+            "x": 110.6644,
+            "y": 72.0,
+            "percent": 136.0,
+            "action": 4,
+            "stocks": 0,
+            "is_dead": false
+          }
+        }
+      }
+    }
+  }
+}

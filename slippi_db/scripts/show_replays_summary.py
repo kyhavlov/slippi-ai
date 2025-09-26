@@ -27,20 +27,22 @@ def walk_directory(directory):
 
       
 
-      if game.start['is_teams'] == False:
+      if not game.start.is_teams:
         continue
 
       game_count += 1
 
-      for player in game.start['players']:
-        code = player['netplay']['code']
-        port = player['port']
+      for player in game.start.players:
+        if player.netplay is None:
+          continue
+
+        code = player.netplay.code
+        port = player.port
 
         # look up player stats entry or create it
         p = player_aggregate_stats[code] if code in player_aggregate_stats else PlayerStats(0, {}, {})
         p.game_count += 1
-        #character = game.frames[0]['ports'][port]['leader']['post']['character'].as_py()
-        character = player['character']
+        character = player.character
 
         # increment character games
         if character in p.character_games:
@@ -49,11 +51,11 @@ def walk_directory(directory):
           p.character_games[character] = 1
 
         # update teammate stats
-        for other_player in game.start['players']:
-          if other_player['netplay']['code'] == code:
+        for other_player in game.start.players:
+          if other_player.netplay is None or other_player.netplay.code == code:
             continue
-          if other_player['team']['color'] == player['team']['color']:
-            teammate_code = other_player['netplay']['code']
+          if other_player.team and player.team and other_player.team.color == player.team.color:
+            teammate_code = other_player.netplay.code
             if teammate_code in p.teammate_counts:
               p.teammate_counts[teammate_code] += 1
             else:

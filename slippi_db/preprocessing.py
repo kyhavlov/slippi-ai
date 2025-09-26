@@ -87,29 +87,43 @@ def mode(xs: np.ndarray):
   i = np.argmax(counts)
   return unique[i]
 
-def port_to_int(port: str) -> int:
-  assert port.startswith('P')
-  return int(port[1])
+def port_to_int(port) -> int:
+  if isinstance(port, str):
+    assert port.startswith('P')
+    return int(port[1])
+  return int(port.value)
 
 def compute_winner(game: peppi_py.Game) -> Optional[int]:
-  last_frame = game.frames[-1]
+  ports = list(game.frames.ports)
+  players = list(game.start.players)
 
-  if len(game.start['players']) == 4:
+  if len(players) == 4:
     remaining_teams = set()
-    for port in range(len(game.start['players'])):
-      stocks_left = last_frame['ports'][port]['leader']['post']['stocks'].as_py()
+    for player, port in zip(players, ports):
+      team = player.team
+      if team is None:
+        continue
 
-      if game.start['players'][port]['team'] is not None and stocks_left and stocks_left > 0:
-        remaining_teams.add(game.start['players'][port]['team']['color'])
+      stocks = port.leader.post.stocks.to_numpy(zero_copy_only=False)
+      last_stock = stocks[-1]
+      if np.isnan(last_stock):
+        last_stock = 0
+
+      if last_stock > 0:
+        remaining_teams.add(team.color)
 
     if len(remaining_teams) == 1:
       return remaining_teams.pop()
-
     return None
-  elif len(game.start['players']) == 2:
+
+  if len(players) == 2:
     player_stocks = []
-    for port in range(len(game.start['players'])):
-      player_stocks.append(last_frame['ports'][port]['leader']['post']['stocks'].as_py())
+    for port in ports:
+      stocks = port.leader.post.stocks.to_numpy(zero_copy_only=False)
+      last_stock = stocks[-1]
+      if np.isnan(last_stock):
+        last_stock = 0
+      player_stocks.append(last_stock)
 
     if player_stocks[0] > 0 and player_stocks[1] == 0:
       return 0
@@ -128,35 +142,36 @@ def get_metadata(game: peppi_py.Game) -> dict:
       result[key] = metadata[key]
   del metadata
 
-  result['lastFrame'] = game.frames.field('id')[-1].as_py()
+  frame_ids = game.frames.id.to_numpy(zero_copy_only=False)
+  result['lastFrame'] = int(frame_ids[-1])
 
   start = game.start
-  result['slippi_version'] = start['slippi']['version']
+  result['slippi_version'] = list(start.slippi.version)
 
-  players = start['players']
+  players = list(start.players)
   player_metas = []
 
-  for player in players:
-    port = player['port']  # P[1-4]
-
-    # get most-played character
+  for player, port in zip(players, game.frames.ports):
     if len(players) == 2:
-      leader = game.frames.field('ports').field(port).field('leader')
-      cs = leader.field('post').field('character').to_numpy()
-      character = int(mode(cs))
-    else: # Non-1v1 games will have nulls when players are eliminated
-      leader = game.frames[0]['ports'][port]['leader']
-      character = leader['post']['character'].as_py()
+      chars = port.leader.post.character.to_numpy(zero_copy_only=False)
+      character = int(mode(chars))
+    else:
+      character = int(port.leader.post.character[0].as_py())
 
     meta = dict(
-        port=port_to_int(port),
+        port=port_to_int(player.port),
         character=character,
-        type=0 if player['type'] == 'Human' else 1,
-        name_tag=player['name_tag'],
-        netplay=player.get('netplay'),
+        type=0 if player.type.value == 0 else 1,
+        name_tag=player.name_tag,
+        netplay=dict(
+            name=player.netplay.name,
+            code=player.netplay.code,
+            suid=player.netplay.suid,
+        ) if player.netplay is not None else None,
     )
-    if player['team']:
-      meta['team'] = player['team']['color']
+
+    if player.team is not None:
+      meta['team'] = player.team.color
 
     player_metas.append(meta)
 
@@ -165,8 +180,9 @@ def get_metadata(game: peppi_py.Game) -> dict:
       players=player_metas,
   )
 
-  for key in ['stage', 'timer', 'is_teams']:
-    result[key] = start[key]
+  result['stage'] = start.stage
+  result['timer'] = start.timer
+  result['is_teams'] = start.is_teams
 
   # compute winner
   result['winner'] = compute_winner(game)

@@ -9,7 +9,8 @@ boto3
 pymongo
 dnspython
 fancyflags
-pyarrow
+pyarrow>=17,<18
+peppi-py==0.7.1
 git+https://github.com/vladfi1/py7zr.git@dev
 portpicker
 ray

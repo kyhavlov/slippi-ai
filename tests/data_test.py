@@ -28,9 +28,49 @@ if 'py7zr' not in sys.modules:  # pragma: no cover
   stub_module.SevenZipFile = _SevenZipStub
   sys.modules['py7zr'] = stub_module
 
-from slippi_db import utils
 from slippi_db import parse_local
+from slippi_db import parse_peppi
+from slippi_db import utils
 from slippi_db.scripts import make_local_dataset
+
+
+_SAMPLE_FRAMES = (0, 60, 600, -1)
+
+
+def _summarize_game(game_array: types.GAME_TYPE) -> dict:
+  game_nt = types.game_array_to_nt(game_array)
+  frame_count = len(game_nt.stage)
+
+  summary = {
+      'frame_count': int(frame_count),
+      'stage': int(game_nt.stage[0]),
+      'is_teams': bool(game_nt.is_teams[0]),
+      'samples': {},
+  }
+
+  for frame_idx in _SAMPLE_FRAMES:
+    idx = frame_idx if frame_idx >= 0 else frame_count + frame_idx
+    if idx < 0 or idx >= frame_count:
+      continue
+
+    players_snapshot = {}
+    for port in range(4):
+      player = getattr(game_nt, f'p{port}')
+      players_snapshot[f'p{port}'] = {
+          'x': round(float(player.x[idx]), 4),
+          'y': round(float(player.y[idx]), 4),
+          'percent': round(float(player.percent[idx]), 2),
+          'action': int(player.action[idx]),
+          'stocks': int(player.stocks_left[idx]),
+          'is_dead': bool(player.is_dead[idx]),
+      }
+
+    summary['samples'][str(frame_idx)] = {
+        'randall_phase': int(game_nt.randall_phase[idx]),
+        'players': players_snapshot,
+    }
+
+  return summary
 
 
 def _make_controller():
@@ -398,6 +438,23 @@ class DataTest(unittest.TestCase):
     self.assertTrue(swapped_odd.p1.is_dead[0])
     self.assertTrue(swapped_odd.p2.is_dead[0])
     self.assertEqual(int(swapped_odd.p3.character[0]), 22)
+
+  def test_parsed_replays_match_golden(self):
+    golden_path = pathlib.Path(__file__).parent / 'golden' / 'parse_peppi_summary.json'
+    with golden_path.open('r', encoding='utf-8') as fp:
+      golden = json.load(fp)
+
+    replay_dir = pathlib.Path(__file__).parent / 'data' / 'replays'
+
+    for relative_path, expected in golden.items():
+      replay_path = replay_dir / relative_path
+      game_array = parse_peppi.get_slp(str(replay_path))
+      actual = _summarize_game(game_array)
+      self.assertDictEqual(
+          actual,
+          expected,
+          msg=f'{relative_path} parsing no longer matches golden summary',
+      )
 
   def test_singles_second_perspective_layout(self):
     game = _make_game()

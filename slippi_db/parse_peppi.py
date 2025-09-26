@@ -1,5 +1,4 @@
 import numpy as np
-import pyarrow as pa
 
 import melee
 from melee import Button
@@ -22,62 +21,111 @@ BUTTON_MASKS = {
     Button.BUTTON_D_UP: 0x0008,
 }
 
-def get_buttons(button_bits: np.ndarray) -> types.Buttons:
-  return types.Buttons(**{
-      name: np.asarray(
-          np.bitwise_and(button_bits, BUTTON_MASKS[button]),
-          dtype=bool)
+
+def _arrow_to_numpy(array, *, dtype=None, nan=0.0):
+  """Convert a pyarrow array into numpy while handling NaNs."""
+
+  np_array = array.to_numpy(zero_copy_only=False)
+  if np.issubdtype(np_array.dtype, np.floating):
+    np_array = np.nan_to_num(np_array, nan=nan)
+
+  if dtype is not None:
+    np_array = np_array.astype(dtype, copy=False)
+
+  return np_array
+
+
+def _to_bool(array) -> np.ndarray:
+  return array.to_numpy(zero_copy_only=False).astype(bool, copy=False)
+
+
+def _to_float(array) -> np.ndarray:
+  return np.nan_to_num(
+      array.to_numpy(zero_copy_only=False).astype(np.float32, copy=False),
+      nan=0.0)
+
+
+def _to_uint(array, dtype) -> np.ndarray:
+  arr = np.nan_to_num(array.to_numpy(zero_copy_only=False), nan=0.0)
+  return arr.astype(dtype, copy=False)
+
+
+def _libmelee_trigger(array) -> np.ndarray:
+  return np.nan_to_num(
+      array.to_numpy(zero_copy_only=False).astype(np.float32, copy=False),
+      nan=0.0)
+
+
+def _libmelee_stick(position) -> types.Stick:
+  x = _to_float(position.x)
+  y = _to_float(position.y)
+  return types.Stick(
+      x=(x / 2.0) + 0.5,
+      y=(y / 2.0) + 0.5,
+  )
+
+
+def _controller_from_pre(pre) -> types.Controller:
+  button_bits = np.nan_to_num(
+      pre.buttons_physical.to_numpy(zero_copy_only=False),
+      nan=0.0,
+  ).astype(np.uint32, copy=False)
+  buttons = types.Buttons(**{
+      name: np.asarray(np.bitwise_and(button_bits, BUTTON_MASKS[button]), dtype=bool)
       for name, button in types.LIBMELEE_BUTTONS.items()
   })
 
-def to_libmelee_stick(raw_stick: np.ndarray) -> np.ndarray:
-  return (raw_stick / 2.) + 0.5
-
-def get_stick(stick) -> types.Stick:
-  return types.Stick(
-      x=to_libmelee_stick(np.nan_to_num(stick.field('x').to_numpy(zero_copy_only=False), nan=0.)),
-      y=to_libmelee_stick(np.nan_to_num(stick.field('y').to_numpy(zero_copy_only=False), nan=0.)),
+  return types.Controller(
+      main_stick=_libmelee_stick(pre.joystick),
+      c_stick=_libmelee_stick(pre.cstick),
+      shoulder=_libmelee_trigger(pre.triggers),
+      buttons=buttons,
   )
 
-def get_player(player: pa.StructArray) -> types.Player:
-  leader = player.field('leader')
 
-  post = leader.field('post')
-  get_post = lambda key: post.field(key)
-  position = post.field('position')
-  pre = leader.field('pre')
+def _player_from_port(port: peppi_py.frame.PortData) -> types.Player:
+  leader = port.leader
+  pre = leader.pre
+  post = leader.post
 
-  # there doesn't seem to be a good way to check if a player is dead,
-  # so just check if the position data is missing since that's what happens after a player dies.
-  dead = np.where(np.isnan(position.field('x')), True, False)
+  position_x_raw = post.position.x.to_numpy(zero_copy_only=False)
+  position_y_raw = post.position.y.to_numpy(zero_copy_only=False)
+  direction_raw = post.direction.to_numpy(zero_copy_only=False)
+  percent_raw = post.percent.to_numpy(zero_copy_only=False)
+  state_raw = post.state.to_numpy(zero_copy_only=False)
+  shield_raw = post.shield.to_numpy(zero_copy_only=False)
+  jumps_raw = post.jumps.to_numpy(zero_copy_only=False)
+  character_raw = post.character.to_numpy(zero_copy_only=False)
+  stocks_raw = post.stocks.to_numpy(zero_copy_only=False)
+  airborne_raw = post.airborne.to_numpy(zero_copy_only=False)
 
-  char = get_post('character')[0].as_py()
+  position_x = np.nan_to_num(position_x_raw, nan=0.0).astype(np.float32, copy=False)
+  position_y = np.nan_to_num(position_y_raw, nan=0.0).astype(np.float32, copy=False)
+  direction = np.nan_to_num(direction_raw, nan=0.0)
+  percent = np.nan_to_num(percent_raw, nan=0.0)
+  state = np.nan_to_num(state_raw, nan=0.0)
+  shield = np.nan_to_num(shield_raw, nan=0.0).astype(np.float32, copy=False)
+  jumps = np.nan_to_num(jumps_raw, nan=0.0)
+  character = np.nan_to_num(character_raw, nan=0.0)
+  stocks = np.nan_to_num(stocks_raw, nan=0.0)
+  airborne = np.nan_to_num(airborne_raw, nan=0.0)
 
-  player = types.Player(
-      percent=np.asarray(np.nan_to_num(get_post('percent'), nan=np.uint16(0)), dtype=np.uint16),
-      facing=get_post('direction').to_numpy(zero_copy_only=False) > 0,
-      x=np.nan_to_num(position.field('x'), nan=0.),
-      y=np.nan_to_num(position.field('y'), nan=0.),
-      action=np.nan_to_num(get_post('state'), nan=np.uint16(0)),
-      # libmelee does extra processing to determine invulnerability
-      invulnerable=get_post('hurtbox_state').to_numpy(zero_copy_only=False) != 0,
-      character=np.nan_to_num(get_post('character'), nan=char),  # uint8
-      jumps_left=np.nan_to_num(get_post('jumps'), nan=np.uint8(0)),  # uint8
-      shield_strength=np.nan_to_num(get_post('shield'), nan=0.),  # float
-      controller=types.Controller(
-          main_stick=get_stick(pre.field('joystick')),
-          c_stick=get_stick(pre.field('cstick')),
-          # libmelee reads the logical value and assigns it to both l/r
-          shoulder=np.nan_to_num(pre.field('triggers'), nan=0.),
-          buttons=get_buttons(pre.field('buttons_physical').fill_null(0)),
-      ),
-      on_ground=np.logical_not(
-          post.field('airborne').to_numpy(zero_copy_only=False)),
-      is_dead=dead,
-      stocks_left=np.nan_to_num(get_post('stocks'), nan=np.uint8(0)),
+  return types.Player(
+      percent=percent.astype(np.uint16, copy=False),
+      facing=direction.astype(np.float32, copy=False) > 0,
+      x=position_x,
+      y=position_y,
+      action=state.astype(np.uint16, copy=False),
+      invulnerable=((post.hurtbox_state.to_numpy(zero_copy_only=False)
+                     if post.hurtbox_state is not None else np.zeros_like(position_x_raw)) != 0),
+      character=character.astype(np.uint8, copy=False),
+      jumps_left=jumps.astype(np.uint8, copy=False),
+      shield_strength=shield,
+      on_ground=np.logical_not(airborne.astype(bool, copy=False)),
+      is_dead=np.isnan(position_x_raw),
+      stocks_left=stocks.astype(np.uint8, copy=False),
+      controller=_controller_from_pre(pre),
   )
-
-  return player
 
 # Create a copy of the given player but with all fields zeroed out
 def zero_out_namedtuple(nt: types.NamedTuple) -> types.NamedTuple:
@@ -98,67 +146,43 @@ def zero_out_namedtuple(nt: types.NamedTuple) -> types.NamedTuple:
 def from_peppi(game: peppi_py.Game) -> types.GAME_TYPE:
   frames = game.frames
 
-  players = {}
-  port_names = sorted(p['port'] for p in game.start['players'])
-  ports_data = frames.field('ports')
-  #print(game.metadata)
-  #print(game.start)
-  #print(game.frames[0])
-  for i, port_name in enumerate(port_names):
-    players[f'p{i}'] = get_player(ports_data.field(port_name))
-    #player: types.Player = players[f'p{i}']
-    '''fields = [player.percent, player.facing, player.x, player.y, player.action, 
-                player.invulnerable, player.character, player.jumps_left, 
-                player.shield_strength, player.on_ground, player.controller.main_stick.x,
-                player.controller.main_stick.y, player.controller.c_stick.x, player.controller.c_stick.y,
-                player.controller.shoulder, player.controller.buttons.A, player.controller.buttons.B,
-                player.controller.buttons.X, player.controller.buttons.Y, player.controller.buttons.Z,
-                player.controller.buttons.L, player.controller.buttons.R, player.controller.buttons.D_UP]
+  port_data = list(frames.ports)
+  players_map: dict[str, types.Player] = {}
 
-    was_nan = False
-    for j, field in enumerate(fields):
-      nan_present = np.any(np.isnan(field))
-      if nan_present:
-        nan_locs = np.argwhere(np.isnan(field)).flatten()
-        action = player.action[nan_locs[0]]
-        print(f'NAN in field {j} for player {i} (action: {action}) in {game.metadata}: ', nan_locs)
-        was_nan = True
+  for idx, port in enumerate(port_data):
+    players_map[f'p{idx}'] = _player_from_port(port)
 
-    assert not was_nan'''
+  if len(port_data) == 2:
+    p0 = players_map['p0']
+    p1 = players_map['p1']
+    empty = zero_out_namedtuple(p0)
+    empty.is_dead.fill(True)
 
-  if len(game.start['players']) == 2:
-    player0 = players['p0']
-    player1 = players['p1']
-
-    empty_player = zero_out_namedtuple(player0)
-    empty_player.is_dead.fill(True)
-
-    players = {
-        'p0': player0,
-        'p1': empty_player,
-        'p2': player1,
-        'p3': zero_out_namedtuple(player0),
+    players_map = {
+        'p0': p0,
+        'p1': empty,
+        'p2': p1,
+        'p3': zero_out_namedtuple(p0),
     }
-    players['p3'].is_dead.fill(True)
+    players_map['p3'].is_dead.fill(True)
+  elif len(port_data) != 4:
+    raise ValueError(f'Unexpected port count: {len(port_data)}')
 
-  stage = melee.enums.to_internal_stage(game.start['stage'])
-  stage = np.full([len(frames)], stage.value, dtype=np.uint8)
-  is_teams = np.full([len(frames)], len(game.start['players']) == 4, dtype=np.uint8)
+  frame_ids = frames.id.to_numpy(zero_copy_only=False)
+  game_length = len(frame_ids)
 
-  # randall_phase for each frame is equal to the current game frame % 1200
-  randall_phase = np.arange(len(frames)) % 1200
+  stage = melee.enums.to_internal_stage(game.start.stage)
+  stage_array = np.full(game_length, stage.value, dtype=np.uint8)
+  is_teams = np.full(game_length, len(port_data) == 4, dtype=np.bool_)
+  randall_phase = (np.arange(game_length, dtype=np.float32) % 1200).astype(np.float32)
 
-  game = types.Game(stage=stage, is_teams=is_teams, randall_phase=randall_phase, **players)
-  game_array = types.array_from_nt(game)
-
-  index = frames.field('id').to_numpy()
-  first_indices = []
-  next_idx = -123
-  for i, idx in enumerate(index):
-    if idx == next_idx:
-      first_indices.append(i)
-      next_idx += 1
-  return game_array.take(first_indices)
+  game_nt = types.Game(
+      stage=stage_array,
+      randall_phase=randall_phase,
+      is_teams=is_teams,
+      **players_map,
+  )
+  return types.array_from_nt(game_nt)
 
 def get_slp(path: str) -> types.GAME_TYPE:
   game = peppi_py.read_slippi(path)
