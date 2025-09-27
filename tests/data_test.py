@@ -9,6 +9,7 @@ import unittest
 import numpy as np
 
 from slippi_ai import data, types, paths
+from slippi_db import file_layout
 
 import peppi_py
 
@@ -320,6 +321,54 @@ class DataTest(unittest.TestCase):
       expected_opponents = tuple(i for i in range(4)
                                  if i not in (info.main_player_index, info.teammate_index))
       self.assertEqual(info.opponent_order, expected_opponents)
+
+  def test_replays_from_meta_prefers_hashed_layout(self):
+    md5 = 'abcdef0123456789abcdef0123456789'
+    players_meta = [
+        dict(port=0, character=1, type=0, name_tag='', netplay=dict(name='', code='', suid=''), team=0),
+        dict(port=1, character=2, type=0, name_tag='', netplay=dict(name='', code='', suid=''), team=1),
+    ]
+    meta_row = dict(
+        name='singles.slp',
+        slp_md5=md5,
+        slp_size=0,
+        lastFrame=100,
+        slippi_version=[3, 14, 0],
+        num_players=2,
+        players=players_meta,
+        stage=2,
+        timer=480,
+        is_teams=False,
+        winner=0,
+        valid=True,
+        is_training=True,
+        not_training_reason='',
+        pq_size=0,
+        raw='ignored.zip',
+        compression='zlib',
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+      data_dir = pathlib.Path(tmp) / 'games'
+      hashed_dir = data_dir / md5[:file_layout.PARQUET_PREFIX_LEN]
+      hashed_dir.mkdir(parents=True)
+      (hashed_dir / md5).touch()
+
+      meta_path = pathlib.Path(tmp) / 'meta.json'
+      meta_path.write_text(json.dumps([meta_row]))
+
+      cfg = data.DatasetConfig(
+          data_dir=str(data_dir),
+          meta_path=str(meta_path),
+          allowed_characters='all',
+          allowed_opponents='all',
+      )
+
+      replays = data.replays_from_meta(cfg)
+
+    self.assertEqual(len(replays), 2)
+    for replay in replays:
+      self.assertEqual(replay.path, str(hashed_dir / md5))
 
   def test_end_to_end_parse_pipeline(self):
     singles_path = pathlib.Path(__file__).parent / 'data' / 'replays' / 'test_singles_game.slp'

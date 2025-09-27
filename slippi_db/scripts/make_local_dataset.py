@@ -17,6 +17,7 @@ from slippi_ai import nametags
 from melee import Character
 
 from absl import app, flags
+from slippi_db import file_layout
 
 ROOT = flags.DEFINE_string('root', None, 'root directory', required=True)
 WINNER_ONLY = flags.DEFINE_boolean(
@@ -194,7 +195,8 @@ def build_meta(
   iterator = rows if quiet else tqdm.tqdm(rows, smoothing=0, unit='slp')
   for row in iterator:
     md5 = row['slp_md5']
-    parsed_path = os.path.join(root_path, 'Parsed', md5)
+    parsed_dir = os.path.join(root_path, 'Parsed')
+    parsed_path = file_layout.resolve_parquet_path(parsed_dir, md5)
     if not os.path.isfile(parsed_path):
       missing[row.get('raw', row['name'])] += 1
 

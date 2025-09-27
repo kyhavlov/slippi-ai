@@ -49,6 +49,7 @@ from slippi_db import preprocessing
 from slippi_db import utils
 from slippi_db import parsing_utils
 from slippi_db.parsing_utils import CompressionType
+from slippi_db import file_layout
 
 class ArrowJSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -107,7 +108,8 @@ def parse_slp(
         )
 
         # TODO: consider writing to raw_name/slp_name
-        with open(os.path.join(output_dir, md5), 'wb') as f:
+        parquet_path = file_layout.ensure_parquet_directory(output_dir, md5)
+        with open(parquet_path, 'wb') as f:
           f.write(game_bytes)
 
   except KeyboardInterrupt as e:

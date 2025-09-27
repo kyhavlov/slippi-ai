@@ -20,6 +20,7 @@ import pyarrow.parquet as pq
 import melee
 
 from slippi_ai import reward, utils, nametags, paths
+from slippi_db import file_layout
 from slippi_ai.types import Game, game_array_to_nt, Controller
 
 class PlayerMeta(NamedTuple):
@@ -156,7 +157,7 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
 
   for row in meta_rows:
     replay_meta = ReplayMeta.from_metadata(row)
-    replay_path = os.path.join(config.data_dir, replay_meta.slp_md5)
+    replay_path = file_layout.resolve_parquet_path(config.data_dir, replay_meta.slp_md5)
 
     # for singles games, generate two replays (one for each player). 
     # each replay will have the self player as p0 and the opponent randomized
@@ -272,17 +273,17 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
 def train_test_split(
     config: DatasetConfig,
 ) -> Tuple[List[ReplayInfo], List[ReplayInfo]]:
-  filenames = sorted(os.listdir(config.data_dir))
-  print(f"Found {len(filenames)} files.")
-
   replays: list[ReplayInfo] = []
 
   if config.meta_path is not None:
     replays = replays_from_meta(config)
 
-    # check that we have the right metadata
-    filenames_set = set(filenames)
-    assert all(info.meta.slp_md5 in filenames_set for info in replays)
+    # Ensure every replay referenced in metadata exists on disk.
+    missing = [info.path for info in replays if not os.path.exists(info.path)]
+    if missing:
+      raise FileNotFoundError(
+          f"Missing {len(missing)} parquet files referenced in metadata; "
+          f"sample: {missing[:3]}")
   else:
     raise ValueError("Please provide a metadata file.")
 

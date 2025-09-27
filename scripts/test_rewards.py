@@ -5,6 +5,7 @@ from absl import app
 
 from slippi_ai.data import ReplayMeta, ReplayInfo, TrajectoryManager, swap_players
 from slippi_ai import reward
+from slippi_db import file_layout
 
 def main(_):
     data_dir = '/media/kyle/Windows/Users/kyleh/git/slippi-ai/data/'
@@ -23,7 +24,8 @@ def main(_):
             #break
 
             replay_meta = ReplayMeta.from_metadata(first_game)
-            replay_path = os.path.join(data_dir, 'Parsed', replay_meta.slp_md5)
+            parsed_dir = os.path.join(data_dir, 'Parsed')
+            replay_path = file_layout.resolve_parquet_path(parsed_dir, replay_meta.slp_md5)
 
             def make_replay_info(port: int):
                 teammate_index = 1
