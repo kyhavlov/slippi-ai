@@ -50,9 +50,6 @@ _EMPTY_ITEM = utils.map_nt(
 )
 
 def get_player(player: melee.PlayerState) -> Player:
-  if player.action == melee.Action.UNKNOWN_ANIMATION:
-    raise InvalidGameError('UNKNOWN_ANIMATION')
-
   base = dict(
       percent=np.uint16(player.percent),
       facing=np.bool_(player.facing),

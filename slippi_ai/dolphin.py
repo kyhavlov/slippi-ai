@@ -220,6 +220,10 @@ class Dolphin:
     menu_frames = 0
     while is_menu_state(gamestate):
       for i, (controller, player) in enumerate(self._menuing_controllers):
+        autostart_enabled = False
+        if self._autostart and menu_frames > 180:
+          if i == 0 or getattr(self.menu_helper, 'stage_selected', False):
+            autostart_enabled = True
 
         self.menu_helper.menu_helper_simple(
             gamestate, controller,
@@ -228,7 +232,7 @@ class Dolphin:
             teams_connect_code=self._teams_connect_code,
             desired_teams=self._desired_teams,
             offline_teams=self._desired_teams and not self._teams_connect_code and len(self._players) == 4,
-            autostart=self._autostart and i == 0 and menu_frames > 180,
+            autostart=autostart_enabled,
             swag=False,
             costume=i,
             **player.menuing_kwargs())
@@ -248,6 +252,10 @@ class Dolphin:
           yield gamestate
 
         for i, (controller, player) in enumerate(self._menuing_controllers):
+          autostart_enabled = False
+          if self._autostart and menu_frames > 180:
+            if i == 0 or getattr(self.menu_helper, 'stage_selected', False):
+              autostart_enabled = True
 
           self.menu_helper.menu_helper_simple(
               gamestate, controller,
@@ -256,7 +264,7 @@ class Dolphin:
               teams_connect_code=self._teams_connect_code,
               desired_teams=self._desired_teams,
               offline_teams=self._desired_teams and not self._teams_connect_code and len(self._players) == 4,
-              autostart=self._autostart and i == 0 and menu_frames > 180,
+              autostart=autostart_enabled,
               swag=False,
               costume=i,
               **player.menuing_kwargs())

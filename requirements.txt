@@ -12,6 +12,7 @@ fancyflags
 pyarrow>=17,<18
 peppi-py==0.8.2
 git+https://github.com/vladfi1/py7zr.git@dev
+git+https://github.com/kyhavlov/libmelee.git@doubles
 portpicker
 ray
 discord
