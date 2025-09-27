@@ -308,3 +308,8 @@ def from_peppi(game: peppi_py.Game) -> types.GAME_TYPE:
 def get_slp(path: str) -> types.GAME_TYPE:
   game = peppi_py.read_slippi(path)
   return from_peppi(game)
+
+
+def read_slippi(path: str) -> peppi_py.Game:
+  """Compatibility wrapper expected by older parsing code."""
+  return peppi_py.read_slippi(path)
