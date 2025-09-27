@@ -2,6 +2,7 @@ import atexit
 import collections
 import dataclasses
 import itertools
+import logging
 import json
 import multiprocessing as mp
 import os
@@ -425,6 +426,7 @@ class DataSource:
       # None means all allowed.
       allowed_characters: Optional[list[melee.Character]] = None,
       allowed_opponents: Optional[list[melee.Character]] = None,
+      balance_characters: bool = False,
       name_map: Optional[dict[str, int]] = None,
   ):
     self.replays = replays
@@ -434,6 +436,7 @@ class DataSource:
     self.damage_ratio = damage_ratio
     self.compressed = compressed
     self.batch_counter = 0
+    self.balance_characters = balance_characters
 
     self.replay_counter = 0
     replays = self.iter_replays()
@@ -452,7 +455,56 @@ class DataSource:
     self.encode_name = nametags.name_encoder(self.name_map)
 
   def iter_replays(self) -> Iterator[ReplayInfo]:
-    for replay in itertools.cycle(self.replays):
+    replay_iter = itertools.cycle(self.replays)
+
+    if not self.balance_characters:
+      for replay in replay_iter:
+        self.replay_counter += 1
+        yield replay
+      return
+
+    by_character: dict[int, list[ReplayInfo]] = collections.defaultdict(list)
+    skipped = 0
+
+    for replay in self.replays:
+      try:
+        character = int(replay.main_player.character)
+      except Exception:
+        skipped += 1
+        continue
+
+      by_character[character].append(replay)
+
+    if len(by_character) <= 1:
+      if skipped:
+        logging.debug(
+            'Skipping character balancing because %d replays lacked metadata.',
+            skipped)
+      for replay in replay_iter:
+        self.replay_counter += 1
+        yield replay
+      return
+
+    character_counts: dict[str, int] = {}
+    for char, entries in by_character.items():
+      try:
+        char_enum = melee.Character(char)
+        char_name = char_enum.name.lower()
+      except ValueError:
+        char_name = str(char)
+      character_counts[char_name] = len(entries)
+
+    if skipped:
+      logging.info(
+          'Skipped %d replay(s) without character metadata while balancing.',
+          skipped)
+    logging.info('Character balance counts: %s', character_counts)
+
+    iterators = [itertools.cycle(entries) for entries in by_character.values()]
+    balanced_iter = utils.interleave(*iterators)
+    combined_iter = utils.interleave(balanced_iter, replay_iter)
+
+    for replay in combined_iter:
       self.replay_counter += 1
       yield replay
 
@@ -529,6 +581,7 @@ class DataConfig:
   damage_ratio: float = 0.01
   compressed: bool = True
   in_parallel: bool = True
+  balance_characters: bool = False
 
 def make_source(
     in_parallel: bool,

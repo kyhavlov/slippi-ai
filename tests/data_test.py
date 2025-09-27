@@ -8,7 +8,7 @@ import unittest
 
 import numpy as np
 
-from slippi_ai import data, types
+from slippi_ai import data, types, paths
 
 import peppi_py
 
@@ -182,6 +182,29 @@ def _make_game() -> types.Game:
       randall=randall,
       items=items,
       is_teams=is_teams,
+  )
+
+
+def _make_replay_info(character: int, slug: str) -> data.ReplayInfo:
+  player = data.PlayerMeta(character=character, name=f'player{character}', team=0)
+  empty = data.PlayerMeta(character=0, name='', team=1)
+  meta = data.ReplayMeta(
+      p0=player,
+      p1=empty,
+      p2=empty,
+      p3=empty,
+      stage=0,
+      slp_md5=f'slp_{slug}',
+      is_singles=True,
+  )
+
+  return data.ReplayInfo(
+      path=f'/tmp/{slug}.parquet',
+      main_player_index=0,
+      teammate_index=1,
+      main_player_name=player.name,
+      meta=meta,
+      opponent_order=(2, 3),
   )
 
 
@@ -367,6 +390,20 @@ class DataTest(unittest.TestCase):
         expected_opponents = tuple(i for i in range(4)
                                    if i not in (info.main_player_index, info.teammate_index))
         self.assertEqual(info.opponent_order, expected_opponents)
+
+  def test_train_test_split_is_deterministic(self):
+    cfg = data.DatasetConfig(
+        data_dir=str(paths.TOY_DATA_DIR),
+        meta_path=str(paths.TOY_META_PATH),
+        test_ratio=0.5,
+        seed=123,
+    )
+
+    train_a, test_a = data.train_test_split(cfg)
+    train_b, test_b = data.train_test_split(cfg)
+
+    self.assertEqual(train_a, train_b)
+    self.assertEqual(test_a, test_b)
 
   def _meta_from_slp(self, source: pathlib.Path, parse_result: dict) -> dict:
     game = peppi_py.read_slippi(str(source))
@@ -606,6 +643,63 @@ class DataTest(unittest.TestCase):
     self.assertEqual(int(swapped_opponent.p1.character[0]), 4)
     self.assertEqual(int(swapped_opponent.p2.character[0]), 1)
     self.assertEqual(int(swapped_opponent.p3.character[0]), 2)
+
+  def test_iter_replays_balances_characters(self):
+    replays = [
+        _make_replay_info(1, 'fox'),
+        _make_replay_info(2, 'falco'),
+        _make_replay_info(3, 'sheik'),
+    ]
+
+    data_source = data.DataSource.__new__(data.DataSource)
+    data_source.replays = replays
+    data_source.balance_characters = True
+    data_source.replay_counter = 0
+
+    iterator = data_source.iter_replays()
+    observed = {next(iterator).main_player.character for _ in range(2 * len(replays))}
+    self.assertEqual(observed, {1, 2, 3})
+
+  def test_iter_replays_balance_falls_back_with_single_character(self):
+    replays = [
+        _make_replay_info(4, 'marth_a'),
+        _make_replay_info(4, 'marth_b'),
+    ]
+
+    data_source = data.DataSource.__new__(data.DataSource)
+    data_source.replays = replays
+    data_source.balance_characters = True
+    data_source.replay_counter = 0
+
+    iterator = data_source.iter_replays()
+    observed_paths = [next(iterator).path for _ in range(4)]
+    self.assertEqual(observed_paths, [replays[0].path, replays[1].path] * 2)
+    self.assertEqual(data_source.replay_counter, 4)
+
+  def test_iter_replays_includes_replays_without_metadata(self):
+    valid_replays = [
+        _make_replay_info(5, 'falcon'),
+        _make_replay_info(6, 'ganon'),
+    ]
+    missing_meta = data.ReplayInfo(
+        path='/tmp/invalid.parquet',
+        main_player_index=0,
+        teammate_index=1,
+        main_player_name='unknown',
+        meta=(),
+        opponent_order=(2, 3),
+    )
+
+    replays = valid_replays + [missing_meta]
+
+    data_source = data.DataSource.__new__(data.DataSource)
+    data_source.replays = replays
+    data_source.balance_characters = True
+    data_source.replay_counter = 0
+
+    iterator = data_source.iter_replays()
+    observed_paths = [next(iterator).path for _ in range(6)]
+    self.assertIn('/tmp/invalid.parquet', observed_paths)
 
 
 if __name__ == '__main__':

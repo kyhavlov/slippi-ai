@@ -287,6 +287,17 @@ def check_same_structure(
     path.reverse()
   return errors
 
+def interleave(*iterables: tp.Iterable[T]) -> tp.Iterator[T]:
+  """Yield elements by alternating between multiple iterables."""
+
+  iterators = [iter(it) for it in iterables]
+  while iterators:
+    for iterator in list(iterators):
+      try:
+        yield next(iterator)
+      except StopIteration:
+        iterators.remove(iterator)
+
 def find_open_udp_ports(num: int):
   min_port = 10_000
   max_port = 2 ** 16

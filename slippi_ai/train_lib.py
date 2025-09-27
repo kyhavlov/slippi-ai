@@ -19,6 +19,8 @@ import tree
 
 import wandb
 
+import melee
+
 from slippi_ai import (
     controller_heads,
     nametags,
@@ -82,6 +84,74 @@ def log_stats(
   if take_mean:
     stats = tree.map_structure(mean, stats)
   wandb.log(data=stats, step=step)
+
+
+def _character_name(character_id: int) -> str:
+  try:
+    return melee.Character(character_id).name.lower()
+  except ValueError:
+    return str(character_id)
+
+
+def _summarize_replays_by_character(
+    replays: list[data_lib.ReplayInfo],
+) -> dict[str, collections.Counter]:
+  summary = {
+      'singles': collections.Counter(),
+      'doubles': collections.Counter(),
+      'unknown': collections.Counter(),
+  }
+
+  for info in replays:
+    meta = getattr(info, 'meta', ())
+    if not hasattr(meta, 'is_singles'):
+      summary['unknown']['unlabelled'] += 1
+      continue
+
+    try:
+      character_id = info.main_player.character
+    except Exception:
+      summary['unknown']['unlabelled'] += 1
+      continue
+
+    bucket = 'singles' if meta.is_singles else 'doubles'
+    summary[bucket][_character_name(character_id)] += 1
+
+  return summary
+
+
+def _log_replay_distribution(
+    split_name: str,
+    replays: list[data_lib.ReplayInfo],
+):
+  summary = _summarize_replays_by_character(replays)
+
+  singles_total = sum(summary['singles'].values())
+  doubles_total = sum(summary['doubles'].values())
+  unknown_total = sum(summary['unknown'].values())
+  total = len(replays)
+
+  logging.info(
+      'Replay distribution [%s]: total=%d singles=%d doubles=%d unknown=%d',
+      split_name, total, singles_total, doubles_total, unknown_total)
+
+  if summary['singles']:
+    logging.info(
+        'Replay distribution [%s][singles]: %s',
+        split_name,
+        dict(sorted(summary['singles'].items())))
+
+  if summary['doubles']:
+    logging.info(
+        'Replay distribution [%s][doubles]: %s',
+        split_name,
+        dict(sorted(summary['doubles'].items())))
+
+  if summary['unknown']:
+    logging.info(
+        'Replay distribution [%s][unknown]: %s',
+        split_name,
+        dict(sorted(summary['unknown'].items())))
 
 _field = utils.field
 
@@ -263,6 +333,9 @@ def train(config: Config):
 
   train_replays, test_replays = data_lib.train_test_split(dataset_config)
   logging.info(f'Training on {len(train_replays)} replays, testing on {len(test_replays)}')
+
+  _log_replay_distribution('train', train_replays)
+  _log_replay_distribution('test', test_replays)
 
   if restored:
     name_map: dict[str, int] = combined_state['name_map']
