@@ -37,8 +37,11 @@ float_type = tf.float32
 In = TypeVar('In')
 Out = TypeVar('Out')
 
-class Embedding(Generic[In, Out], abc.ABC):
+class Embedding(Generic[In, Out], abc.ABC, snt.Module):
   """Embeds game type (In) into tf-ready type Out."""
+
+  def __init__(self, name: Optional[str] = None):
+    super().__init__(name=name)
 
   def from_state(self, state: In) -> Out:
     """Encodes a parsed state."""
@@ -88,7 +91,7 @@ class BoolEmbedding(Embedding[bool, np.bool_]):
   dtype = np.bool_
 
   def __init__(self, name='bool', on=1., off=0.):
-    self.name = name
+    super().__init__(name=name)
     self.on = on
     self.off = off
 
@@ -124,7 +127,7 @@ class FloatEmbedding(Embedding[float, np.float32]):
   size = 1
 
   def __init__(self, name, scale=None, bias=None, lower=-10., upper=10.):
-    self.name = name
+    super().__init__(name=name)
     self.scale = scale
     self.bias = bias
     self.lower = lower
@@ -169,7 +172,7 @@ embed_float = FloatEmbedding("float")
 class OneHotEmbedding(Embedding[int, np.int32]):
 
   def __init__(self, name, size, dtype=np.int32):
-    self.name = name
+    super().__init__(name=name)
     self.size = size
     self.input_size = size
     self.dtype = dtype
@@ -257,7 +260,7 @@ class StructEmbedding(Embedding[NT, NT]):
       builder: Callable[[Mapping[str, Any]], NT],
       getter: Callable[[NT, str], Any],
   ):
-    self.name = name
+    super().__init__(name=name)
     self.embedding = embedding
     self.builder = builder
     self.getter = getter
@@ -388,7 +391,7 @@ class MLPWrapper(Embedding[In, Out]):
       output_sizes: Sequence[int],
       embed: Embedding[In, Out],
   ):
-    self.name = f'MLP_{embed.name}'
+    super().__init__(name=f'MLP_{embed.name}')
     self._output_sizes = output_sizes
     self._embed = embed
     self.size = output_sizes[-1]
@@ -403,6 +406,12 @@ class MLPWrapper(Embedding[In, Out]):
   def __call__(self, inputs: Out) -> tf.Tensor:
     embedded = self._embed(inputs)
     return self._mlp(embedded)
+
+  def dummy(self, shape):
+    return self._embed.dummy(shape)
+
+  def dummy_embedding(self, shape):
+    return self._embed.dummy_embedding(shape)
 
 # one larger than KIRBY_STONE_UNFORMING
 # embed_action = EnumEmbedding(enums.Action, size=0x18F, dtype=np.int16)

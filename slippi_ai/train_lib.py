@@ -522,6 +522,43 @@ def train(config: Config):
     )
 
     to_log = dict(eval_names=to_log, **counters)
+
+    # Log losses aggregated by character when metadata is available.
+    info_meta = meta.info.meta
+    if hasattr(info_meta, 'p0') and hasattr(info_meta.p0, 'character'):
+      main_indices = np.asarray(meta.info.main_player_index)
+      try:
+        stacked_characters = np.stack([
+            info_meta.p0.character,
+            info_meta.p1.character,
+            info_meta.p2.character,
+            info_meta.p3.character,
+        ], axis=0)
+        stacked_characters = stacked_characters.astype(np.int32, copy=False)
+        gather_indices = np.expand_dims(main_indices.astype(np.int32, copy=False), axis=0)
+        gathered = np.take_along_axis(stacked_characters, gather_indices, axis=0)[0]
+      except Exception:
+        gathered = None
+
+      if gathered is not None:
+        per_character_losses: dict[str, float] = {}
+        per_character_counts: dict[str, int] = {}
+        for char_id in np.unique(gathered):
+          mask = gathered == char_id
+          count = int(mask.sum())
+          if count == 0:
+            continue
+          name = _character_name(int(char_id))
+          total_loss = float(np.sum(loss * mask))
+          per_character_losses[name] = total_loss
+          per_character_counts[name] = count
+
+        if per_character_losses:
+          to_log['eval_characters'] = dict(
+              losses=per_character_losses,
+              counts=per_character_counts,
+          )
+
     train_lib.log_stats(to_log, total_steps, take_mean=False)
 
   start_time = time.time()
