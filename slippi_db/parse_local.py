@@ -230,11 +230,11 @@ def parse_chunk(
   if pool is None:
     results = []
     for file in chunk:
-      results.append(parse_slp(file, **parse_slp_kwargs))
+      results.append(parse_slp_safe(file, **parse_slp_kwargs))
     return results
   else:
     futures = [
-        pool.submit(parse_slp, f, **parse_slp_kwargs)
+        pool.submit(parse_slp_safe, f, **parse_slp_kwargs)
         for f in chunk]
     return [f.result() for f in futures]
 
