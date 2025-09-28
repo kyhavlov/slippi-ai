@@ -32,7 +32,19 @@ def get_leaf_flag(field_type: type, default: tp.Any) -> tp.Optional[ff.Item]:
   item_constructor = TYPE_TO_ITEM.get(field_type)
   if item_constructor is not None:
     return item_constructor(default)
-  elif issubclass(field_type, enum.Enum):
+
+  origin = tp.get_origin(field_type)
+  if origin in (list, tuple):
+    (elem_type, *rest) = tp.get_args(field_type)
+    if rest not in ([], [Ellipsis]):
+      logging.warn(f'Unsupported sequence field of type {field_type}')
+      return None
+    if elem_type in (int, float, str):
+      default_seq = list(default or [])
+      default_strings = [str(x) for x in default_seq]
+      return ff.StringList(default_strings)
+
+  if isinstance(field_type, type) and issubclass(field_type, enum.Enum):
     return ff.EnumClass(
         default=default,
         enum_class=field_type,
@@ -122,6 +134,15 @@ def dataclass_from_dict(cls: tp.Type[T], nest: dict) -> T:
       value = nest[field.name]
       if dataclasses.is_dataclass(field.type):
         value = dataclass_from_dict(field.type, value)
+      else:
+        origin = tp.get_origin(field.type)
+        if origin in (list, tuple):
+          elem_type = tp.get_args(field.type)[0]
+          if isinstance(value, list):
+            converter = {int: int, float: float, str: str}.get(elem_type, lambda x: x)
+            value = [converter(v) for v in value]
+          if origin is tuple:
+            value = tuple(value)
 
     recursed[field.name] = value
 

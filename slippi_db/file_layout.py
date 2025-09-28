@@ -14,11 +14,7 @@ def parquet_full_path(root: str, md5: str, prefix_len: int = PARQUET_PREFIX_LEN)
 
 
 def resolve_parquet_path(root: str, md5: str, prefix_len: int = PARQUET_PREFIX_LEN) -> str:
-  hashed_path = parquet_full_path(root, md5, prefix_len=prefix_len)
-  if os.path.exists(hashed_path):
-    return hashed_path
-  return os.path.join(root, md5)
-
+  return parquet_full_path(root, md5, prefix_len=prefix_len)
 
 def ensure_parquet_directory(root: str, md5: str, prefix_len: int = PARQUET_PREFIX_LEN) -> str:
   path = parquet_full_path(root, md5, prefix_len=prefix_len)

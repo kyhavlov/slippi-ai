@@ -98,17 +98,25 @@
 - Replay parsing tightens rollback handling, processed buttons, FoD platform exposure, and upgrade tooling (`f5208b0`, `d0e1607`, `862647c`, `596f847`, `ee2d7dc`).
 - New observation and config plumbing (e.g., `slippi_ai/observations.py`, `saving.py` v5 upgrades) would need reconciliation with doubles-specific structures before merging.
 
-## Roadmap
+## Roadmap (done)
 - Pull in some of the upstream improvements from https://github.com/vladfi1/slippi-ai on the imitation-dev branch: item/projectile embeddings, nana embedding per-player, randall embedding (have one currently but it's probably incorrectly done/suboptimal), support for balancing replay data per-character during imitation learning. Probably other small improvements as well in the history of that branch. When adding new embeddings or changing existing ones, follow the existing conventions of adding them as optional, configurable fields to maintain backwards compatibility with running older versions of models. See [Upstream Imitation-Dev Audit (2025-09-25)](#upstream-imitation-dev-audit-2025-09-25) for commit-level notes before starting integration work.
 - Minor upstream improvement: pull changes to enable kirby and update our local libmelee fork to get upstream changes there for it too.
 - Double check that the player embeddings are properly voided for the singles games we use for imitation training. This would be in both the replay pre-processing and the IL code to double check the gamestate the model gets makes it obvious in some way that the player is not there/eliminated. I added an 'is_teams' embedding at some point but i'm not sure it's well done.
 - Add support for splitting training between some % singles and some % doubles games during RL. Last time i looked into this it was tricky because of how the batches from the envs are lined up/prepared, and having envs of different sizes (2 vs 4 players each) seemed to present complications. This should be doable though, but it will take some care and testing.
 - Set up a script to load a trained model and run a replay through it in order to log its value function from one player's perspective throughout the game. Emit a readable graph as well. (done, in scripts/value_trace.py)
+
+## Roadmap (TODO)
 - Experiment with smaller network size for faster inference/training.
 - Add a moderate penalty (0.002 per frame or so) for existing as Zelda instead of Sheik, to hard incentivize transforming off Zelda when able.
 - Look at adding a win probability head to the model (possibly with shared trunk or separate, idk which is better). Ideally we would incorporate this in RL in some way to surface the true game win signal/reward to the model so it's able to think long term better for things like beneficial trades or stock 1-for-1s. Not sure how exactly this should work.
-- Equalize all character weights, dont need separate per-character distribution
-- Add robust testing around reward function, look into optimizing its performance (some work done in upstream for this i think), and add a 'Zelda penalty' for existing as zelda per-frame to incentivize it to switch back to sheik quickly. 
+- Equalize all character weights during RL, dont need separate per-character distribution
+- Comprehensive review of reward function.
+  - Full audit of how it works, pitfalls, bugs, inconsistencies, potential improvements.
+  - Begin by adding a bunch of tests to verify current behavior
+  - look into optimizing its performance (some work done in upstream for this i think, should review that and potentially apply gains)
+  - add a 'Zelda penalty' for existing as zelda per-frame to incentivize it to switch back to sheik quickly. 
+  - Normalize reward between singles/doubles games somehow, not sure exactly how this should work.
+- Once reward audit/cleanup is done, can start thinking about adding proper support for mixed singles+doubles envs during RL. Partially implemented but not done well, and not working. Some planning outlined in docs/rl_mixed_envs_plan.md
 
 ## Quick Reference
 - Launch imitation: `./scripts/imitation_doubles.sh --config.dataset.meta_path=data/meta.json`
