@@ -1,6 +1,7 @@
 """Calculate rewards."""
 
 import dataclasses
+from typing import Sequence
 
 import numpy as np
 
@@ -11,76 +12,82 @@ def is_dying(player_action: np.ndarray) -> np.ndarray:
   # See https://docs.google.com/spreadsheets/d/1JX2w-r2fuvWuNgGb6D3Cs4wHQKLFegZe2jhbBuIhCG8/edit#gid=13
   return player_action <= 0xA
 
-def process_deaths(player_action: np.ndarray) -> np.ndarray:
-  deaths = is_dying(player_action)
-  # Players are in a dead action-state for many consecutive frames.
-  # Prune all but the first frame of death
-  return np.logical_and(np.logical_not(deaths[:-1]), deaths[1:])
+def process_deaths(
+    player_action: np.ndarray,
+    percent: np.ndarray | None = None,
+    weight_by_percent: bool = False,
+) -> np.ndarray:
+  """Detect death frames and optionally scale them by percent taken."""
+
+  actions = np.asarray(player_action)
+  deaths = is_dying(actions)
+
+  # Players are in a dead action state for many consecutive frames; only keep
+  # the rising edge where death first registers.
+  death_frames = np.diff(deaths.astype(np.int8), axis=0) > 0
+  death_frames = death_frames.astype(np.float32)
+
+  if weight_by_percent and percent is not None:
+    percents = np.asarray(percent, dtype=np.float32)
+    weights = 100.0 / (100.0 + percents[1:])
+    death_frames *= weights
+
+  return death_frames
+
 
 def process_deaths_teams(player_action: np.ndarray, percent: np.ndarray) -> np.ndarray:
-  deaths = is_dying(player_action)
-  # Players are in a dead action-state for many consecutive frames.
-  # Prune all but the first frame of death
-  death_frames = np.logical_and(np.logical_not(deaths[:-1]), deaths[1:])
-
-  # Reduce the value of the death frame by 100/(100+percent)
-  # This way, a death at 0 percent is worth the full amount, but a death at
-  # 100 percent is worth half, and a death at 200 percent is worth a third, and so on.
-  #clipped_percent = np.clip(percent, 0, 999)[1:]
-  return (100 / (100 + percent[1:])) * death_frames
+  # Backwards-compatible wrapper used by older call sites.
+  return process_deaths(player_action, percent, weight_by_percent=True)
 
 def process_damages(damages: np.ndarray) -> np.ndarray:
-  damages = damages.astype(np.float32)
-  return np.maximum(damages[1:] - damages[:-1], 0)
+  damages = np.asarray(damages, dtype=np.float32)
+  return np.maximum(np.diff(damages, axis=0), 0.0)
 
 def grabbed_ledge(player_action: np.ndarray) -> np.ndarray:
   is_ledge_grab = player_action == melee.Action.EDGE_CATCHING.value
   return np.logical_and(np.logical_not(is_ledge_grab[:-1]), is_ledge_grab[1:])
 
-def get_bad_ledge_grabs(player: Player, opponent: Player) -> np.ndarray:
+def _get_bad_ledge_grabs_multi(
+    player: Player, opponents: Sequence[Player]) -> np.ndarray:
   ledge_grabs = grabbed_ledge(player.action)
 
-  # Don't penalize if opponent is offstage
-  opponent_direction = player.x < opponent.x  # True if opponent is right
-  center_direction = player.x < 0  # True if center is right
-  opponent_towards_center = opponent_direction == center_direction
-  bad_ledge_grabs = np.logical_and(ledge_grabs, opponent_towards_center[:-1])
+  if not opponents:
+    return np.zeros_like(ledge_grabs, dtype=bool)
 
-  # Also ok if opponent is invincible (like after respawn)
-  bad_ledge_grabs = np.logical_and(
-      bad_ledge_grabs, np.logical_not(opponent.invulnerable[:-1]))
-
-  return bad_ledge_grabs
-
-def get_bad_ledge_grabs_team(player: Player, opponents: list[Player]) -> np.ndarray:
-  ledge_grabs = grabbed_ledge(player.action)
-
-  # Don't penalize if opponent is offstage
-  opponent1_direction = player.x < opponents[0].x  # True if opponent is right
-  opponent2_direction = player.x < opponents[1].x  # True if opponent is right
-  center_direction = player.x < 0  # True if center is right
-  opponents_towards_center = np.logical_and(opponent1_direction == center_direction, opponent2_direction == center_direction)
+  center_direction = player.x < 0
+  opponent_directions = [player.x < opponent.x for opponent in opponents]
+  opponents_towards_center = np.logical_and.reduce(
+      [op_dir == center_direction for op_dir in opponent_directions])
   bad_ledge_grabs = np.logical_and(ledge_grabs, opponents_towards_center[:-1])
 
-  # Also ok if opponent is invincible (like after respawn)
-  bad_ledge_grabs = np.logical_and(
-      bad_ledge_grabs, np.logical_not(np.logical_or(opponents[0].invulnerable[:-1], opponents[1].invulnerable[:-1])))
+  invulnerable = np.zeros_like(player.invulnerable, dtype=bool)
+  for opponent in opponents:
+    invulnerable = np.logical_or(invulnerable, opponent.invulnerable)
 
+  bad_ledge_grabs = np.logical_and(
+      bad_ledge_grabs, np.logical_not(invulnerable[:-1]))
   return bad_ledge_grabs
+
+
+def get_bad_ledge_grabs(player: Player, opponent: Player) -> np.ndarray:
+  return _get_bad_ledge_grabs_multi(player, [opponent])
+
+
+def get_bad_ledge_grabs_team(player: Player, opponents: Sequence[Player]) -> np.ndarray:
+  return _get_bad_ledge_grabs_multi(player, opponents)
 
 def normalize(xys, epsilon=1e-6):
   r = np.sqrt(np.sum(np.square(xys), axis=-1, keepdims=True))
   return xys / (r + epsilon)
 
-def compute_approaching_factor(
-    player: Player, opponent: Player) -> np.ndarray:
-  """Measures how much we are approaching the opponent on each frame."""
+def _compute_approach_core(
+    player: Player,
+    opponent_xy: np.ndarray,
+) -> np.ndarray:
   xy = np.stack([player.x, player.y], axis=-1)
   v = xy[1:] - xy[:-1]
 
-
-  opp_xy = np.stack([opponent.x, opponent.y], axis=-1)
-  dxy = normalize(opp_xy - xy)
+  dxy = normalize(opponent_xy - xy)
 
   approach_factor = np.sum(v * dxy[:-1], axis=-1)
 
@@ -89,7 +96,25 @@ def compute_approaching_factor(
   respawning = np.logical_and(dying[:-1], np.logical_not(dying[1:]))
   approach_factor = np.where(respawning, 0, approach_factor)
 
-  return approach_factor
+  return approach_factor.astype(np.float32)
+
+
+def compute_approaching_factor(
+    player: Player, opponent: Player) -> np.ndarray:
+  """Measures how much we are approaching a single opponent on each frame."""
+  opp_xy = np.stack([opponent.x, opponent.y], axis=-1)
+  return _compute_approach_core(player, opp_xy)
+
+
+def compute_approaching_factor_multi(
+    player: Player, opponents: Sequence[Player]) -> np.ndarray:
+  if not opponents:
+    length = player.x.shape[0] - 1
+    return np.zeros(length, dtype=np.float32)
+
+  opp_xy = np.mean(
+      [np.stack([opp.x, opp.y], axis=-1) for opp in opponents], axis=0)
+  return _compute_approach_core(player, opp_xy)
 
 stage_to_edge_x = {
     stage.value: x for stage, x in melee.stages.EDGE_POSITION.items()
@@ -134,101 +159,203 @@ class RewardConfig:
   ledge_grab_penalty: float = 0
   approaching_factor: float = 0
   stalling_penalty: float = 0  # per second
+  zelda_penalty: float = 0  # per frame
+  team_size_normalization: bool = True
+  singles_scale: float | None = None
+  doubles_scale: float | None = None
+  weight_deaths_by_percent: bool = True
+
+
+def _player_has_presence(player: Player) -> bool:
+  stocks = np.asarray(player.stocks_left)
+  percents = np.asarray(player.percent)
+  return bool(np.any(stocks > 0) or np.any(percents > 0))
+
+
+def _count_active_players(players: Sequence[Player]) -> int:
+  count = sum(1 for player in players if _player_has_presence(player))
+  return max(count, 1)
+
+
+def _add(total: np.ndarray | None, value: np.ndarray) -> np.ndarray:
+  value = np.asarray(value, dtype=np.float32)
+  if total is None:
+    return value
+  return total + value
+
+
+def _stock_penalties(team: Sequence[Player]) -> np.ndarray:
+  stocks = np.sum(
+      [np.asarray(player.stocks_left, dtype=np.float32) for player in team],
+      axis=0)
+  second_last = np.where(
+      (stocks[:-1] == 2) & (stocks[1:] == 1), 1.5, 0.0).astype(np.float32)
+  last = np.where(
+      (stocks[:-1] == 1) & (stocks[1:] == 0), 3.5, 0.0).astype(np.float32)
+  return second_last + last
+
+
+_ZELDA = melee.Character.ZELDA.value
+
+
+def _zelda_frames(player: Player) -> np.ndarray:
+  characters = np.asarray(player.character)
+  return (characters[1:] == _ZELDA).astype(np.float32)
+
+
+def _team_reward(
+    team: Sequence[Player],
+    opponents: Sequence[Player],
+    stage: np.ndarray,
+    config: RewardConfig,
+) -> np.ndarray:
+  deaths = None
+  damages = None
+  ledges = None
+  stalling = None
+  zelda = None
+  approach = None
+
+  for player in team:
+    percent = player.percent
+    deaths = _add(deaths, process_deaths(
+        player.action,
+        percent if config.weight_deaths_by_percent else None,
+        weight_by_percent=config.weight_deaths_by_percent))
+
+    damages = _add(damages, process_damages(percent))
+
+    ledges = _add(
+        ledges,
+        get_bad_ledge_grabs_team(player, opponents).astype(np.float32))
+
+    stalling = _add(
+        stalling,
+        is_stalling_offstage(player, stage)[1:].astype(np.float32))
+
+    if config.zelda_penalty:
+      zelda = _add(zelda, _zelda_frames(player))
+
+    if config.approaching_factor:
+      approach = _add(
+          approach, compute_approaching_factor_multi(player, opponents))
+
+  if deaths is None:
+    raise ValueError('Team must include at least one player.')
+
+  # Normalize by the number of meaningful teammates if requested.
+  normalization = (float(_count_active_players(team))
+                   if config.team_size_normalization else float(len(team)))
+  normalization = normalization or 1.0
+
+  penalty = np.zeros_like(deaths, dtype=np.float32)
+  penalty += deaths
+  penalty += config.damage_ratio * damages
+  penalty += config.ledge_grab_penalty * ledges
+  penalty += (config.stalling_penalty / 60.0) * stalling
+
+  if config.zelda_penalty and zelda is not None:
+    penalty += config.zelda_penalty * zelda
+
+  penalty /= normalization
+
+  reward = -penalty
+  reward -= _stock_penalties(team)
+
+  if config.approaching_factor and approach is not None:
+    reward += (config.approaching_factor * approach) / normalization
+
+  return reward.astype(np.float32)
+
+
+def _broadcast_is_teams(is_teams: np.ndarray, reward_shape: tuple[int, ...]) -> np.ndarray:
+  mode = np.asarray(is_teams, dtype=bool)
+  if mode.ndim == 0:
+    return np.broadcast_to(mode, reward_shape)
+
+  time_dim = reward_shape[0]
+  if mode.shape[0] == time_dim + 1:
+    mode = mode[1:]
+  elif mode.shape[0] != time_dim:
+    raise ValueError(
+        f'is_teams first dimension {mode.shape[0]} does not align with '
+        f'reward time dimension {time_dim}')
+
+  while mode.ndim < len(reward_shape):
+    mode = np.expand_dims(mode, axis=-1)
+
+  return np.broadcast_to(mode, reward_shape)
+
+
+def _apply_mode_scale(
+    rewards: np.ndarray,
+    is_teams: np.ndarray,
+    config: RewardConfig,
+) -> np.ndarray:
+  singles_scale = config.singles_scale
+  doubles_scale = config.doubles_scale
+
+  if singles_scale is None and doubles_scale is None:
+    return rewards
+
+  mode = _broadcast_is_teams(is_teams, rewards.shape)
+
+  if singles_scale is not None:
+    rewards = np.where(mode, rewards, rewards * singles_scale)
+
+  if doubles_scale is not None:
+    rewards = np.where(mode, rewards * doubles_scale, rewards)
+
+  return rewards
 
 def compute_rewards(
     game: Game,
     damage_ratio: float = 0.01,
     ledge_grab_penalty: float = 0,
     approaching_factor: float = 0,
-    stalling_penalty: float = 0  # per second
+    stalling_penalty: float = 0,
+    zelda_penalty: float = 0,
+    team_size_normalization: bool = True,
+    singles_scale: float | None = None,
+    doubles_scale: float | None = None,
+    weight_deaths_by_percent: bool = True,
 ) -> np.ndarray:
-  '''
-    Args:
-      game: nest of np.arrays of length T, from make_dataset.py
-      damage_ratio: How much damage (percent) counts relative to stocks
-    Returns:
-      A length (T-1) np.array of rewards
-  '''
+  """Compute per-frame rewards for the main team (ports 0/1) vs. opponents."""
 
-  def player_reward(player: Player, opponent: Player, game_stage=None):
-    deaths = process_deaths(player.action).astype(np.float32)
-    damages = damage_ratio * process_damages(player.percent)
+  config = RewardConfig(
+      damage_ratio=damage_ratio,
+      ledge_grab_penalty=ledge_grab_penalty,
+      approaching_factor=approaching_factor,
+      stalling_penalty=stalling_penalty,
+      zelda_penalty=zelda_penalty,
+      team_size_normalization=team_size_normalization,
+      singles_scale=singles_scale,
+      doubles_scale=doubles_scale,
+      weight_deaths_by_percent=weight_deaths_by_percent,
+  )
 
-    bad_ledge_grabs = get_bad_ledge_grabs(player, opponent).astype(np.float32)
-    ledge_grab_penalties = ledge_grab_penalty * bad_ledge_grabs
+  stage = np.asarray(game.stage)
+  team1 = (game.p0, game.p1)
+  team2 = (game.p2, game.p3)
 
-    stalling = is_stalling_offstage(player, game.stage)[1:]
-    stalling_penalties = (stalling_penalty / 60) * stalling.astype(np.float32)
+  team1_reward = _team_reward(team1, team2, stage, config)
+  team2_reward = _team_reward(team2, team1, stage, config)
 
-    last_stock_loss = np.where(
-      (player.stocks_left[:-1] == 1) & (player.stocks_left[1:] == 0),
-      3.0, 0.0
-    ).astype(np.float32)
+  rewards = team1_reward - team2_reward
+  rewards = _apply_mode_scale(rewards, game.is_teams, config)
 
-    reward = approaching_factor * compute_approaching_factor(player, opponent)
-    reward -= (deaths + damages + ledge_grab_penalties + stalling_penalties + last_stock_loss)
+  rewards = rewards.astype(np.float32)
 
-    return reward
-  
-  # calculate rewards for a team
-  def team_reward(team: list[Player], opponents: list[Player]):
-    deaths = process_deaths_teams(team[0].action, team[0].percent).astype(np.float32)
-    deaths += process_deaths_teams(team[1].action, team[1].percent).astype(np.float32)
-    damages = damage_ratio * process_damages(team[0].percent)
-    damages += damage_ratio * process_damages(team[1].percent)
-
-    bad_ledge_grabs = get_bad_ledge_grabs_team(team[0], opponents).astype(np.float32)
-    bad_ledge_grabs += get_bad_ledge_grabs_team(team[1], opponents).astype(np.float32)
-    ledge_grab_penalties = ledge_grab_penalty * bad_ledge_grabs
-
-    stalling1 = (stalling_penalty / 60) * is_stalling_offstage(team[0], game.stage)[1:].astype(np.float32)
-    stalling2 = (stalling_penalty / 60) * is_stalling_offstage(team[1], game.stage)[1:].astype(np.float32)
-    stalling_penalties = stalling1 + stalling2
-
-    # add extra penalties for losing last stock and 2nd to last stock
-    team1_stocks = np.array(team[0].stocks_left + team[1].stocks_left)
-
-    # Add extra penalty for losing the second-to-last stock (going from 2 to 1)
-    second_last_stock_loss = np.where(
-      (team1_stocks[:-1] == 2) & (team1_stocks[1:] == 1),
-      1.5, 0.0
-    ).astype(np.float32)
-
-    # Add extra penalty for losing the last stock (going from 1 to 0)
-    last_stock_loss = np.where(
-      (team1_stocks[:-1] == 1) & (team1_stocks[1:] == 0),
-      3.5, 0.0
-    ).astype(np.float32)
-
-    # Combine stock penalties
-    stock_penalties = second_last_stock_loss + last_stock_loss
-
-    return -(deaths + damages + ledge_grab_penalties + stalling_penalties)/2.0 - stock_penalties
-
-  # separate players into teams so we can calculate reward from the
-  # main player/team1's perspective
-  team1 = [game.p0, game.p1]
-  team2 = [game.p2, game.p3]
-
-  rewards = team_reward(team1, team2) - team_reward(team2, team1)
-
-  assert np.all(rewards > -6)
-  assert np.all(rewards < 6)
-
-  # sanity checks
-  assert rewards.dtype == np.float32
-
-  if False:
-    print("damage ratio: ", damage_ratio, "action shape", game.p0.action.shape)
-    sums = np.sum(rewards, axis=0)
-    print("character:", game.p0.character[0], "reward:", sums, "shape:", sums.shape)
+  if not np.all(np.isfinite(rewards)):
+    raise ValueError('Reward calculation produced non-finite values.')
 
   return rewards
 
 def player_stats(player: Player, opponent: Player, stage: np.ndarray) -> dict:
   FPM = 60 * 60
   return dict(
-      deaths=process_deaths(player.action, player.percent).mean() * FPM,
+      deaths=process_deaths(
+          player.action, player.percent, weight_by_percent=True).mean() * FPM,
       damages=process_damages(player.percent).mean() * FPM,
       ledge_grabs=get_bad_ledge_grabs(player, opponent).mean() * FPM,
       approaching_factor=compute_approaching_factor(player, opponent).mean(),
@@ -237,7 +364,10 @@ def player_stats(player: Player, opponent: Player, stage: np.ndarray) -> dict:
 
 def team_stats(team: list[Player], opponents: list[Player], stage: np.ndarray) -> dict:
   FPM = 60 * 60
-  deaths = process_deaths(team[0].action) + process_deaths(team[1].action)
+  deaths = process_deaths(
+      team[0].action, team[0].percent, weight_by_percent=True)
+  deaths += process_deaths(
+      team[1].action, team[1].percent, weight_by_percent=True)
   damages = process_damages(team[0].percent) + process_damages(team[1].percent)
   ledge_grabs = get_bad_ledge_grabs_team(team[0], opponents) + get_bad_ledge_grabs_team(team[1], opponents)
 
@@ -272,7 +402,8 @@ def get_reward(
     players = [prev_state.players[port], next_state.players[port]]
     actions = np.array([p.action for p in players])
     percents = np.array([p.percent for p in players])
-    deaths = process_deaths(actions, percents).astype(np.float32).item()
+    deaths = process_deaths(
+        actions, percents, weight_by_percent=True).astype(np.float32).item()
 
     damage = damage_ratio * process_damages(percents).item()
     return - (deaths + damage)

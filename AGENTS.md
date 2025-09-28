@@ -1,5 +1,8 @@
 # Slippi-AI Agents Guide
 
+## Rules
+- Do not ever add 'skip' annotations to tests, for any reason (dependencies missing or otherwise). If you can't figure out a dependency error, ask me to help resolve it.
+
 ## Mission & Scope
 - This is a SSBM ai project started by vladfi1 and forked by me with modifications to support 2v2.
 - Goal: keep pipeline maintainable for human + LLM contributors spanning data prep, imitation, RL, evaluation, and analytics.
