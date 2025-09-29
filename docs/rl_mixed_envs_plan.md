@@ -1,17 +1,17 @@
 # Mixed Singles + Doubles RL: Design and Implementation Plan
 
-Author: LLM planning pass on 2025-09-26
+Author: LLM planning pass on 2025-09-29
 
 Status: Planning only (no code changes yet)
 
 Scope: Enable robust RL training with a controllable mix of singles and doubles environments, targeting a default 50/50 trajectory split. Remove fragile multi-Dolphin-per-env behavior and make shapes, rewards, and logging explicitly support mixed-mode training.
-Much of the core of these changes will likely like in slippi_ai/rl/run_lib.py and slippi_ai/envs.py.
+Much of the core of these changes will likely live in `slippi_ai/rl/run_lib.py` and `slippi_ai/envs.py`.
 
 ---
 
 ## Goals
 
-- Train with a configurable fraction of singles vs doubles during RL (default 50/50) to improve robustness and skill balance.
+- Train with a controllable mix of singles vs doubles during RL (defaulting to a 50/50 split) to improve robustness and skill balance.
 - Use exactly one Dolphin process per environment for both modes to simplify resets/lifecycle and isolate failures.
 - Keep the existing 4-slot `Game` schema for all environments to minimize invasive changes in the actor/evaluator pipeline.
 - Prevent dummy ports from polluting gradients by masking inactive columns in the learner.
@@ -20,9 +20,9 @@ Much of the core of these changes will likely like in slippi_ai/rl/run_lib.py an
 ## Decisions
 
 1) One-Dolphin-per-env for both singles and doubles
-   - Singles envs expose a 4-slot `Game` with real players in `p0` (self) and the opponent in an even split of  either `p2` pr `p3` (to avoid bias when carrying over knowledge to doubles), `p1` and the unused opponent slot are dead placeholders.
+   - Singles envs expose a 4-slot `Game` with real players in `p0` (self) and the opponent in an even split of either `p2` or `p3` (to avoid bias when carrying over knowledge to doubles); `p1` and the unused opponent slot are dead placeholders.
    - `is_teams=False` for singles env states; `is_teams=True` for doubles.
-   - Env ignores controllers for `p1` and the unused opponet slot in singles mode.
+   - Env ignores controllers for `p1` and the unused opponent slot in singles mode.
 
 2) Keep 4 agents/ports at the rollout layer; add an active-column mask
    - Don’t reshape the pipeline to 2 ports for singles; instead, provide a per‑column `active_mask` so the learner trains only on live ports. Need to carefully test this both locally and end-to-end to make sure the exact correct trajectories and their shapes make it to the learner in the state we expect.
@@ -31,10 +31,10 @@ Much of the core of these changes will likely like in slippi_ai/rl/run_lib.py an
 
 3) Ratio control via `singles_fraction`
    - Replace `enable_singles` (bool) with `singles_fraction: float` on the actor config.
-   - Validate realizability given `num_envs` and batching strategy (see below). Default to 0.5.
+   - Default to 0.5 (even split). Implementation will handle arbitrary ratios via a per-env mask, but initial configs can assume 50/50 for simplicity.
 
 4) Reward normalization by mode
-   - Figure out a reasonable default for reward settings to normalize reward in singles games if needed. Env modes can be fixed for the entire training duration, so we shouldn't need to worry about trajectory data for a game switching modes part-way through.
+   - Rely on existing `team_size_normalization` for now. Add per-mode reward logging so we can revisit scaling if magnitude drift shows up.
 
 5) Observability
    - Fix `is_teams` values for RL envs and log per‑mode metrics: realized mix ratio, FPS/MPS, actor_kl, teacher_kl, UEV, reward mean/std, PPO objective.
@@ -75,11 +75,9 @@ Risks in current implementation:
 ### Ratio control & provisioning
 
 - `singles_fraction: float` (0..1) on `ActorConfig` replaces `enable_singles`.
-- Compute `singles_envs = round(num_envs * singles_fraction)`.
+- Default computation: `singles_envs = num_envs // 2` (even split). The builder produces a deterministic boolean mask whose first `singles_envs` entries are singles; later we can expand to arbitrary ratios by changing only the mask generator.
 - Provision exactly one dolphin port per env (`num_envs` total), no extra provisioning for singles.
-- Assignment policy:
-  - Option A (simple): keep group-level toggling for async envs; require `singles_envs` be a multiple of `inner_batch_size`. Validate at startup; fail fast otherwise.
-  - Option B (better): per‑env toggling with a boolean mask passed to the env builder; removes divisibility constraints, but requires minor plumbing to deliver a per‑env mode flag.
+- Pass the per-env singles mask into `SafeEnvironment`/`BatchedEnvironment`/async/ray variants so each env instance knows its mode.
 - (IMPORTANT) Need to keep in mind that the current code has one agent per game port (1-4) that performs batch inference for that port across all envs. We will need to come up with a solution to change this to handle the fact that each singles env will only want 2 ports worth of inference/agents, not 4.
 
 ### Rollout packaging & learner masks
@@ -95,7 +93,8 @@ Risks in current implementation:
 
 ### Rewards and normalization
 
-- TODO: see if anything significant is still needed here or if configuring existing normalization setting is enough.
+- Use `team_size_normalization` (already in `RewardConfig`) to keep per-frame magnitudes comparable.
+- Add logging to surface singles vs doubles reward means/stds; revisit explicit scaling only if the data warrants it.
 
 ### Logging & metrics
 
@@ -113,13 +112,57 @@ Risks in current implementation:
 - `is_teams` correctness: ensure False for singles; many features/metrics depend on it.
 - Reward scale skew: without per‑mode normalization/scales, one mode can dominate gradients.
 
-## Configuration Examples
+## Configuration Example
 
-- 50/50, async, group‑level toggling (Option A)
-  - `num_envs=96`, `inner_batch_size=6` → `outer_batch_size=16` (even)
-  - `singles_fraction=0.5` → `singles_envs=48` → realizable (48 is multiple of 6)
+- 50/50 split (default): `num_envs=96`, `singles_envs=48`, mask `[True]*48 + [False]*48`; works for sync and async actors because each env reads its own mode flag.
 
-- 25% singles, async, per‑env mask (Option B)
-  - `num_envs=64`, `singles_fraction=0.25` → `singles_envs=16` assigned per env; no divisibility constraint.
+---
 
+## Updated Implementation Plan (2025-09-29)
 
+This supersedes the earlier outline. Steps will be executed sequentially, each with targeted validation before progressing.
+
+1. **Config plumbing for singles mix** (`slippi_ai/rl/run_lib.py`, `slippi_ai/rl/run.py`, launch scripts)
+   - Replace `enable_singles` with `singles_fraction` (float). Default to 0.5.
+   - Add a helper that, given `(num_envs, singles_fraction)`, returns a deterministic single/double mask (start with 50/50 split; honor odd counts by flooring and leaving one extra doubles env).
+   - Thread the mask through config serialization/deserialization and CLI flags. Update helper scripts to pass the new flag.
+   - Tests: unit test for the mask helper to verify counts/order; adjust any config round-trip tests.
+
+2. **Environment lifecycle refactor** (`slippi_ai/envs.py` and builders)
+   - Refactor `SafeEnvironment`/`Environment` to run exactly one Dolphin per env regardless of mode; remove `slippi_port2` plumbing.
+   - Accept a per-env boolean (`is_singles`) and derive the correct controller/port wiring. For singles, ensure placeholder players are marked dead and ignored, and set `is_teams=False`.
+   - Update batched/async/ray builders to iterate over the mask when instantiating environments.
+   - Tests: lightweight fake-dolphin test ensuring singles envs create one Dolphin and produce 4-slot games with dead placeholders and `is_teams=False`.
+
+3. **Activity metadata propagation** (`slippi_ai/envs.py`, `slippi_ai/evaluators.py`)
+   - Compute an `active_ports` boolean array per env (ports that represent real players) alongside the `Game` data.
+   - Extend `evaluators.Trajectory` with an `active_mask` (batch-major) and ensure `Trajectory.batch`/`dummy_trajectory` include it.
+   - Tests: unit test batching behavior for the mask (mix singles/doubles trajectories and check concatenation).
+
+4. **Actor/agent batching overhaul** (`slippi_ai/evaluators.py`, `slippi_ai/rl/run_lib.py`)
+   - For each port, gather indices of envs where that port is active and instantiate `DelayedAgent` with that smaller batch size.
+   - Before calling `agent.push`, slice env states/needs_reset to the active indices; after inference, scatter controllers back, filling inactive slots with neutral inputs.
+   - Keep nametag batching aligned with the same index lists.
+   - Tests: fake-agent test confirming inactive ports never trigger inference and controller scatter preserves zeros.
+
+5. **Learner pipeline masking** (`slippi_ai/rl/run_lib.py`, `slippi_ai/rl/learner.py`)
+   - Derive the effective batch size from the mask and initialize learner hidden states accordingly.
+   - Introduce utilities to slice trajectory tensors by the mask before computing PPO/value updates.
+   - Ensure checkpoints capture any additional mask metadata if necessary.
+   - Tests: synthetic-trajectory learner test comparing masked vs manually pre-sliced runs.
+
+6. **Metrics and logging updates** (`slippi_ai/rl/run_lib.py`)
+   - Log realized singles ratio, per-mode reward mean/std, per-mode PPO metrics (actor_kl, teacher_kl, UEV), and effective active batch size during flushes.
+   - Validate `is_teams` stats now differentiate singles/doubles correctly.
+   - Tests: extend logger tests (or add new) validating the metrics dictionary contains the expected per-mode keys.
+
+7. **Docs and script refresh** (this document, `scripts/rl_*.sh`, README snippets)
+   - Document new flags and assumptions (50/50 default, team-size normalization reliance).
+   - Update example scripts to use `singles_fraction` and remove legacy `enable_singles` references.
+   - Tests: `python -m compileall` on updated scripts to catch syntax issues.
+
+8. **End-to-end validation**
+   - Provide a fake-env smoke command (e.g., `python slippi_ai/rl/run.py --config.actor.use_fake_envs=True --config.actor.num_envs=4 --config.actor.singles_fraction=0.5`) to verify actors build, masks propagate, and PPO runs at least one epoch.
+   - Document an optional short real-env sanity run for when Dolphin access is available.
+
+Each step ends with targeted verification before moving on, and we’ll revisit reward scaling only if the logged per-mode stats expose a mismatch after implementation.
