@@ -2,6 +2,7 @@
 
 ## Rules
 - Do not ever add 'skip' annotations to tests, for any reason (dependencies missing or otherwise). If you can't figure out a dependency error, ask me to help resolve it.
+- Do not ever add try/except around imports. Imports MUST succeed, period. If they don't we will fix that root problem. Adding conditionals around import success is UNACCEPTABLE.
 
 ## Mission & Scope
 - This is a SSBM ai project started by vladfi1 and forked by me with modifications to support 2v2.
@@ -112,7 +113,7 @@
 - Experiment with smaller network size for faster inference/training.
 - Add a moderate penalty (0.002 per frame or so) for existing as Zelda instead of Sheik, to hard incentivize transforming off Zelda when able.
 - Look at adding a win probability head to the model (possibly with shared trunk or separate, idk which is better). Ideally we would incorporate this in RL in some way to surface the true game win signal/reward to the model so it's able to think long term better for things like beneficial trades or stock 1-for-1s. Not sure how exactly this should work.
-- Equalize all character weights during RL, dont need separate per-character distribution
+- Equalize all character-env balance during RL, dont need separate per-character distribution
 - Comprehensive review of reward function.
   - Full audit of how it works, pitfalls, bugs, inconsistencies, potential improvements.
   - Begin by adding a bunch of tests to verify current behavior

@@ -151,6 +151,7 @@ CHARACTER_WEIGHTINGS = {
       Character.JIGGLYPUFF: 1000,
       Character.PIKACHU: 200,
       Character.YOSHI: 200,
+      Character.GANONDORF: 200,
       Character.POPO: 100,
       Character.SAMUS: 100,
       Character.DK: 100,
@@ -165,15 +166,8 @@ CHARACTER_WEIGHTINGS = {
       Character.MEWTWO: 50,
       Character.PICHU: 50,
       Character.BOWSER: 50,
+      Character.KIRBY: 50,
 }
-
-'''
-      Character.POPO: 200,
-      Character.GANONDORF: 200,
-      Character.SAMUS: 200,
-      Character.DK: 200,
-      Character.LUIGI: 200,
-'''
 
 class LearnerManager:
 

@@ -5,6 +5,7 @@ Author: LLM planning pass on 2025-09-26
 Status: Planning only (no code changes yet)
 
 Scope: Enable robust RL training with a controllable mix of singles and doubles environments, targeting a default 50/50 trajectory split. Remove fragile multi-Dolphin-per-env behavior and make shapes, rewards, and logging explicitly support mixed-mode training.
+Much of the core of these changes will likely like in slippi_ai/rl/run_lib.py and slippi_ai/envs.py.
 
 ---
 
@@ -19,24 +20,25 @@ Scope: Enable robust RL training with a controllable mix of singles and doubles 
 ## Decisions
 
 1) One-Dolphin-per-env for both singles and doubles
-   - Singles envs expose a 4-slot `Game` with real players in `p0` (self) and `p2` (opponent); `p1` and `p3` are dead placeholders.
+   - Singles envs expose a 4-slot `Game` with real players in `p0` (self) and the opponent in an even split of  either `p2` pr `p3` (to avoid bias when carrying over knowledge to doubles), `p1` and the unused opponent slot are dead placeholders.
    - `is_teams=False` for singles env states; `is_teams=True` for doubles.
-   - Env ignores controllers for `p1`/`p3` in singles mode.
+   - Env ignores controllers for `p1` and the unused opponet slot in singles mode.
 
 2) Keep 4 agents/ports at the rollout layer; add an active-column mask
-   - Don’t reshape the pipeline to 2 ports for singles; instead, provide a per‑column `active_mask` so the learner trains only on live ports.
+   - Don’t reshape the pipeline to 2 ports for singles; instead, provide a per‑column `active_mask` so the learner trains only on live ports. Need to carefully test this both locally and end-to-end to make sure the exact correct trajectories and their shapes make it to the learner in the state we expect.
    - Effective batch columns per rollout become `4 * (#doubles_envs) + 2 * (#singles_envs)`.
+   - Need to look into disabling inference for inactive singles ports, will likely require some refactoring in the actor/agent code but is worth it as inference time is our bottleneck during rollout generation currently.
 
 3) Ratio control via `singles_fraction`
    - Replace `enable_singles` (bool) with `singles_fraction: float` on the actor config.
    - Validate realizability given `num_envs` and batching strategy (see below). Default to 0.5.
 
 4) Reward normalization by mode
-   - Support separate `RewardConfig` for singles vs doubles.
-   - Add optional per‑mode scaling (simple multiplier) and/or per‑mode advantage normalization (preferred).
+   - Figure out a reasonable default for reward settings to normalize reward in singles games if needed. Env modes can be fixed for the entire training duration, so we shouldn't need to worry about trajectory data for a game switching modes part-way through.
 
 5) Observability
    - Fix `is_teams` values for RL envs and log per‑mode metrics: realized mix ratio, FPS/MPS, actor_kl, teacher_kl, UEV, reward mean/std, PPO objective.
+   - (TODO) Metrics may need somewhat more of an overhaul to simplify and make them more useful in general, given that when I adapted this pipeline from singles to doubles initially, I didn't really make many changes to the metrics being emitted and many of them may be incorrect or not make sense. This is more of a nice-to-have/stretch goal.
 
 ## Current State (what exists now)
 
@@ -62,10 +64,9 @@ Risks in current implementation:
   - Observations map to a 4-slot `Game` with:
     - `p0`: self (controlled by our agent)
     - `p1`: placeholder dead player
-    - `p2`: opponent
-    - `p3`: placeholder dead player
+    - `p2`/`p3`: 50/50 split randomized among opponent and placeholder dead player (can be fixed per-env, just needs to have a 50/50 balance overall)
     - `is_teams=False`
-  - `step` ignores incoming controllers for `p1` and `p3`.
+  - `step` ignores incoming controllers for `p1` and placeholder dead opponent.
 
 - Doubles env:
   - One Dolphin instance as today.
@@ -75,17 +76,18 @@ Risks in current implementation:
 
 - `singles_fraction: float` (0..1) on `ActorConfig` replaces `enable_singles`.
 - Compute `singles_envs = round(num_envs * singles_fraction)`.
-- Provision exactly one port per env (`num_envs` total), no extra provisioning for singles.
+- Provision exactly one dolphin port per env (`num_envs` total), no extra provisioning for singles.
 - Assignment policy:
   - Option A (simple): keep group-level toggling for async envs; require `singles_envs` be a multiple of `inner_batch_size`. Validate at startup; fail fast otherwise.
   - Option B (better): per‑env toggling with a boolean mask passed to the env builder; removes divisibility constraints, but requires minor plumbing to deliver a per‑env mode flag.
+- (IMPORTANT) Need to keep in mind that the current code has one agent per game port (1-4) that performs batch inference for that port across all envs. We will need to come up with a solution to change this to handle the fact that each singles env will only want 2 ports worth of inference/agents, not 4.
 
 ### Rollout packaging & learner masks
 
 - Continue to build 4-port trajectories for every env as today.
 - Add `active_mask: np.ndarray[bool]` to `evaluators.Trajectory` with shape `[B]` (one boolean per batch column):
   - For doubles columns (p0,p1,p2,p3) → True.
-  - For singles columns → True for p0,p2; False for p1,p3.
+  - For singles columns → True for p0 and active opponent slot, False for p1, and inactive opponent slot.
 - Learner changes:
   - When computing PPO, first gather/slice all frame tensors, actions, advantages, and is_resetting using `active_mask` along the batch dimension.
   - Hidden-state sizing: compute the effective batch size at init as the sum of active columns from the dummy trajectory for the configured ratio (or infer per rollout and handle via masked slicing).
@@ -93,20 +95,7 @@ Risks in current implementation:
 
 ### Rewards and normalization
 
-- Add config:
-  - `learner.reward_singles: RewardConfig` (defaults to current values)
-  - `learner.reward_doubles: RewardConfig` (defaults to current values)
-  - `learner.reward_scale_singles: float = 1.0`
-  - `learner.reward_scale_doubles: float = 1.0`
-  - `learner.normalize_advantages_per_mode: bool = True`
-
-- Computation path:
-  1) Compute base rewards via `compute_rewards` as today.
-  2) Split batch columns by mode using `states.is_teams[0]`.
-  3) Apply per‑mode `RewardConfig` and optional scale.
-  4) Compute returns/advantages; if enabled, z‑normalize advantages per mode (zero mean, unit variance with epsilon).
-
-Note: A simple global multiplier (e.g., “divide by 2 in doubles while teammate alive”) is acceptable as `reward_scale_doubles=0.5`, but per‑mode configs + per‑mode advantage normalization is preferred for stability and clarity.
+- TODO: see if anything significant is still needed here or if configuring existing normalization setting is enough.
 
 ### Logging & metrics
 
@@ -116,45 +105,11 @@ Note: A simple global multiplier (e.g., “divide by 2 in doubles while teammate
 - Record active batch size per rollout for sanity.
 - Ensure `is_teams` is correct in states (fix singles to False).
 
-## Implementation Phases (minimal risky steps first)
-
-Phase 0 — Hardening + Visibility
-- Add `singles_fraction` to `ActorConfig`. Keep `enable_singles` as a deprecated alias that maps `False→0.0`, `True→0.5`.
-- Validate `singles_fraction` realizability for Option A (group-level) or implement Option B mask.
-- Fix `is_teams` for singles states in RL env path.
-- Add per‑mode logging and realized ratio reporting (no behavior change yet).
-
-Phase 1 — One-Dolphin Singles
-- Remove dual-Dolphin creation in `Environment` for singles; always one Dolphin per env.
-- In singles env, ignore controllers for `p1/p3` and synthesize dead placeholders in `current_state`.
-- Port provisioning: exactly `num_envs` UDP ports.
-
-Phase 2 — Active Mask & Learner Integration
-- Add `active_mask` to `evaluators.Trajectory` and plumb it from env metadata.
-- In the learner (`rl/learner.py`):
-  - Before PPO, mask batch columns in frames/actions/advantages by `active_mask`.
-  - Recompute effective batch size for init/hidden-state handling (or use masking-friendly init with maximum size and slice on use).
-
-Phase 3 — Reward Normalization
-- Add `reward_singles`, `reward_doubles`, `reward_scale_*`, and `normalize_advantages_per_mode` to the learner config.
-- Branch rewards/advantages per mode using `states.is_teams` or the env mask.
-
-Phase 4 — Tests
-- Provisioning tests (async path): for tuples `(num_envs, inner_batch_size, singles_fraction)` assert:
-  - Singles count matches request.
-  - Port count equals `num_envs`.
-  - First popped state shows correct `is_teams` mask.
-- Rollout tests:
-  - Short rollouts yield correct `active_mask` counts (2 per singles env, 4 per doubles env).
-  - Learner can complete PPO steps with mixed trajectories.
-  - Per‑mode logs present with non‑NaN values.
-
 ## Validation & Failure Modes to Guard
 
 - Hidden-state sizing mismatch: initialize using effective active batch size or slice on use.
 - Forgetting to ignore controllers for dead ports in singles env → controller send errors.
 - Ratio drift: enforce realizability or use per‑env mask; log realized ratio.
-- Sync envs: either explicitly unsupported for mixed mode or fully provisioned (one Dolphin per env always → simpler to support sync as well).
 - `is_teams` correctness: ensure False for singles; many features/metrics depend on it.
 - Reward scale skew: without per‑mode normalization/scales, one mode can dominate gradients.
 
@@ -167,45 +122,4 @@ Phase 4 — Tests
 - 25% singles, async, per‑env mask (Option B)
   - `num_envs=64`, `singles_fraction=0.25` → `singles_envs=16` assigned per env; no divisibility constraint.
 
-## Rollout & Performance Notes
-
-- With one Dolphin per env, singles no longer require extra processes; resource usage becomes linear in `num_envs` for any ratio.
-- Two inactive columns per singles env still flow through the actor; masking prevents their contribution to PPO, but we still pay some inference cost. Future optimization could skip running those agents entirely for singles envs.
-
-## File Touch Points (for implementation later)
-
-- Env layer: `slippi_ai/envs.py`
-  - Environment: single Dolphin per env (singles/doubles); ignore p1/p3 controllers in singles; set `is_teams` correctly.
-  - Batched/Async env builders: pass per‑env singles mask or enforce group-level ratio; allocate exactly `num_envs` ports.
-
-- Evaluator: `slippi_ai/evaluators.py`
-  - Add `active_mask` to `Trajectory` and construct it when batching trajectories across ports/envs.
-
-- RL runner: `slippi_ai/rl/run_lib.py`
-  - Add `ActorConfig.singles_fraction` and config validation.
-  - Extend logging to emit per‑mode metrics and realized ratio.
-
-- Learner: `slippi_ai/rl/learner.py`
-  - Accept `active_mask` and mask batch columns for PPO.
-  - Add reward config by mode and per‑mode advantage normalization.
-
-- Reward: `slippi_ai/reward.py`
-  - No core changes required; scaling is applied in learner prior to advantage computation. Optional: mode‑specific configs can be selected here if preferred.
-
-- Scripts: `scripts/rl_doubles.sh`
-  - New flag `--config.actor.singles_fraction=0.5` (keep old `enable_singles` as deprecated alias).
-
-## Open Questions
-
-- Do we want synchronous env support for mixed mode or make mixed mode async‑only for now? (Recommendation: async‑only initially.)
-- Should we skip building agents for inactive ports in singles to save inference compute? (Would require actor refactor; defer.)
-- Do we want to expose an automatic ratio annealing schedule (e.g., start with more doubles, then mix in singles)?
-
-## Next Steps (when we resume)
-
-1) Implement Phase 0 (config + logging + `is_teams` fix) and run a short smoke to collect per‑mode metrics with the current code.
-2) Implement Phase 1 (one Dolphin per env) and validate provisioning/ports; re‑run smoke tests.
-3) Implement Phase 2 (active_mask + learner masking); add minimal tests; confirm PPO runs with mixed data.
-4) Implement Phase 3 (per‑mode reward config/normalization) and verify gradient scales in logs.
-5) Land test suite additions and document launch guidance in `AGENTS.md`/scripts.
 
