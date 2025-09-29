@@ -122,11 +122,11 @@ Risks in current implementation:
 
 This supersedes the earlier outline. Steps will be executed sequentially, each with targeted validation before progressing.
 
-1. **Config plumbing for singles mix** (`slippi_ai/rl/run_lib.py`, `slippi_ai/rl/run.py`, launch scripts)
-   - Replace `enable_singles` with `singles_fraction` (float). Default to 0.5.
-   - Add a helper that, given `(num_envs, singles_fraction)`, returns a deterministic single/double mask (start with 50/50 split; honor odd counts by flooring and leaving one extra doubles env).
-   - Thread the mask through config serialization/deserialization and CLI flags. Update helper scripts to pass the new flag.
-   - Tests: unit test for the mask helper to verify counts/order; adjust any config round-trip tests.
+1. **Config plumbing for singles mix** (`slippi_ai/rl/run_lib.py`, `slippi_ai/rl/config_utils.py`, `slippi_ai/rl/run.py`, launch scripts)
+   - Replace `enable_singles` with `singles_fraction` (float). Default to 0.5 (reset to 0.0 in `DEFAULT_CONFIG`).
+   - Add a helper that, given `(num_envs, singles_fraction)`, returns a deterministic single/double mask (current implementation rounds to the nearest env count and marks the leading indices as singles; more flexible placement can come later).
+   - Thread the mask through config serialization/deserialization and CLI flags. Update helper scripts to pass the new flag. Until Step 2 lands, async actors still flip the legacy `enable_singles` flag internally but use the new mask for validation.
+   - Tests: unit test for the mask helper to verify counts/order and error handling; adjust any config round-trip tests.
 
 2. **Environment lifecycle refactor** (`slippi_ai/envs.py` and builders)
    - Refactor `SafeEnvironment`/`Environment` to run exactly one Dolphin per env regardless of mode; remove `slippi_port2` plumbing.

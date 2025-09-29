@@ -4,6 +4,7 @@ import itertools
 import logging
 import os
 import pickle
+import math
 import typing as tp
 
 import numpy as np
@@ -30,6 +31,7 @@ from slippi_ai import (
 from slippi_ai.types import Game
 from slippi_ai import value_function as vf_lib
 from slippi_ai.rl import learner as learner_lib
+from slippi_ai.rl.config_utils import compute_singles_mask
 
 field = lambda f: dataclasses.field(default_factory=f)
 
@@ -61,7 +63,7 @@ class ActorConfig:
   inner_batch_size: int = 1
   gpu_inference: bool = True
   use_fake_envs: bool = False
-  enable_singles: bool = False
+  singles_fraction: float = 0.5
 
 @dataclasses.dataclass
 class AgentConfig:
@@ -140,33 +142,34 @@ class Config:
 
 DEFAULT_CONFIG = Config()
 DEFAULT_CONFIG.dolphin.console_timeout = 30
+DEFAULT_CONFIG.actor.singles_fraction = 0.0
 
 CHARACTER_WEIGHTINGS = {
-      Character.FOX: 2000,
+      Character.FOX: 1000,
       Character.FALCO: 1000,
       Character.MARTH: 1000,
       Character.SHEIK: 1000,
       Character.PEACH: 1000,
       Character.CPTFALCON: 1000,
       Character.JIGGLYPUFF: 1000,
-      Character.PIKACHU: 200,
-      Character.YOSHI: 200,
-      Character.GANONDORF: 200,
-      Character.POPO: 100,
-      Character.SAMUS: 100,
-      Character.DK: 100,
-      Character.LUIGI: 100,
-      Character.DOC: 50,
-      Character.MARIO: 50,
-      Character.YLINK: 50,
-      Character.LINK: 50,
-      Character.GAMEANDWATCH: 50,
-      Character.NESS: 50,
-      Character.ROY: 50,
-      Character.MEWTWO: 50,
-      Character.PICHU: 50,
-      Character.BOWSER: 50,
-      Character.KIRBY: 50,
+      Character.PIKACHU: 1000,
+      Character.YOSHI: 1000,
+      Character.GANONDORF: 1000,
+      Character.POPO: 1000,
+      Character.SAMUS: 1000,
+      Character.DK: 1000,
+      Character.LUIGI: 1000,
+      Character.DOC: 1000,
+      Character.MARIO: 1000,
+      Character.YLINK: 1000,
+      Character.LINK: 1000,
+      Character.GAMEANDWATCH: 1000,
+      Character.NESS: 1000,
+      Character.ROY: 1000,
+      Character.MEWTWO: 1000,
+      Character.PICHU: 1000,
+      Character.BOWSER: 1000,
+      Character.KIRBY: 1000,
 }
 
 class LearnerManager:
@@ -403,6 +406,26 @@ def run(config: Config):
   #main_agent_kwargs['fake'] = True
   batch_size = config.actor.num_envs
 
+  singles_mask = compute_singles_mask(
+      config.actor.num_envs, config.actor.singles_fraction)
+  singles_envs = int(singles_mask.sum())
+  legacy_enable_singles = singles_envs > 0
+
+  if not config.actor.async_envs and legacy_enable_singles and singles_envs not in (config.actor.num_envs,):
+    raise ValueError(
+        'singles_fraction > 0 currently requires async_envs=True until '
+        'mixed-mode env support is fully implemented.')
+
+  if config.actor.async_envs and legacy_enable_singles:
+    if config.actor.num_envs % config.actor.inner_batch_size != 0:
+      raise ValueError('num_envs must be divisible by inner_batch_size for async envs.')
+    outer_batch_size = config.actor.num_envs // config.actor.inner_batch_size
+    expected_async_singles = math.ceil(outer_batch_size / 2) * config.actor.inner_batch_size
+    if singles_envs not in (expected_async_singles, config.actor.num_envs):
+      raise ValueError(
+          'singles_fraction value not yet supported until per-env mask '
+          'plumbing lands (Step 2).')
+
   if config.opponent.type is not OpponentType.SELF:
     raise NotImplementedError('Only self-play is currently supported.')
 
@@ -429,7 +452,7 @@ def run(config: Config):
     env_kwargs.update(
         num_steps=config.actor.num_env_steps,
         inner_batch_size=config.actor.inner_batch_size,
-        enable_singles=config.actor.enable_singles,
+        enable_singles=legacy_enable_singles,
     )
     print('num steps', config.actor.num_env_steps)
 
@@ -713,21 +736,7 @@ def run(config: Config):
 
     logging.info('Main training loop')
 
-    '''initial_weight = 0.001
-    final_weight = 0.0001
-    total_reduction_steps = 1000
-
-    initial_step = 400
-    final_step = initial_step + total_reduction_steps'''
-
     for i in range(config.runtime.max_step):
-      # anneal the kl_teacher_weight from initial_weight to final_weight over total_reduction_steps
-      '''if step >= initial_step and step < final_step:
-        config.learner.kl_teacher_weight = initial_weight - ((initial_weight - final_weight) / total_reduction_steps) * (step - initial_step)
-        print("lowered kl_teacher weight: ", config.learner.kl_teacher_weight)
-      elif step >= final_step:
-        config.learner.kl_teacher_weight = final_weight
-        print("using final kl_teacher weight: ", config.learner.kl_teacher_weight)'''
 
       with step_profiler:
         if i > 0 and reset_interval and i % reset_interval == 0:

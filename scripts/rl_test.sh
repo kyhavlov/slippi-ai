@@ -55,7 +55,7 @@ python slippi_ai/rl/run.py \
   --config.actor.ray_envs=False \
   --config.actor.num_env_steps=0 \
   --config.actor.gpu_inference=True \
-  --config.actor.enable_singles=True \
+  --config.actor.singles_fraction=0.5 \
   --config.agent.name="$NAME" \
   --config.agent.batch_steps=4 \
   --config.runtime.reset_every_n_steps=512 \

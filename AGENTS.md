@@ -52,7 +52,7 @@
 
 ### 3. Reinforcement Learning
 1. Start from imitation checkpoint (`--config.teacher` in `scripts/rl_doubles.sh:28`).
-2. Tune env counts / rollout length according to hardware; optional singles mix via `--config.actor.enable_singles`.
+2. Tune env counts / rollout length according to hardware; optional singles mix via `--config.actor.singles_fraction`.
 3. Self-play stats stream to wandb; checkpoints rotate under `experiments/rl/<tag>`.
 
 ### 4. Evaluation & Deployment

@@ -56,6 +56,11 @@ def get_leaf_flag(field_type: type, default: tp.Any) -> tp.Optional[ff.Item]:
 
 def is_leaf(type_: type) -> bool:
   type_ = maybe_undo_optional(type_)
+  if not isinstance(type_, type):
+    origin = tp.get_origin(type_)
+    if origin is dict or dataclasses.is_dataclass(origin):
+      return False
+    return True
   if issubclass(type_, dict) or dataclasses.is_dataclass(type_):
     return False
   return True
