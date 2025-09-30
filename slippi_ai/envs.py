@@ -35,9 +35,13 @@ DOUBLES_PORT_MAPPINGS: Mapping[int, list[int]] = {
 def is_initial_frame(gamestate: GameState) -> bool:
   return gamestate.frame == -123
 
+ActiveMask = Mapping[int, tp.Union[bool, np.bool_, np.ndarray]]
+
+
 class EnvOutput(tp.NamedTuple):
   gamestates: Mapping[int, Game]
   needs_reset: bool
+  active: ActiveMask
 
 def timeout(func, args=(), kwargs={}, timeout_duration=1, default=None):
   def handler(signum, frame):
@@ -121,36 +125,36 @@ class Environment:
       players: dict[Port, dolphin.Player],
       swap_ports: bool,
   ) -> None:
-    # Friendly team occupies ports 1 and 4; opponents occupy ports 2 and 3.
-    friendly_active = 1 if not swap_ports else 4
-    friendly_placeholder = 4 if friendly_active == 1 else 1
-    enemy_active = 2 if not swap_ports else 3
-    enemy_placeholder = 3 if enemy_active == 2 else 2
-
-    self._singles_friendly_port = friendly_active
-    self._singles_friendly_placeholder = friendly_placeholder
-    self._singles_enemy_port = enemy_active
-    self._singles_enemy_placeholder = enemy_placeholder
-    # Alternate opponent slot to keep representation balanced.
+    self._singles_friendly_port = 1
+    self._singles_friendly_placeholder = 2
+    self._singles_enemy_port = 3
+    self._singles_enemy_placeholder = 4
+    # Alternate opponent slot within the trajectory (p2 vs p3).
     self._singles_opponent_slot = 2 if not swap_ports else 3
 
     self.port_to_actual = {
-        friendly_active: 1,
-        friendly_placeholder: None,
-        enemy_active: 2,
-        enemy_placeholder: None,
+        self._singles_friendly_port: 1,
+        self._singles_friendly_placeholder: None,
+        self._singles_enemy_port: 2,
+        self._singles_enemy_placeholder: None,
     }
-    self.port_from_actual = {actual: port for port, actual in self.port_to_actual.items() if actual is not None}
+    self.port_from_actual = {
+        1: self._singles_friendly_port,
+        2: self._singles_enemy_port,
+    }
 
     actual_players = {
-        1: players[friendly_active],
-        2: players[enemy_active],
+        1: players[self._singles_friendly_port],
+        2: players[self._singles_enemy_port],
     }
 
     self._dolphin_kwargs = dict(dolphin_kwargs, players=actual_players)
     self._dolphin = dolphin.Dolphin(**self._dolphin_kwargs)
 
-  def _build_singles_games(self, gamestate: GameState) -> Mapping[int, Game]:
+  def _build_singles_games(
+      self,
+      gamestate: GameState,
+  ) -> tuple[Mapping[int, Game], dict[int, bool]]:
     if None in (
         self._singles_friendly_port,
         self._singles_friendly_placeholder,
@@ -182,7 +186,14 @@ class Environment:
         self._singles_enemy_placeholder: enemy_placeholder,
     }
 
-    return games
+    active = {
+        self._singles_friendly_port: True,
+        self._singles_friendly_placeholder: False,
+        self._singles_enemy_port: True,
+        self._singles_enemy_placeholder: False,
+    }
+
+    return games, active
 
   def stop(self):
     self._dolphin.stop()
@@ -202,10 +213,11 @@ class Environment:
           port: get_game(self._prev_state, ports)
           for port, ports in DOUBLES_PORT_MAPPINGS.items()
       }
+      active = {port: True for port in DOUBLES_PORT_MAPPINGS}
     else:
-      games = self._build_singles_games(self._prev_state)
+      games, active = self._build_singles_games(self._prev_state)
 
-    return EnvOutput(games, needs_reset)
+    return EnvOutput(games, needs_reset, active)
 
   def multi_current_state(self) -> list[EnvOutput]:
     return [self.current_state()]
@@ -367,13 +379,19 @@ class BatchedEnvironment:
       raise ValueError('singles_mask must match num_envs length.')
 
     envs: list[SafeEnvironment] = []
+    singles_toggle = False
     for i in range(num_envs):
       dolphin_kwargs_i = dolphin_kwargs.copy()
       dolphin_kwargs_i.update(slippi_port=slippi_ports[i])
       env_is_singles = bool(singles_mask[i]) if singles_mask is not None else False
+      if env_is_singles:
+        use_swap = singles_toggle
+        singles_toggle = not singles_toggle
+      else:
+        use_swap = swap_ports and i >= num_envs // 2
       env = SafeEnvironment(
           dolphin_kwargs_i, num_retries=num_retries, agent_names=agent_names[i],
-          swap_ports=swap_ports and i >= num_envs // 2,
+          swap_ports=use_swap,
           is_singles=env_is_singles)
       envs.append(env)
 
@@ -1095,6 +1113,7 @@ class FakeBatchedEnvironment:
     self._dummy_output = EnvOutput(
         gamestates={p: game for p in players},
         needs_reset=np.full([num_envs], False),
+        active={p: np.full([num_envs], True, dtype=np.bool_) for p in players},
     )
     self.num_steps = 1
     self._output_queue = collections.deque()
@@ -1155,6 +1174,7 @@ class ReplayBatchedEnvironment:
     output = EnvOutput(
         gamestates=gamestates,  # [B=1, T=1]
         needs_reset=batch.frames.is_resetting,  # [B=1, T=1]
+        active={p: np.full([self.batch_size], True, dtype=np.bool_) for p in self.players},
     )
     output = utils.map_nt(np.squeeze, output)  # []
     output = utils.map_nt(lambda x: np.tile(x, [self.batch_size]), output)

@@ -77,6 +77,10 @@ class EnvironmentModeTest(unittest.TestCase):
       self.assertTrue(placeholder_game.p0.is_dead)
       self.assertFalse(env_output.gamestates[env._singles_friendly_port].is_teams)
       self.assertFalse(env_output.gamestates[env._singles_enemy_port].is_teams)
+      self.assertTrue(env_output.active[env._singles_friendly_port])
+      self.assertFalse(env_output.active[env._singles_friendly_placeholder])
+      self.assertTrue(env_output.active[env._singles_enemy_port])
+      self.assertFalse(env_output.active[env._singles_enemy_placeholder])
 
       controllers = {port: mock.Mock() for port in range(1, 5)}
       env._step(controllers)
@@ -113,6 +117,7 @@ class EnvironmentModeTest(unittest.TestCase):
       for port in range(1, 5):
         self.assertIn(port, env_output.gamestates)
         self.assertTrue(env_output.gamestates[port].is_teams)
+        self.assertTrue(env_output.active[port])
 
       controllers = {port: mock.Mock() for port in range(1, 5)}
       env._step(controllers)

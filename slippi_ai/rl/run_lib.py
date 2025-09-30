@@ -296,6 +296,7 @@ def dummy_trajectory(
       delayed_actions=[
           eval_lib.dummy_sample_outputs(embed_controller, [batch_size])
       ] * policy.delay,
+      active_mask=np.full([batch_size], True, dtype=np.bool_),
   )
 
 

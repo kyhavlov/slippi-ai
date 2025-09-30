@@ -33,6 +33,7 @@ class Trajectory(tp.NamedTuple):
   is_resetting: bool  # [T+1, B]
   initial_state: policies.RecurrentState  # [B]
   delayed_actions: list[SampleOutputs]  # [D, B]
+  active_mask: np.ndarray  # [B]
 
   @classmethod
   def batch(cls, trajectories: list['Trajectory']) -> 'Trajectory':
@@ -45,6 +46,7 @@ class Trajectory(tp.NamedTuple):
         is_resetting=1,
         initial_state=0,
         delayed_actions=0,
+        active_mask=0,
     )
     return utils.map_nt(
         lambda axis, *ts: utils.concat_nest_nt(ts, axis),
@@ -191,6 +193,9 @@ class RolloutWorker:
         port: [] for port in self._agents
     }
     is_resetting: list[bool] = []
+    active_masks: dict[Port, np.ndarray | None] = {
+        port: None for port in self._agents
+    }
 
     # Record each agent's initial state at the beginning of the rollout.
     initial_states = {
@@ -207,6 +212,24 @@ class RolloutWorker:
       for port, game in env_output.gamestates.items():
         gamestates[port].append(game)
         sample_outputs[port].append(prev_agent_outputs[port])
+        mask_value = env_output.active[port]
+        mask_array = np.asarray(mask_value, dtype=np.bool_)
+        if mask_array.shape == ():
+          mask_array = np.full((self._num_envs,), bool(mask_array), dtype=np.bool_)
+        else:
+          # Ensure shape is [num_envs]
+          mask_array = mask_array.astype(np.bool_)
+          if mask_array.ndim != 1:
+            raise ValueError(
+                f'Active mask must be 1D; received shape {mask_array.shape}.')
+          if mask_array.shape[0] != self._num_envs:
+            raise ValueError(
+                f'Active mask shape {mask_array.shape} does not match '
+                f'num_envs {self._num_envs}')
+        if active_masks[port] is None:
+          active_masks[port] = mask_array
+        elif not np.array_equal(active_masks[port], mask_array):
+          raise ValueError('Active mask changed during rollout.')
       is_resetting.append(env_output.needs_reset)
 
     for _ in range(num_steps):
@@ -251,6 +274,8 @@ class RolloutWorker:
     trajectories = {}
     is_resetting = np.array(is_resetting)
     for port, agent in self._agents.items():
+      if active_masks[port] is None:
+        raise ValueError(f'Missing active mask for port {port}.')
       states=utils.batch_nest_nt(gamestates[port])
       trajectories[port] = Trajectory(
           # TODO: Let the learner call from_state on game
@@ -266,6 +291,7 @@ class RolloutWorker:
           # Note that delayed actions aren't time-concatenated, mainly to
           # simplify the case where the delay is 0.
           delayed_actions=delayed_actions[port],
+          active_mask=active_masks[port].copy(),
       )
 
     timings = {

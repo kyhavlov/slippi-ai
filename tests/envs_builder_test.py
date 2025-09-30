@@ -1,78 +1,113 @@
+import contextlib
+import types
 import unittest
 from unittest import mock
 
 import numpy as np
+from melee import Action, Character, Stage
 
 from slippi_ai import envs
+from slippi_db import parse_libmelee
+
+
+class _FakePlayerState:
+
+  def __init__(self, *, alive: bool, character: Character):
+    self.percent = 0.0 if alive else 999.0
+    self.facing = True
+    self.position = types.SimpleNamespace(x=0.0, y=0.0)
+    self.action = types.SimpleNamespace(value=0)
+    self.invulnerable = False
+    self.character = character
+    self.jumps_left = 2
+    self.shield_strength = 60.0
+    self.on_ground = True
+    self.stock = 4 if alive else 0
+    self.controller_state = types.SimpleNamespace(
+        main_stick=(0.0, 0.0),
+        c_stick=(0.0, 0.0),
+        l_shoulder=0.0,
+        button={button: False for button in parse_libmelee.LIBMELEE_BUTTONS.values()},
+    )
+    self.nana = None
+
+
+class FakeDolphin:
+
+  def __init__(self, players, **_kwargs):
+    del players
+    self.controllers = {port: mock.Mock(name=f'controller{port}') for port in range(1, 5)}
+
+  def step(self):
+    players = {
+        1: _FakePlayerState(alive=True, character=Character.FOX),
+        2: _FakePlayerState(alive=True, character=Character.FALCO),
+        3: _FakePlayerState(alive=True, character=Character.MARTH),
+        4: _FakePlayerState(alive=True, character=Character.SHEIK),
+    }
+    return types.SimpleNamespace(
+        frame=0,
+        stage=Stage.FINAL_DESTINATION,
+        players=players,
+    )
+
+  def stop(self):
+    pass
 
 
 class BatchedEnvironmentMaskTest(unittest.TestCase):
 
+  def _build_env(self, singles_mask):
+    stack = contextlib.ExitStack()
+    self.addCleanup(stack.close)
+    num_envs = len(singles_mask)
+    stack.enter_context(mock.patch.object(envs.dolphin, 'Dolphin', side_effect=FakeDolphin))
+    stack.enter_context(mock.patch.object(envs.match_reporting, 'match_is_over', return_value=False))
+    stack.enter_context(mock.patch.object(envs.utils, 'find_open_udp_ports', return_value=list(range(5000, 5000 + num_envs))))
+
+    players = {port: mock.Mock(name=f'player{port}') for port in range(1, 5)}
+    env = envs.BatchedEnvironment(
+        num_envs=num_envs,
+        dolphin_kwargs=dict(players=players),
+        agent_names=[('', '')] * num_envs,
+        singles_mask=singles_mask,
+    )
+    self.addCleanup(env.stop)
+    return env
+
   def test_batched_environment_respects_singles_mask(self):
-    singles_mask = [True, False]
-    received_modes = []
-    controller_logs = []
+    env = self._build_env([True, False])
+    output = env.current_state()
+    np.testing.assert_array_equal(output.active[1], np.array([True, True]))
+    np.testing.assert_array_equal(output.active[2], np.array([False, True]))
+    np.testing.assert_array_equal(output.active[3], np.array([True, True]))
+    np.testing.assert_array_equal(output.active[4], np.array([False, True]))
+    np.testing.assert_array_equal(output.needs_reset, np.array([False, False]))
 
-    class FakeSafeEnvironment:
+    games_port1 = output.gamestates[1]
+    np.testing.assert_array_equal(games_port1.p2.is_dead, np.array([False, False]))
+    np.testing.assert_array_equal(games_port1.p3.is_dead, np.array([True, False]))
 
-      def __init__(self, dolphin_kwargs, num_retries, agent_names, *, swap_ports, is_singles):
-        del dolphin_kwargs, num_retries, agent_names, swap_ports
-        self._is_singles = is_singles
-        self._index = len(received_modes)
-        received_modes.append(is_singles)
-        self.controllers_seen = []
+    self.assertTrue(env._envs[0]._env._is_singles)
+    self.assertFalse(env._envs[1]._env._is_singles)
+    self.assertEqual(env._envs[0]._env._singles_opponent_slot, 2)
 
-      def current_state(self):
-        base = 10 if self._is_singles else 20
-        gamestates = {port: base + port for port in range(1, 5)}
-        return envs.EnvOutput(gamestates=gamestates, needs_reset=False)
+  def test_batched_environment_balances_singles_opponent_slots(self):
+    env = self._build_env([True, True, False, False])
+    output = env.current_state()
+    np.testing.assert_array_equal(output.active[1], np.array([True, True, True, True]))
+    np.testing.assert_array_equal(output.active[2], np.array([False, False, True, True]))
+    np.testing.assert_array_equal(output.active[3], np.array([True, True, True, True]))
+    np.testing.assert_array_equal(output.active[4], np.array([False, False, True, True]))
 
-      def step(self, controllers):
-        self.controllers_seen.append(dict(controllers))
-        controller_logs.append(dict(controllers))
-        return self.current_state()
+    games_port1 = output.gamestates[1]
+    np.testing.assert_array_equal(games_port1.p2.is_dead, np.array([False, True, False, False]))
+    np.testing.assert_array_equal(games_port1.p3.is_dead, np.array([True, False, False, False]))
 
-      def multi_step(self, controllers):
-        return [self.step(c) for c in controllers]
-
-      def multi_current_state(self):
-        return [self.current_state()]
-
-      def stop(self):
-        pass
-
-    with (
-        mock.patch.object(envs, 'SafeEnvironment', side_effect=lambda *args, **kwargs: FakeSafeEnvironment(*args, **kwargs)),
-        mock.patch.object(envs.utils, 'find_open_udp_ports', return_value=[1000, 1001]),
-    ):
-      batched = envs.BatchedEnvironment(
-          num_envs=2,
-          dolphin_kwargs=dict(players={port: mock.Mock() for port in range(1, 5)}),
-          agent_names=[('', '')] * 2,
-          swap_ports=False,
-          singles_mask=singles_mask,
-      )
-
-      output = batched.current_state()
-
-      self.assertEqual(received_modes, [True, False])
-      for port in range(1, 5):
-        expected = np.array([10 + port, 20 + port])
-        self.assertTrue(np.array_equal(output.gamestates[port], expected), f'port {port}')
-      self.assertTrue(np.array_equal(output.needs_reset, np.array([False, False])))
-
-      controllers = {
-          port: np.array([port * 100 + 1, port * 100 + 2], dtype=np.int32)
-          for port in range(1, 5)
-      }
-      batched.step(controllers)
-
-      self.assertEqual(len(controller_logs), 2)
-      env0_controllers = controller_logs[0]
-      env1_controllers = controller_logs[1]
-      for port in range(1, 5):
-        self.assertEqual(env0_controllers[port], port * 100 + 1, f'env0 port {port}')
-        self.assertEqual(env1_controllers[port], port * 100 + 2, f'env1 port {port}')
+    self.assertEqual(env._envs[0]._env._singles_opponent_slot, 2)
+    self.assertEqual(env._envs[1]._env._singles_opponent_slot, 3)
+    self.assertFalse(env._envs[2]._env._is_singles)
+    self.assertFalse(env._envs[3]._env._is_singles)
 
   def test_async_environment_slices_mask_per_inner_batch(self):
     singles_mask = [True, False, True, False]

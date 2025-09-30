@@ -133,10 +133,10 @@ This supersedes the earlier outline. Steps will be executed sequentially, each w
    - Update batched/async/ray builders to iterate over the mask when instantiating environments. ✅
    - Tests: `tests/envs_environment_test.py` covers singles/doubles lifecycles, and `tests/envs_builder_test.py` checks mask plumbing and controller routing for batched/async envs. ✅
 
-3. **Activity metadata propagation** (`slippi_ai/envs.py`, `slippi_ai/evaluators.py`)
-   - Compute an `active_ports` boolean array per env (ports that represent real players) alongside the `Game` data.
-   - Extend `evaluators.Trajectory` with an `active_mask` (batch-major) and ensure `Trajectory.batch`/`dummy_trajectory` include it.
-   - Tests: unit test batching behavior for the mask (mix singles/doubles trajectories and check concatenation).
+3. **Activity metadata propagation** (`slippi_ai/envs.py`, `slippi_ai/evaluators.py`) — ✅ Completed 2025-09-30
+   - Compute an `active_ports` boolean array per env (ports that represent real players) alongside the `Game` data. ✅
+   - Extend `evaluators.Trajectory` with an `active_mask` (batch-major) and ensure `Trajectory.batch`/`dummy_trajectory` include it. ✅
+   - Tests: unit test batching behavior for the mask (mix singles/doubles trajectories and check concatenation). Added `tests/evaluators_rollout_test.py` plus builder/environment tests that exercise the real environment stack, confirm placeholders stay dead, and validate that singles trajectories alternate between `p2` and `p3` for the opponent. ✅
 
 4. **Actor/agent batching overhaul** (`slippi_ai/evaluators.py`, `slippi_ai/rl/run_lib.py`)
    - For each port, gather indices of envs where that port is active and instantiate `DelayedAgent` with that smaller batch size.
