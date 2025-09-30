@@ -11,7 +11,7 @@
 
 # What player(s) from the dataset should we condition on?
 # This can be a comma-separated list.
-NAME="Master Player,Cody"
+NAME="Master Player,Cody,Darkatma,Dragunov"
 D=21
 TAG=rl_doubles_delay_${D}_v2
 ROOTDIR=$(pwd)
@@ -49,14 +49,14 @@ python slippi_ai/rl/run.py \
   --config.opponent.train=True \
   --config.actor.rollout_length=60 \
   --config.actor.num_envs=2 \
-  --config.actor.inner_batch_size=2 \
+  --config.actor.inner_batch_size=1 \
   --config.actor.async_envs=True \
   --config.actor.num_env_steps=0 \
-  --config.actor.gpu_inference=True \
-  --config.actor.singles_fraction=0.0 \
+  --config.actor.gpu_inference=False \
+  --config.actor.singles_fraction=0.5 \
   --config.agent.name="$NAME" \
   --config.agent.batch_steps=4 \
-  --config.agent.jit_compile=True \
+  --config.agent.jit_compile=False \
   --config.runtime.reset_every_n_steps=512 \
   --config.runtime.burnin_steps_after_reset=1 \
   --config.optimizer_burnin_steps=0 \

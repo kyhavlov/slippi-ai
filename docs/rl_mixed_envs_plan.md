@@ -2,7 +2,7 @@
 
 Author: LLM planning pass on 2025-09-29
 
-Status: Planning only (no code changes yet)
+Status: Implementation in progress (Steps 1–2 complete)
 
 Scope: Enable robust RL training with a controllable mix of singles and doubles environments, targeting a default 50/50 trajectory split. Remove fragile multi-Dolphin-per-env behavior and make shapes, rewards, and logging explicitly support mixed-mode training.
 Much of the core of these changes will likely live in `slippi_ai/rl/run_lib.py` and `slippi_ai/envs.py`.
@@ -42,10 +42,9 @@ Much of the core of these changes will likely live in `slippi_ai/rl/run_lib.py` 
 
 ## Current State (what exists now)
 
-- Mixed mode is partially implemented only for async envs by flipping `enable_singles` on alternating inner groups. This uses two Dolphins per singles “env,” sharing one logical slot (fragile across resets and port allocation). See:
-  - `slippi_ai/envs.py` AsyncBatchedEnvironmentMP env building and `enable_singles and i % 2 == 0` logic.
-  - `Environment` creating two Dolphins when `enable_singles=True` (singles) and a single Dolphin when False (doubles).
-  - `parse_libmelee.get_game(...)` always sets `is_teams=True` in RL path (needs correction).
+- Config plumbing now exposes `singles_fraction` → per-env `singles_mask` in `run_lib` (Step 1 ✅ 2025-09-29).
+- Environment builders consume the mask and always launch one Dolphin per env; singles placeholders stay dead and `is_teams=False` (Step 2 ✅ 2025-09-29).
+- Evaluator/learner stacks still assume four active agents (pending Steps 3–5).
 - Evaluator and learner assume 4 ports and batch by concatenation; reward function already computes team-differences and works for both modes if singles are represented with placeholders.
 
 Risks in current implementation:
@@ -122,17 +121,17 @@ Risks in current implementation:
 
 This supersedes the earlier outline. Steps will be executed sequentially, each with targeted validation before progressing.
 
-1. **Config plumbing for singles mix** (`slippi_ai/rl/run_lib.py`, `slippi_ai/rl/config_utils.py`, `slippi_ai/rl/run.py`, launch scripts)
+1. **Config plumbing for singles mix** (`slippi_ai/rl/run_lib.py`, `slippi_ai/rl/config_utils.py`, `slippi_ai/rl/run.py`, launch scripts) — ✅ Completed 2025-09-29
    - Replace `enable_singles` with `singles_fraction` (float). Default to 0.5 (reset to 0.0 in `DEFAULT_CONFIG`).
    - Add a helper that, given `(num_envs, singles_fraction)`, returns a deterministic single/double mask (current implementation rounds to the nearest env count and marks the leading indices as singles; more flexible placement can come later).
-   - Thread the mask through config serialization/deserialization and CLI flags. Update helper scripts to pass the new flag. Until Step 2 lands, async actors still flip the legacy `enable_singles` flag internally but use the new mask for validation.
+   - Thread the mask through config serialization/deserialization and CLI flags. Update helper scripts to pass the new flag.
    - Tests: unit test for the mask helper to verify counts/order and error handling; adjust any config round-trip tests.
 
-2. **Environment lifecycle refactor** (`slippi_ai/envs.py` and builders)
-   - Refactor `SafeEnvironment`/`Environment` to run exactly one Dolphin per env regardless of mode; remove `slippi_port2` plumbing.
-   - Accept a per-env boolean (`is_singles`) and derive the correct controller/port wiring. For singles, ensure placeholder players are marked dead and ignored, and set `is_teams=False`.
-   - Update batched/async/ray builders to iterate over the mask when instantiating environments.
-   - Tests: lightweight fake-dolphin test ensuring singles envs create one Dolphin and produce 4-slot games with dead placeholders and `is_teams=False`.
+2. **Environment lifecycle refactor** (`slippi_ai/envs.py` and builders) — ✅ Completed 2025-09-29
+   - Refactor `SafeEnvironment`/`Environment` to run exactly one Dolphin per env regardless of mode; remove `slippi_port2` plumbing. ✅
+   - Accept a per-env boolean (`is_singles`) and derive the correct controller/port wiring. Singles envs now zero out inactive controllers, keep placeholders dead, and set `is_teams=False`. ✅
+   - Update batched/async/ray builders to iterate over the mask when instantiating environments. ✅
+   - Tests: `tests/envs_environment_test.py` covers singles/doubles lifecycles, and `tests/envs_builder_test.py` checks mask plumbing and controller routing for batched/async envs. ✅
 
 3. **Activity metadata propagation** (`slippi_ai/envs.py`, `slippi_ai/evaluators.py`)
    - Compute an `active_ports` boolean array per env (ports that represent real players) alongside the `Game` data.

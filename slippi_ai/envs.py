@@ -32,13 +32,6 @@ DOUBLES_PORT_MAPPINGS: Mapping[int, list[int]] = {
     4: (4, 1, 3, 2),
 }
 
-SINGLES_PORT_MAPPINGS: Mapping[int, list[int]] = {
-    1: (1, 2),
-    2: (2, 1),
-    3: (1, 2),
-    4: (2, 1),
-}
-
 def is_initial_frame(gamestate: GameState) -> bool:
   return gamestate.frame == -123
 
@@ -71,90 +64,146 @@ class Environment:
       agent_names: tuple[str, str] = [],
       swap_ports: bool = False,
       check_controller_outputs: bool = False,
-      enable_singles: bool = False,
+      is_singles: bool = False,
   ):
     players: dict[Port, dolphin.Player] = dolphin_kwargs['players']
     if len(players) != 4:
       raise ValueError('Environment requires exactly 4 players.')
-    
+
     print("Creating environment on", socket.gethostname(), "with slippi_port:", dolphin_kwargs.get('slippi_port'))
     self._agent_names = agent_names
     print("agent_names in base env: ", self._agent_names)
-    self._enable_singles = enable_singles
+    self._is_singles = is_singles
     self._env_port = dolphin_kwargs.get('slippi_port')
 
+    self._current_characters = []
+    self._dead_frame = {port: 0 for port in players}
+
+    if not is_singles:
+      self._configure_doubles(dolphin_kwargs, players, swap_ports)
+    else:
+      self._configure_singles(dolphin_kwargs, players, swap_ports)
+
+    self._prev_state: Optional[GameState] = None
+
+  def _configure_doubles(
+      self,
+      dolphin_kwargs: dict,
+      players: dict[Port, dolphin.Player],
+      swap_ports: bool,
+  ) -> None:
     ports = list(players)
     actual_ports = list(reversed(ports)) if swap_ports else ports
-    self.port_to_actual = dict(zip(ports, actual_ports))
+    self.port_to_actual: dict[int, Optional[int]] = dict(zip(ports, actual_ports))
     self.port_from_actual = dict(zip(actual_ports, ports))
-    self._current_characters = []
 
     actual_players = {
         actual_port: players[port]
         for port, actual_port in self.port_to_actual.items()
     }
 
-    #print("actual_ports: ", actual_ports)
-    #print("actual_players: ", actual_players)
-    '''import random
-    self.test_freeze = False
-    if random.random() < 0.5:
-      self.test_freeze = True
-      print("test_freeze: ", self.test_freeze)'''
+    self._dolphin_kwargs = dict(
+        dolphin_kwargs,
+        players=actual_players,
+        desired_teams={1: 0, 2: 1, 3: 1, 4: 0},
+    )
+    self._dolphin = dolphin.Dolphin(**self._dolphin_kwargs)
 
-    if not enable_singles:
-      self._dolphin1_kwargs = dict(dolphin_kwargs, 
-                                  players=actual_players,
-                                  desired_teams={1: 0, 2: 1, 3: 1, 4: 0})
-      self._dolphin = dolphin.Dolphin(**self._dolphin1_kwargs)
-    else:
-      slippi_port2 = dolphin_kwargs.get('slippi_port2')
-      dolphin_kwargs.pop('slippi_port2', None)  # remove slippi_port2 from dolphin_kwargs
+    self._singles_friendly_port: Optional[int] = None
+    self._singles_friendly_placeholder: Optional[int] = None
+    self._singles_enemy_port: Optional[int] = None
+    self._singles_enemy_placeholder: Optional[int] = None
+    self._singles_opponent_slot: Optional[int] = None
 
-      self._dolphin1_kwargs = dict(dolphin_kwargs, players={1: players[1], 2: players[2]})
-      self._dolphin = dolphin.Dolphin(**self._dolphin1_kwargs)
-      dolphin_kwargs.update(slippi_port=slippi_port2)
-      self._dolphin2_kwargs = dict(dolphin_kwargs, players={1: players[3], 2: players[4]})
-      self._dolphin2 = dolphin.Dolphin(**self._dolphin2_kwargs)
+  def _configure_singles(
+      self,
+      dolphin_kwargs: dict,
+      players: dict[Port, dolphin.Player],
+      swap_ports: bool,
+  ) -> None:
+    # Friendly team occupies ports 1 and 4; opponents occupy ports 2 and 3.
+    friendly_active = 1 if not swap_ports else 4
+    friendly_placeholder = 4 if friendly_active == 1 else 1
+    enemy_active = 2 if not swap_ports else 3
+    enemy_placeholder = 3 if enemy_active == 2 else 2
 
-    self._dead_frame = {port: 0 for port in ports}
+    self._singles_friendly_port = friendly_active
+    self._singles_friendly_placeholder = friendly_placeholder
+    self._singles_enemy_port = enemy_active
+    self._singles_enemy_placeholder = enemy_placeholder
+    # Alternate opponent slot to keep representation balanced.
+    self._singles_opponent_slot = 2 if not swap_ports else 3
 
-    self._prev_state: Optional[GameState] = None
-    self._prev_state2: Optional[GameState] = None
+    self.port_to_actual = {
+        friendly_active: 1,
+        friendly_placeholder: None,
+        enemy_active: 2,
+        enemy_placeholder: None,
+    }
+    self.port_from_actual = {actual: port for port, actual in self.port_to_actual.items() if actual is not None}
+
+    actual_players = {
+        1: players[friendly_active],
+        2: players[enemy_active],
+    }
+
+    self._dolphin_kwargs = dict(dolphin_kwargs, players=actual_players)
+    self._dolphin = dolphin.Dolphin(**self._dolphin_kwargs)
+
+  def _build_singles_games(self, gamestate: GameState) -> Mapping[int, Game]:
+    if None in (
+        self._singles_friendly_port,
+        self._singles_friendly_placeholder,
+        self._singles_enemy_port,
+        self._singles_enemy_placeholder,
+        self._singles_opponent_slot,
+    ):
+      raise ValueError('Singles configuration not initialized correctly.')
+
+    ally_game = get_game(
+        gamestate,
+        (1, 2),
+        singles_opponent_port=self._singles_opponent_slot,
+    )
+    enemy_slot = 3 if self._singles_opponent_slot == 2 else 2
+    enemy_game = get_game(
+        gamestate,
+        (2, 1),
+        singles_opponent_port=enemy_slot,
+    )
+
+    ally_placeholder = ally_game._replace(p0=ally_game.p1)
+    enemy_placeholder = enemy_game._replace(p0=enemy_game.p1)
+
+    games = {
+        self._singles_friendly_port: ally_game,
+        self._singles_friendly_placeholder: ally_placeholder,
+        self._singles_enemy_port: enemy_game,
+        self._singles_enemy_placeholder: enemy_placeholder,
+    }
+
+    return games
 
   def stop(self):
     self._dolphin.stop()
-    if self._enable_singles:
-      self._dolphin2.stop()
 
   def start(self):
-    self._dolphin = dolphin.Dolphin(**self._dolphin1_kwargs)
-    if self._enable_singles:
-      self._dolphin2 = dolphin.Dolphin(**self._dolphin2_kwargs)
+    self._dolphin = dolphin.Dolphin(**self._dolphin_kwargs)
+    self._prev_state = None
 
   def current_state(self) -> EnvOutput:
     if self._prev_state is None:
       self._prev_state = self._dolphin.step()
 
-    if self._prev_state2 is None and self._enable_singles:
-      self._prev_state2 = self._dolphin2.step()
+    needs_reset = is_initial_frame(self._prev_state)
 
-    needs_reset = is_initial_frame(self._prev_state) or \
-        (self._enable_singles and is_initial_frame(self._prev_state2))
-
-    games = {}
-    
-    # return one game per port in DOUBLES_PORT_MAPPINGS
-    if not self._enable_singles:
-      for port, ports in DOUBLES_PORT_MAPPINGS.items():
-        games[port] = get_game(self._prev_state, ports)
+    if not self._is_singles:
+      games = {
+          port: get_game(self._prev_state, ports)
+          for port, ports in DOUBLES_PORT_MAPPINGS.items()
+      }
     else:
-      for port, ports in SINGLES_PORT_MAPPINGS.items():
-        actual_port = self.port_to_actual[port]
-        singles_opponent_port = 2 if port < 3 else 3
-        games[port] = get_game(self._prev_state if actual_port <= 2 else self._prev_state2, ports, singles_opponent_port)
-
-    #print("current_state keys: ", self._enable_singles, games.keys())
+      games = self._build_singles_games(self._prev_state)
 
     return EnvOutput(games, needs_reset)
 
@@ -163,24 +212,21 @@ class Environment:
   
   def _step(self, controllers: Controllers) -> EnvOutput:
     """Send controllers for each AI. Return the next state."""
-    if not self._enable_singles:
+    if not self._is_singles:
       for port, controller in controllers.items():
         actual_port = self.port_to_actual[port]
         send_controller(self._dolphin.controllers[actual_port], controller)
     else:
       for port, controller in controllers.items():
-        actual_port = self.port_to_actual[port]
-        if actual_port <= 2:
-          send_controller(self._dolphin.controllers[actual_port], controller)
-        else:
-          send_controller(self._dolphin2.controllers[actual_port-2], controller)
+        actual_port = self.port_to_actual.get(port)
+        if actual_port is None:
+          continue
+        send_controller(self._dolphin.controllers[actual_port], controller)
 
     game_was_over = False if self._prev_state is None else match_reporting.match_is_over(self._prev_state)
 
     # TODO: compute reward?
     self._prev_state = self._dolphin.step()
-    if self._enable_singles:
-      self._prev_state2 = self._dolphin2.step()
 
     if self._prev_state.frame == 1:
       self._current_characters = [player.character for player in self._prev_state.players.values()]
@@ -189,7 +235,7 @@ class Environment:
       match_reporting.submit_match(self._prev_state, self._agent_names, self._current_characters)
 
     # stock stealing hack
-    if not self._enable_singles:
+    if not self._is_singles:
       for port, controller in controllers.items():
         player_port = port
         teammate_port = DOUBLES_PORT_MAPPINGS[port][1]
@@ -309,26 +355,26 @@ class BatchedEnvironment:
       num_retries: int = 2,
       agent_names: list[tuple[str, str]] = [],
       swap_ports: bool = True,  # Swap ports on half of the environments.
-      enable_singles: bool = False,  # Enable singles mode for half the envs
+      singles_mask: Optional[tp.Sequence[bool]] = None,
   ):
     self._dolphin_kwargs = dolphin_kwargs
     slippi_ports = slippi_ports or utils.find_open_udp_ports(num_envs)
 
     if swap_ports and num_envs % 2 != 0:
       raise ValueError('swap_ports=True requires an even number of environments.')
-    
-    print("batched env, enable_singles: ", enable_singles, "slippi_ports: ", slippi_ports)
+
+    if singles_mask is not None and len(singles_mask) != num_envs:
+      raise ValueError('singles_mask must match num_envs length.')
 
     envs: list[SafeEnvironment] = []
     for i in range(num_envs):
       dolphin_kwargs_i = dolphin_kwargs.copy()
       dolphin_kwargs_i.update(slippi_port=slippi_ports[i])
-      if enable_singles:
-        dolphin_kwargs_i.update(slippi_port2=slippi_ports[i*2 + 1])
+      env_is_singles = bool(singles_mask[i]) if singles_mask is not None else False
       env = SafeEnvironment(
           dolphin_kwargs_i, num_retries=num_retries, agent_names=agent_names[i],
           swap_ports=swap_ports and i >= num_envs // 2,
-          enable_singles=enable_singles)
+          is_singles=env_is_singles)
       envs.append(env)
 
     self._envs = envs
@@ -394,6 +440,7 @@ def build_environment(
     slippi_ports: Optional[list[int]] = None,
     num_retries: int = 2,
     agent_names: list[tuple[str, str]] = [],
+    singles_mask: Optional[tp.Sequence[bool]] = None,
     **env_kwargs,
 ) -> tp.Union[SafeEnvironment, BatchedEnvironment]:
   if num_envs == 0:
@@ -401,11 +448,26 @@ def build_environment(
       assert len(slippi_ports) == 1
       dolphin_kwargs = dolphin_kwargs.copy()
       dolphin_kwargs['slippi_port'] = slippi_ports[0]
-    return SafeEnvironment(dolphin_kwargs, num_retries=num_retries, agent_names=agent_names[0], **env_kwargs)
+    env_kwargs = env_kwargs.copy()
+    is_singles = bool(singles_mask[0]) if singles_mask else env_kwargs.pop('is_singles', False)
+    env_kwargs['is_singles'] = is_singles
+    return SafeEnvironment(
+        dolphin_kwargs,
+        num_retries=num_retries,
+        agent_names=agent_names[0],
+        **env_kwargs,
+    )
 
   # BatchedEnvironment uses SafeEnvironment internally
   return BatchedEnvironment(
-      num_envs, dolphin_kwargs, slippi_ports, num_retries, agent_names, **env_kwargs)
+      num_envs,
+      dolphin_kwargs,
+      slippi_ports,
+      num_retries,
+      agent_names,
+      singles_mask=singles_mask,
+      **env_kwargs,
+  )
 
 def _run_env(
     build_env_kwargs: dict,
@@ -465,6 +527,7 @@ class AsyncEnvMP:
       num_retries: int = 2,
       batch_time: bool = False,
       agent_names: list[tuple[str, str]] = [],
+      singles_mask: Optional[tp.Sequence[bool]] = None,
       **env_kwargs,
   ):
     context = mp.get_context('forkserver')
@@ -477,6 +540,7 @@ class AsyncEnvMP:
         slippi_ports=slippi_ports,
         num_retries=num_retries,
         agent_names=agent_names,
+        singles_mask=singles_mask,
         **env_kwargs,
     )
     # self._stop = mp.Event()
@@ -569,7 +633,7 @@ class AsyncBatchedEnvironmentMP:
       inner_batch_size: int = 1,
       num_retries: int = 2,
       swap_ports: bool = True,
-      enable_singles: bool = False, # Enable singles mode for half the envs
+      singles_mask: Optional[tp.Sequence[bool]] = None,
       agent_names: list[tuple[str, str]] = [],
   ):
     if num_envs % inner_batch_size != 0:
@@ -580,6 +644,9 @@ class AsyncBatchedEnvironmentMP:
     if swap_ports and inner_batch_size % 2 != 0:
       raise ValueError('swap_ports=True requires an even inner_batch_size.')
 
+    if singles_mask is not None and len(singles_mask) != num_envs:
+      raise ValueError('singles_mask must match num_envs length.')
+
     self._total_batch_size = num_envs
     self._outer_batch_size = num_envs // inner_batch_size
     self._inner_batch_size = inner_batch_size
@@ -588,7 +655,7 @@ class AsyncBatchedEnvironmentMP:
     self._dolphin_kwargs = dolphin_kwargs
 
     self._envs: list[AsyncEnvMP] = []
-    slippi_ports = utils.find_open_udp_ports(num_envs + num_envs // 2)
+    slippi_ports = utils.find_open_udp_ports(num_envs)
     print("slippi ports: ", slippi_ports)
     print("agent names: ", agent_names)
 
@@ -598,6 +665,10 @@ class AsyncBatchedEnvironmentMP:
       # take the slice of names for the envs in this AsyncEnvMP
       env_agent_names = agent_names[i * inner_batch_size:(i + 1) * inner_batch_size]
 
+      env_singles_mask = None
+      if singles_mask is not None:
+        env_singles_mask = singles_mask[i * inner_batch_size:(i + 1) * inner_batch_size]
+
       env = AsyncEnvMP(
           dolphin_kwargs=dolphin_kwargs,
           num_envs=inner_batch_size,
@@ -605,7 +676,7 @@ class AsyncBatchedEnvironmentMP:
           slippi_ports=env_ports,
           num_retries=num_retries,
           swap_ports=swap_ports,
-          enable_singles=enable_singles and i % 2 == 0,
+          singles_mask=env_singles_mask,
           agent_names=env_agent_names,
       )
       self._envs.append(env)

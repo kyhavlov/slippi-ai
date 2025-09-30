@@ -95,6 +95,7 @@ def get_game(
     singles_opponent_port: int = 2,
 ) -> Game:
   ports = ports or sorted(game.players)
+  is_singles = len(ports) == 2
   
   assert singles_opponent_port == 2 or singles_opponent_port == 3, \
       f"Invalid singles_opponent_port: {singles_opponent_port}. Must be 2 or 3."
@@ -119,7 +120,7 @@ def get_game(
     print("================== NO PLAYERS LEFT IN GAME ====================")
 
   # For singles mode, create a proper 4-player structure
-  if len(ports) == 2:
+  if is_singles:
     #print(f"Creating dummy players for singles mode - current players: {list(players.keys())}")
     
     # Create a dead player for empty slots
@@ -150,7 +151,7 @@ def get_game(
           y=np.float32(0.0),
       ),
       items=Items(**{f'item_{i}': _EMPTY_ITEM for i in range(len(Items._fields))}),
-      is_teams=True,
+      is_teams=not is_singles,
       **players,
   )
 

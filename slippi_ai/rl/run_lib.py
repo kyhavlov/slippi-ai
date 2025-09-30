@@ -4,7 +4,6 @@ import itertools
 import logging
 import os
 import pickle
-import math
 import typing as tp
 
 import numpy as np
@@ -408,23 +407,10 @@ def run(config: Config):
 
   singles_mask = compute_singles_mask(
       config.actor.num_envs, config.actor.singles_fraction)
-  singles_envs = int(singles_mask.sum())
-  legacy_enable_singles = singles_envs > 0
 
-  if not config.actor.async_envs and legacy_enable_singles and singles_envs not in (config.actor.num_envs,):
-    raise ValueError(
-        'singles_fraction > 0 currently requires async_envs=True until '
-        'mixed-mode env support is fully implemented.')
-
-  if config.actor.async_envs and legacy_enable_singles:
+  if config.actor.async_envs:
     if config.actor.num_envs % config.actor.inner_batch_size != 0:
       raise ValueError('num_envs must be divisible by inner_batch_size for async envs.')
-    outer_batch_size = config.actor.num_envs // config.actor.inner_batch_size
-    expected_async_singles = math.ceil(outer_batch_size / 2) * config.actor.inner_batch_size
-    if singles_envs not in (expected_async_singles, config.actor.num_envs):
-      raise ValueError(
-          'singles_fraction value not yet supported until per-env mask '
-          'plumbing lands (Step 2).')
 
   if config.opponent.type is not OpponentType.SELF:
     raise NotImplementedError('Only self-play is currently supported.')
@@ -447,12 +433,14 @@ def run(config: Config):
     )
     print("port names: ", i, agent_kwargs[i]['name'])
 
-  env_kwargs = dict(swap_ports=False)
+  env_kwargs = dict(
+      swap_ports=False,
+      singles_mask=singles_mask.tolist(),
+  )
   if config.actor.async_envs:
     env_kwargs.update(
         num_steps=config.actor.num_env_steps,
         inner_batch_size=config.actor.inner_batch_size,
-        enable_singles=legacy_enable_singles,
     )
     print('num steps', config.actor.num_env_steps)
 
