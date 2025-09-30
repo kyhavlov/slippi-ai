@@ -1,6 +1,7 @@
 """Calculate rewards."""
 
 import dataclasses
+from typing import Optional
 from typing import Sequence
 
 import numpy as np
@@ -161,8 +162,8 @@ class RewardConfig:
   stalling_penalty: float = 0  # per second
   zelda_penalty: float = 0  # per frame
   team_size_normalization: bool = True
-  singles_scale: float | None = None
-  doubles_scale: float | None = None
+  singles_scale: Optional[float] = None
+  doubles_scale: Optional[float] = None
   weight_deaths_by_percent: bool = True
 
 
@@ -316,8 +317,8 @@ def compute_rewards(
     stalling_penalty: float = 0,
     zelda_penalty: float = 0,
     team_size_normalization: bool = True,
-    singles_scale: float | None = None,
-    doubles_scale: float | None = None,
+    singles_scale: Optional[float] = None,
+    doubles_scale: Optional[float] = None,
     weight_deaths_by_percent: bool = True,
 ) -> np.ndarray:
   """Compute per-frame rewards for the main team (ports 0/1) vs. opponents."""
