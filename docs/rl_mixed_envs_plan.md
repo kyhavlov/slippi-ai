@@ -138,11 +138,11 @@ This supersedes the earlier outline. Steps will be executed sequentially, each w
    - Extend `evaluators.Trajectory` with an `active_mask` (batch-major) and ensure `Trajectory.batch`/`dummy_trajectory` include it. ✅
    - Tests: unit test batching behavior for the mask (mix singles/doubles trajectories and check concatenation). Added `tests/evaluators_rollout_test.py` plus builder/environment tests that exercise the real environment stack, confirm placeholders stay dead, and validate that singles trajectories alternate between `p2` and `p3` for the opponent. ✅
 
-4. **Actor/agent batching overhaul** (`slippi_ai/evaluators.py`, `slippi_ai/rl/run_lib.py`)
-   - For each port, gather indices of envs where that port is active and instantiate `DelayedAgent` with that smaller batch size.
-   - Before calling `agent.push`, slice env states/needs_reset to the active indices; after inference, scatter controllers back, filling inactive slots with neutral inputs.
-   - Keep nametag batching aligned with the same index lists.
-   - Tests: fake-agent test confirming inactive ports never trigger inference and controller scatter preserves zeros.
+4. **Actor/agent batching overhaul** (`slippi_ai/evaluators.py`, `slippi_ai/rl/run_lib.py`) — ✅ Completed 2025-09-30
+   - Rollout workers now compute per-port active masks from the env, build delayed agents only for live logical ports, and maintain neutral controller templates for placeholders. ✅
+   - Added slice/scatter utilities so agents only see their active env indices and controller outputs are expanded back to the full batch before hitting the environment. ✅
+   - Integration tests cover mixed singles/doubles batches, including mid-batch gaps (`tests/evaluators_rollout_test.py`). ✅
+   - Learned that TF tensors must be normalized to NumPy before copying; the helper pipeline (`_sample_to_numpy` / `_structure_to_numpy`) is in place and should be reused if later steps need similar handling. **Important for Step 5:** the learner will receive `Trajectory.active_mask` with NumPy/boolean arrays that exactly match the port batching performed here; rely on those instead of recomputing anything.
 
 5. **Learner pipeline masking** (`slippi_ai/rl/run_lib.py`, `slippi_ai/rl/learner.py`)
    - Derive the effective batch size from the mask and initialize learner hidden states accordingly.

@@ -13,7 +13,7 @@
 # This can be a comma-separated list.
 NAME="Master Player,Cody,Darkatma,Dragunov"
 D=21
-TAG=rl_doubles_delay_${D}_v2
+TAG=rl_doubles_delay_mixedtest
 ROOTDIR=$(pwd)
 #DOLPHIN_PATH="$ROOTDIR/Slippi_Online-x86_64-ExiAI.AppImage"
 DOLPHIN_PATH="$ROOTDIR/Slippi_Netplay_Mainline_NoGui-x86_64.AppImage"
@@ -44,15 +44,15 @@ python slippi_ai/rl/run.py \
   --config.learner.ppo.beta=3e-1 \
   --config.learner.ppo.epsilon=1e-2 \
   --config.learner.ppo.minibatched=False \
-  --config.teacher="$ROOTDIR/testnew.pkl" \
+  --config.teacher="$ROOTDIR/testnew2.pkl" \
   --config.opponent.type=self \
   --config.opponent.train=True \
   --config.actor.rollout_length=60 \
   --config.actor.num_envs=2 \
   --config.actor.inner_batch_size=1 \
   --config.actor.async_envs=True \
-  --config.actor.num_env_steps=0 \
-  --config.actor.gpu_inference=False \
+  --config.actor.num_env_steps=4 \
+  --config.actor.gpu_inference=True \
   --config.actor.singles_fraction=0.5 \
   --config.agent.name="$NAME" \
   --config.agent.batch_steps=4 \
