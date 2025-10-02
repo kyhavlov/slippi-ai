@@ -2,7 +2,7 @@
 
 Author: LLM planning pass on 2025-09-29
 
-Status: Implementation in progress (Steps 1–2 complete)
+Status: Implementation in progress (Steps 1–5 complete)
 
 Scope: Enable robust RL training with a controllable mix of singles and doubles environments, targeting a default 50/50 trajectory split. Remove fragile multi-Dolphin-per-env behavior and make shapes, rewards, and logging explicitly support mixed-mode training.
 Much of the core of these changes will likely live in `slippi_ai/rl/run_lib.py` and `slippi_ai/envs.py`.
@@ -144,11 +144,12 @@ This supersedes the earlier outline. Steps will be executed sequentially, each w
    - Integration tests cover mixed singles/doubles batches, including mid-batch gaps (`tests/evaluators_rollout_test.py`). ✅
    - Learned that TF tensors must be normalized to NumPy before copying; the helper pipeline (`_sample_to_numpy` / `_structure_to_numpy`) is in place and should be reused if later steps need similar handling. **Important for Step 5:** the learner will receive `Trajectory.active_mask` with NumPy/boolean arrays that exactly match the port batching performed here; rely on those instead of recomputing anything.
 
-5. **Learner pipeline masking** (`slippi_ai/rl/run_lib.py`, `slippi_ai/rl/learner.py`)
-   - Derive the effective batch size from the mask and initialize learner hidden states accordingly.
-   - Introduce utilities to slice trajectory tensors by the mask before computing PPO/value updates.
-   - Ensure checkpoints capture any additional mask metadata if necessary.
-   - Tests: synthetic-trajectory learner test comparing masked vs manually pre-sliced runs.
+5. **Learner pipeline masking** (`slippi_ai/rl/run_lib.py`, `slippi_ai/rl/learner.py`) — ✅ Completed 2025-09-30
+   - LearnerManager now queries the actor for a flattened active-mask signature before burn-in, initializes hidden state with the exact active-port count, and asserts that future rollouts preserve that mask.
+   - Added `_mask_trajectory` utilities in `learner.py` that slice every trajectory field (states, actions, rewards, delayed actions, initial state) down to active columns before unrolls, PPO grads, or initialization. Inactive slots are never passed through the networks or optimizers.
+   - Trajectories consumed by the learner now report `active_mask` as all-True after slicing; downstream metrics must rely on game metadata (e.g., `Game.is_teams`) rather than raw mask positions for per-mode analysis.
+   - Tests: `tests/learner_masking_test.py` builds real policies/value networks, injects distinct placeholder data, and proves masked vs manually pre-sliced trajectories produce identical unroll outputs, PPO gradients, and metrics. Use this as a template for future learner-side regression tests.
+   - Notes for Step 6+: per-mode logging should derive singles/doubles membership from the masked trajectory content (e.g., `states.is_teams`) since the learner’s `active_mask` no longer encodes original port placement.
 
 6. **Metrics and logging updates** (`slippi_ai/rl/run_lib.py`)
    - Log realized singles ratio, per-mode reward mean/std, per-mode PPO metrics (actor_kl, teacher_kl, UEV), and effective active batch size during flushes.

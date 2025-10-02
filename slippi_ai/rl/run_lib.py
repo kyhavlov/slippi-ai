@@ -189,11 +189,10 @@ class LearnerManager:
     self._enemy_port = enemy_port
     self._num_ppo_batches = config.learner.ppo.num_batches
     self._burnin_steps_after_reset = config.runtime.burnin_steps_after_reset
-
-    batch_size = config.actor.num_envs
-    if config.opponent.should_train():
-      batch_size *= 4
-    self._hidden_state = learner.initial_state(batch_size)
+    self._port_order = [1, 2, 3, 4]
+    self._active_mask = None
+    self._active_count = None
+    self._hidden_state = None
 
     self.update_profiler = utils.Profiler(burnin=0)
     self.learner_profiler = utils.Profiler()
@@ -202,6 +201,11 @@ class LearnerManager:
 
     with self.reset_profiler:
       self.actor = self._build_actor()
+      self._active_mask = self.actor.get_flat_active_mask(self._port_order)
+      self._active_count = int(np.sum(self._active_mask, dtype=np.int64))
+      if self._active_count == 0:
+        raise ValueError('Learner requires at least one active port.')
+      self._hidden_state = learner.initial_state(self._active_count)
       self.actor.start()
 
       for _ in range(self._burnin_steps_after_reset):
@@ -210,6 +214,9 @@ class LearnerManager:
   def reset_env(self):
     with self.reset_profiler:
       self.actor.reset_env()
+      new_mask = self.actor.get_flat_active_mask(self._port_order)
+      if not np.array_equal(new_mask, self._active_mask):
+        raise ValueError('Active mask changed after environment reset.')
 
       for _ in range(self._burnin_steps_after_reset):
         self.unroll()
@@ -217,9 +224,10 @@ class LearnerManager:
   def _rollout(self) -> tuple[evaluators.Trajectory, dict]:
     trajectories, timings = self.actor.rollout(self._unroll_length)
 
-    ports = [1, 2, 3, 4]
-    trajectories = [trajectories[p] for p in ports]
+    trajectories = [trajectories[p] for p in self._port_order]
     trajectory = evaluators.Trajectory.batch(trajectories)
+    if not np.array_equal(trajectory.active_mask, self._active_mask):
+      raise ValueError('Active mask changed unexpectedly during rollout.')
 
     return trajectory, timings
 

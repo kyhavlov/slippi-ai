@@ -186,6 +186,17 @@ class RolloutWorker:
       self._active_counts[port] = int(indices.size)
       self._mask_signature[port] = mask.copy()
 
+  def get_active_mask(self, port: Port) -> np.ndarray:
+    """Returns a copy of the active mask for the requested logical port."""
+    return self._mask_signature[port].copy()
+
+  def get_flat_active_mask(self, ports: tp.Sequence[Port]) -> np.ndarray:
+    """Returns the concatenated active mask for the provided port order."""
+    masks = [self._mask_signature[port] for port in ports]
+    if not masks:
+      return np.zeros((0,), dtype=np.bool_)
+    return np.concatenate([mask.copy() for mask in masks], axis=0)
+
   def _validate_port_activity(self, env_output: env_lib.EnvOutput) -> None:
     for port in self._agent_ports:
       mask = self._normalize_mask(env_output.active[port])

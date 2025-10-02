@@ -49,6 +49,13 @@ _EMPTY_ITEM = utils.map_nt(
     utils.reify_tuple_type(Item),
 )
 
+_EMPTY_PLAYER = utils.map_nt(
+    lambda t: t(0),
+    utils.reify_tuple_type(Player),
+)
+
+_DEAD_PLAYER = _EMPTY_PLAYER._replace(is_dead=np.bool_(True))
+
 def get_player(player: melee.PlayerState) -> Player:
   base = dict(
       percent=np.uint16(player.percent),
@@ -110,11 +117,7 @@ def get_game(
     if p in game.players:
       players[f'p{i}'] = get_player(game.players[p])
     else:
-      state = melee.PlayerState()
-      state.action = melee.Action.DEAD_DOWN
-      state.position = melee.Position(0, -100)
-      player = get_player(state)
-      players[f'p{i}'] = player._replace(is_dead=True)
+      players[f'p{i}'] = _DEAD_PLAYER
 
   if len(game.players) == 0:
     print("================== NO PLAYERS LEFT IN GAME ====================")
@@ -122,13 +125,9 @@ def get_game(
   # For singles mode, create a proper 4-player structure
   if is_singles:
     #print(f"Creating dummy players for singles mode - current players: {list(players.keys())}")
-    
-    # Create a dead player for empty slots
-    state = melee.PlayerState()
-    state.action = melee.Action.DEAD_DOWN
-    state.position = melee.Position(0, -100)
-    empty_player = get_player(state)._replace(is_dead=True)
-    
+
+    empty_player = _DEAD_PLAYER
+
     # Save the original players
     p0 = players['p0']
     p1 = players['p1']

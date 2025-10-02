@@ -142,6 +142,152 @@ class Learner:
     self.compiled_ppo_grads_acc = maybe_compile(self.ppo_grads_acc)
     self.compiled_ppo = maybe_compile(self.ppo)
 
+  def _slice_time_major(
+      self,
+      value: tp.Any,
+      mask_size: tp.Optional[int],
+      indices,
+  ) -> tp.Any:
+
+    def slicer(arr):
+      if tf.is_tensor(arr):
+        tensor = tf.convert_to_tensor(arr)
+        rank = tf.rank(tensor)
+
+        def gather_axis1():
+          return tf.gather(tensor, indices, axis=1)
+
+        def gather_axis0():
+          return tf.gather(tensor, indices, axis=0)
+
+        return tf.cond(
+            tf.equal(rank, 0),
+            lambda: tensor,
+            lambda: tf.cond(tf.equal(rank, 1), gather_axis0, gather_axis1))
+
+      arr_np = np.asarray(arr)
+      if arr_np.ndim == 0:
+        return arr_np
+      if arr_np.ndim == 1:
+        if mask_size is not None and arr_np.shape[0] != mask_size:
+          raise ValueError('Mask length does not match array length.')
+        return np.take(arr_np, indices, axis=0)
+      if mask_size is not None and arr_np.shape[1] != mask_size:
+        raise ValueError('Mask length does not match environment axis.')
+      return np.take(arr_np, indices, axis=1)
+
+    return utils.map_single_structure(slicer, value)
+
+  def _slice_batch_major(
+      self,
+      value: tp.Any,
+      mask_size: tp.Optional[int],
+      indices,
+  ) -> tp.Any:
+
+    def slicer(arr):
+      if tf.is_tensor(arr):
+        tensor = tf.convert_to_tensor(arr)
+        rank = tf.rank(tensor)
+
+        def gather_axis0():
+          return tf.gather(tensor, indices, axis=0)
+
+        return tf.cond(tf.equal(rank, 0), lambda: tensor, gather_axis0)
+
+      arr_np = np.asarray(arr)
+      if arr_np.ndim == 0:
+        return arr_np
+      if mask_size is not None and arr_np.shape[0] != mask_size:
+        raise ValueError('Mask length does not match batch axis.')
+      return np.take(arr_np, indices, axis=0)
+
+    return utils.map_single_structure(slicer, value)
+
+  def _mask_trajectory(self, trajectory: Trajectory) -> Trajectory:
+    mask = trajectory.active_mask
+    if tf.is_tensor(mask):
+      mask_tensor = tf.reshape(tf.cast(mask, tf.bool), [-1])
+      active_total = tf.reduce_sum(tf.cast(mask_tensor, tf.int32))
+      with tf.control_dependencies([
+          tf.debugging.assert_positive(
+              active_total, message='Active mask must contain at least one entry.'),
+      ]):
+        mask_tensor = tf.identity(mask_tensor)
+      if tf.reduce_all(mask_tensor):
+        return trajectory
+
+      indices = tf.cast(tf.reshape(tf.where(mask_tensor), [-1]), tf.int32)
+      mask_size = None
+
+      states = self._slice_time_major(trajectory.states, mask_size, indices)
+      name = self._slice_time_major(trajectory.name, mask_size, indices)
+      actions = SampleOutputs(
+          controller_state=self._slice_time_major(
+              trajectory.actions.controller_state, mask_size, indices),
+          logits=self._slice_time_major(
+              trajectory.actions.logits, mask_size, indices),
+      )
+      rewards = self._slice_time_major(trajectory.rewards, mask_size, indices)
+      is_resetting = self._slice_time_major(
+          trajectory.is_resetting, mask_size, indices)
+      initial_state = self._slice_batch_major(
+          trajectory.initial_state, mask_size, indices)
+      delayed_actions = [
+          SampleOutputs(
+              controller_state=self._slice_batch_major(
+                  sample.controller_state, mask_size, indices),
+              logits=self._slice_batch_major(sample.logits, mask_size, indices),
+          )
+          for sample in trajectory.delayed_actions
+      ]
+      active_mask = tf.ones_like(indices, dtype=tf.bool)
+
+    else:
+      mask_np = np.asarray(mask, dtype=np.bool_)
+      if mask_np.ndim != 1:
+        raise ValueError('Active mask must be one-dimensional.')
+      mask_size = mask_np.size
+      if mask_size == 0:
+        raise ValueError('Active mask must contain at least one entry.')
+      if np.all(mask_np):
+        return trajectory
+
+      indices = np.nonzero(mask_np)[0]
+      states = self._slice_time_major(trajectory.states, mask_size, indices)
+      name = self._slice_time_major(trajectory.name, mask_size, indices)
+      actions = SampleOutputs(
+          controller_state=self._slice_time_major(
+              trajectory.actions.controller_state, mask_size, indices),
+          logits=self._slice_time_major(
+              trajectory.actions.logits, mask_size, indices),
+      )
+      rewards = self._slice_time_major(trajectory.rewards, mask_size, indices)
+      is_resetting = self._slice_time_major(
+          trajectory.is_resetting, mask_size, indices)
+      initial_state = self._slice_batch_major(
+          trajectory.initial_state, mask_size, indices)
+      delayed_actions = [
+          SampleOutputs(
+              controller_state=self._slice_batch_major(
+                  sample.controller_state, mask_size, indices),
+              logits=self._slice_batch_major(sample.logits, mask_size, indices),
+          )
+          for sample in trajectory.delayed_actions
+      ]
+      active_mask = np.ones(indices.size, dtype=np.bool_)
+
+    return trajectory._replace(
+        states=states,
+        name=name,
+        actions=actions,
+        rewards=rewards,
+        is_resetting=is_resetting,
+        initial_state=initial_state,
+        delayed_actions=delayed_actions,
+        active_mask=active_mask,
+    )
+
   def initial_state(self, batch_size: int) -> LearnerState:
     return LearnerState(
         teacher=self._teacher.initial_state(batch_size),
@@ -182,6 +328,8 @@ class Learner:
   ) -> tp.Tuple[LearnerOutputs, LearnerState]:
     assert len(trajectory.delayed_actions) == self._policy.delay
 
+    trajectory = self._mask_trajectory(trajectory)
+
     teacher_outputs = self._teacher.unroll(
         # TODO: use the teacher's name instead?
         frames=get_delayed_frames(trajectory),
@@ -215,6 +363,8 @@ class Learner:
   def ppo_grads(self, outputs: LearnerOutputs, trajectory: Trajectory):
     # Value function outputs are for [0, U] while policy outputs are for
     # [D, U+D]. This means we can only train on steps [D, U].
+
+    trajectory = self._mask_trajectory(trajectory)
 
     delay = self._policy.delay  # "D"
     remove_first = lambda t: t[delay:]
@@ -423,6 +573,7 @@ class Learner:
   ) -> tuple[LearnerState, dict]:
     assert self._use_separate_vf
 
+    trajectories = [self._mask_trajectory(t) for t in trajectories]
     trajectories = [
         update_rewards(t, self._config.reward)
         for t in trajectories]
@@ -483,6 +634,7 @@ class Learner:
     """Initialize model and optimizer variables."""
     # Note that optimizers need to be initialized with variables in the same
     # order as during imitation learning.
+    trajectory = self._mask_trajectory(trajectory)
     batch_size = trajectory.is_resetting.shape[1]
     self.unroll(trajectory, self.initial_state(batch_size))
     self._value_vars = self._value_function.variables
