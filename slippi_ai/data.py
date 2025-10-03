@@ -577,40 +577,114 @@ class DataSource:
     except Exception:
       pass
 
-def produce_batches(data_source_kwargs, batch_queue):
+def produce_batches(process_id: int, data_source_kwargs, batch_queue):
   data_source = DataSource(**data_source_kwargs)
   while True:
-    batch_queue.put(next(data_source))
+    batch_queue.put((process_id, *next(data_source)))
+
+
+def _split_batch_sizes(total: int, num_shards: int) -> list[int]:
+  if num_shards <= 0:
+    return []
+  num_shards = min(total, num_shards)
+  base = total // num_shards
+  rem = total % num_shards
+  sizes = []
+  for idx in range(num_shards):
+    shard = base + (1 if idx < rem else 0)
+    if shard <= 0:
+      continue
+    sizes.append(shard)
+  return sizes
 
 class DataSourceMP:
-  def __init__(self, buffer=1, num_processes: int = 1, **kwargs):
+  def __init__(self, buffer=2, num_processes: int = 1, **kwargs):
+    if 'batch_size' not in kwargs:
+      raise ValueError('batch_size must be provided to DataSourceMP.')
     for k, v in kwargs.items():
       setattr(self, k, v)
 
+    self.batch_size = kwargs['batch_size']
+    requested_processes = max(1, num_processes)
+    if 'replays' in kwargs and kwargs['replays'] is not None:
+      requested_processes = min(
+          requested_processes, max(1, len(kwargs['replays'])))
+    shard_sizes = _split_batch_sizes(self.batch_size, requested_processes)
+
     self.batch_queue = mp.Queue(buffer)
     self._processes: list[mp.Process] = []
+    self._process_sizes: dict[int, int] = {}
     self._closed = False
+    self._global_batch_counter = 0
+    self._pending: dict[int, list[tuple[Batch, float]]] = {}
 
     replays = kwargs.get('replays', None)
-    for idx in range(max(1, num_processes)):
+    num_shards = len(shard_sizes)
+    for idx, shard_size in enumerate(shard_sizes):
       proc_kwargs = dict(kwargs)
+      proc_kwargs['batch_size'] = shard_size
       if replays is not None:
-        shard = replays[idx::num_processes]
+        shard = replays[idx::num_shards]
         if not shard:
           continue
         proc_kwargs['replays'] = shard
       process = mp.Process(
-          target=produce_batches, args=(proc_kwargs, self.batch_queue))
+          target=produce_batches, args=(idx, proc_kwargs, self.batch_queue))
       process.start()
       self._processes.append(process)
+      self._process_sizes[idx] = shard_size
 
     if not self._processes:
       raise ValueError('Failed to start any data loader processes.')
 
+    if sum(self._process_sizes.values()) != self.batch_size:
+      raise ValueError('Loader shard sizes do not sum to batch size.')
+
     atexit.register(self.close)
 
   def __next__(self) -> Tuple[Batch, float]:
-    return self.batch_queue.get()
+    micro_batches: list[Batch] = []
+    weighted_epochs = 0.0
+    total = 0
+    seen_processes: set[int] = set()
+
+    for proc_id, shard_size in self._process_sizes.items():
+      pending = self._pending.get(proc_id, [])
+      if pending:
+        batch, epoch = pending.pop(0)
+        micro_batches.append(batch)
+        weighted_epochs += epoch * shard_size
+        total += shard_size
+        seen_processes.add(proc_id)
+        if not pending:
+          self._pending.pop(proc_id, None)
+
+    while len(seen_processes) < len(self._process_sizes):
+      proc_id, batch, epoch = self.batch_queue.get()
+      if proc_id not in self._process_sizes:
+        continue
+      if proc_id in seen_processes:
+        self._pending.setdefault(proc_id, []).append((batch, epoch))
+        continue
+      shard_size = self._process_sizes[proc_id]
+      actual_size = batch.frames.state_action.state.stage.shape[0]
+      if actual_size != shard_size:
+        raise ValueError('Unexpected micro batch size from loader process.')
+      micro_batches.append(batch)
+      weighted_epochs += epoch * shard_size
+      total += shard_size
+      seen_processes.add(proc_id)
+
+    if total != self.batch_size:
+      raise ValueError('Aggregated batch size mismatch.')
+
+    combined_batch: Batch = utils.concat_nest_nt(micro_batches)
+    self._global_batch_counter += 1
+    if isinstance(combined_batch.count, np.ndarray):
+      combined_batch.count.fill(self._global_batch_counter)
+
+    combined_epoch = weighted_epochs / float(self.batch_size)
+    return combined_batch, combined_epoch
 
   def close(self):
     if self._closed:
