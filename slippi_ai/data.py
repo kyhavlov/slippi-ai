@@ -6,7 +6,10 @@ import logging
 import json
 import multiprocessing as mp
 import os
+import queue
 import random
+import threading
+from concurrent import futures
 from typing import (
     Any, Callable, Iterable, List, Optional, Set, Tuple, Iterator, NamedTuple,
     Union,
@@ -429,6 +432,7 @@ class DataSource:
       allowed_opponents: Optional[list[melee.Character]] = None,
       balance_characters: bool = False,
       name_map: Optional[dict[str, int]] = None,
+      num_workers: int = 1,
   ):
     self.replays = replays
     self.batch_size = batch_size
@@ -439,8 +443,14 @@ class DataSource:
     self.batch_counter = 0
     self.balance_characters = balance_characters
 
+    self._executor: Optional[futures.ThreadPoolExecutor] = None
+    self._num_workers = max(1, num_workers)
+
     self.replay_counter = 0
     replays = self.iter_replays()
+    if self._num_workers > 1:
+      replays = _ThreadSafeIterator(replays)
+      self._executor = futures.ThreadPoolExecutor(max_workers=self._num_workers)
     self.managers = [
         TrajectoryManager(
             replays,
@@ -544,13 +554,28 @@ class DataSource:
     return utils.batch_nest_nt(batches)
 
   def __next__(self) -> Tuple[Batch, float]:
-    batch: Batch = self.process_batch(
-        [m.grab_chunk() for m in self.managers])
+    if self._executor is None:
+      chunks = [m.grab_chunk() for m in self.managers]
+    else:
+      futures_list = [self._executor.submit(m.grab_chunk) for m in self.managers]
+      chunks = [future.result() for future in futures_list]
+    batch: Batch = self.process_batch(chunks)
     epoch = self.replay_counter / len(self.replays)
     self.batch_counter += 1
     assert batch.frames.state_action.state.stage.shape[-1] == self.chunk_size
     assert batch.frames.reward.shape[-1] == self.chunk_size - 1
     return batch, epoch
+
+  def close(self):
+    if self._executor is not None:
+      self._executor.shutdown(wait=True)
+      self._executor = None
+
+  def __del__(self):
+    try:
+      self.close()
+    except Exception:
+      pass
 
 def produce_batches(data_source_kwargs, batch_queue):
   data_source = DataSource(**data_source_kwargs)
@@ -558,22 +583,56 @@ def produce_batches(data_source_kwargs, batch_queue):
     batch_queue.put(next(data_source))
 
 class DataSourceMP:
-  def __init__(self, buffer=4, **kwargs):
+  def __init__(self, buffer=1, num_processes: int = 1, **kwargs):
     for k, v in kwargs.items():
       setattr(self, k, v)
-    self.batch_queue = mp.Queue(buffer)
-    self.process = mp.Process(
-        target=produce_batches, args=(kwargs, self.batch_queue))
-    self.process.start()
 
-    atexit.register(self.batch_queue.close)
-    atexit.register(self.process.terminate)
+    self.batch_queue = mp.Queue(buffer)
+    self._processes: list[mp.Process] = []
+    self._closed = False
+
+    replays = kwargs.get('replays', None)
+    for idx in range(max(1, num_processes)):
+      proc_kwargs = dict(kwargs)
+      if replays is not None:
+        shard = replays[idx::num_processes]
+        if not shard:
+          continue
+        proc_kwargs['replays'] = shard
+      process = mp.Process(
+          target=produce_batches, args=(proc_kwargs, self.batch_queue))
+      process.start()
+      self._processes.append(process)
+
+    if not self._processes:
+      raise ValueError('Failed to start any data loader processes.')
+
+    atexit.register(self.close)
 
   def __next__(self) -> Tuple[Batch, float]:
     return self.batch_queue.get()
 
+  def close(self):
+    if self._closed:
+      return
+    self._closed = True
+    try:
+      while True:
+        self.batch_queue.get_nowait()
+    except queue.Empty:
+      pass
+    finally:
+      self.batch_queue.close()
+    for process in self._processes:
+      if process.is_alive():
+        process.terminate()
+      process.join()
+
   def __del__(self):
-    self.process.terminate()
+    try:
+      self.close()
+    except Exception:
+      pass
 
 @dataclasses.dataclass
 class DataConfig:
@@ -583,12 +642,23 @@ class DataConfig:
   compressed: bool = True
   in_parallel: bool = True
   balance_characters: bool = False
+  num_workers: int = 1
+  prefetch_buffer: int = 0
+  loader_processes: int = 1
 
 def make_source(
     in_parallel: bool,
     **kwargs):
+  prefetch_buffer = kwargs.pop('prefetch_buffer', 0)
+  loader_processes = kwargs.pop('loader_processes', 1)
   constructor = DataSourceMP if in_parallel else DataSource
-  return constructor(**kwargs)
+  if constructor is DataSourceMP:
+    source = constructor(num_processes=loader_processes, **kwargs)
+  else:
+    source = constructor(**kwargs)
+  if prefetch_buffer:
+    source = PrefetchDataIterator(source, maxsize=prefetch_buffer)
+  return source
 
 def toy_data_source(**kwargs) -> DataSource:
   dataset_config = DatasetConfig(
@@ -600,3 +670,77 @@ def toy_data_source(**kwargs) -> DataSource:
       compressed=True,
       **kwargs,
   )
+
+
+class _ThreadSafeIterator:
+
+  def __init__(self, iterator: Iterator[ReplayInfo]):
+    self._iterator = iterator
+    self._lock = threading.Lock()
+
+  def __iter__(self) -> '_ThreadSafeIterator':
+    return self
+
+  def __next__(self) -> ReplayInfo:
+    with self._lock:
+      return next(self._iterator)
+
+
+class PrefetchDataIterator:
+
+  def __init__(self, iterator, maxsize: int = 1):
+    self._iterator = iterator
+    self._queue: queue.Queue = queue.Queue(maxsize)
+    self._sentinel = object()
+    self._stop_event = threading.Event()
+    self._error = None
+    self._worker = threading.Thread(
+        target=self._run, name='prefetch-data', daemon=True)
+    self._worker.start()
+
+  def _run(self):
+    try:
+      while not self._stop_event.is_set():
+        item = next(self._iterator)
+        self._queue.put(item)
+    except StopIteration:
+      self._stop_event.set()
+      self._queue.put(self._sentinel)
+    except Exception as exc:
+      self._stop_event.set()
+      self._error = exc
+      self._queue.put(self._sentinel)
+
+  def __iter__(self):
+    return self
+
+  def __next__(self):
+    item = self._queue.get()
+    if item is self._sentinel:
+      if self._error is not None:
+        raise self._error
+      raise StopIteration
+    return item
+
+  def __getattr__(self, name):
+    return getattr(self._iterator, name)
+
+  def close(self):
+    self._stop_event.set()
+    try:
+      self._queue.put_nowait(self._sentinel)
+    except queue.Full:
+      pass
+    if hasattr(self._iterator, 'close'):
+      try:
+        self._iterator.close()
+      except Exception:
+        pass
+    if self._worker.is_alive():
+      self._worker.join(timeout=0.1)
+
+  def __del__(self):
+    try:
+      self.close()
+    except Exception:
+      pass
