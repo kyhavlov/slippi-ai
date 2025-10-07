@@ -9,6 +9,7 @@ import os
 import queue
 import random
 import threading
+import time
 from concurrent import futures
 from typing import (
     Any, Callable, Iterable, List, Optional, Set, Tuple, Iterator, NamedTuple,
@@ -126,6 +127,11 @@ class Batch(NamedTuple):
   frames: Frames
   count: int  # For reproducing batches
   meta: ChunkMeta
+
+
+class ReplayTask(NamedTuple):
+  replay: ReplayInfo
+  epoch_progress: float
 
 def _charset(chars: Optional[Iterable[melee.Character]]) -> Set[int]:
   if chars is None:
@@ -433,6 +439,7 @@ class DataSource:
       balance_characters: bool = False,
       name_map: Optional[dict[str, int]] = None,
       num_workers: int = 1,
+      replay_queue: Optional[queue.Queue] = None,
   ):
     self.replays = replays
     self.batch_size = batch_size
@@ -447,13 +454,19 @@ class DataSource:
     self._num_workers = max(1, num_workers)
 
     self.replay_counter = 0
-    replays = self.iter_replays()
+    self._latest_epoch = 0.0
+    self._using_queue = replay_queue is not None
+    self._total_replays = len(self.replays)
+    if replay_queue is not None:
+      replays_iter: Iterator[ReplayInfo] = _QueueReplayIterator(self, replay_queue)
+    else:
+      replays_iter = self.iter_replays()
     if self._num_workers > 1:
-      replays = _ThreadSafeIterator(replays)
+      replays_iter = _ThreadSafeIterator(replays_iter)
       self._executor = futures.ThreadPoolExecutor(max_workers=self._num_workers)
     self.managers = [
         TrajectoryManager(
-            replays,
+            replays_iter,
             unroll_length=self.chunk_size,
             overlap=extra_frames,
             compressed=compressed,
@@ -560,7 +573,10 @@ class DataSource:
       futures_list = [self._executor.submit(m.grab_chunk) for m in self.managers]
       chunks = [future.result() for future in futures_list]
     batch: Batch = self.process_batch(chunks)
-    epoch = self.replay_counter / len(self.replays)
+    if self._using_queue and self._total_replays > 0:
+      epoch = self._latest_epoch
+    else:
+      epoch = self.replay_counter / max(1, len(self.replays))
     self.batch_counter += 1
     assert batch.frames.state_action.state.stage.shape[-1] == self.chunk_size
     assert batch.frames.reward.shape[-1] == self.chunk_size - 1
@@ -577,10 +593,21 @@ class DataSource:
     except Exception:
       pass
 
-def produce_batches(process_id: int, data_source_kwargs, batch_queue):
-  data_source = DataSource(**data_source_kwargs)
-  while True:
-    batch_queue.put((process_id, *next(data_source)))
+def produce_batches(
+    process_id: int,
+    data_source_kwargs,
+    batch_queue,
+    task_queue,
+):
+  data_source = DataSource(replay_queue=task_queue, **data_source_kwargs)
+  try:
+    while True:
+      batch_epoch = next(data_source)
+      batch_queue.put((process_id, *batch_epoch))
+  except StopIteration:
+    pass
+  finally:
+    batch_queue.put((process_id, None, None))
 
 
 def _split_batch_sizes(total: int, num_shards: int) -> list[int]:
@@ -606,17 +633,25 @@ class DataSourceMP:
 
     self.batch_size = kwargs['batch_size']
     requested_processes = max(1, num_processes)
-    if 'replays' in kwargs and kwargs['replays'] is not None:
-      requested_processes = min(
-          requested_processes, max(1, len(kwargs['replays'])))
     shard_sizes = _split_batch_sizes(self.batch_size, requested_processes)
 
+    self._all_replays: list[ReplayInfo] = list(kwargs.get('replays', []) or [])
+    if not self._all_replays:
+      raise ValueError('DataSourceMP requires a non-empty replay list.')
+
     self.batch_queue = mp.Queue(buffer)
+    task_buffer = max(1, buffer * len(shard_sizes) * 2)
+    self.task_queue = mp.Queue(task_buffer)
     self._processes: list[mp.Process] = []
     self._process_sizes: dict[int, int] = {}
     self._closed = False
     self._global_batch_counter = 0
     self._pending: dict[int, list[tuple[Batch, float]]] = {}
+    self._scheduler_stop = threading.Event()
+    self._rng = random.Random()
+    self._balance_characters = kwargs.get('balance_characters', False)
+    self._epoch_base = 0.0
+    self._total_replays = len(self._all_replays)
 
     replays = kwargs.get('replays', None)
     num_shards = len(shard_sizes)
@@ -624,12 +659,10 @@ class DataSourceMP:
       proc_kwargs = dict(kwargs)
       proc_kwargs['batch_size'] = shard_size
       if replays is not None:
-        shard = replays[idx::num_shards]
-        if not shard:
-          continue
-        proc_kwargs['replays'] = shard
+        proc_kwargs['replays'] = replays
       process = mp.Process(
-          target=produce_batches, args=(idx, proc_kwargs, self.batch_queue))
+          target=produce_batches,
+          args=(idx, proc_kwargs, self.batch_queue, self.task_queue))
       process.start()
       self._processes.append(process)
       self._process_sizes[idx] = shard_size
@@ -639,6 +672,10 @@ class DataSourceMP:
 
     if sum(self._process_sizes.values()) != self.batch_size:
       raise ValueError('Loader shard sizes do not sum to batch size.')
+
+    self._scheduler_thread = threading.Thread(
+        target=self._scheduler_loop, name='replay-scheduler', daemon=True)
+    self._scheduler_thread.start()
 
     atexit.register(self.close)
 
@@ -659,17 +696,19 @@ class DataSourceMP:
         if not pending:
           self._pending.pop(proc_id, None)
 
-    while len(seen_processes) < len(self._process_sizes):
+    while total < self.batch_size:
       proc_id, batch, epoch = self.batch_queue.get()
       if proc_id not in self._process_sizes:
         continue
-      if proc_id in seen_processes:
-        self._pending.setdefault(proc_id, []).append((batch, epoch))
+      if batch is None:
         continue
       shard_size = self._process_sizes[proc_id]
       actual_size = batch.frames.state_action.state.stage.shape[0]
       if actual_size != shard_size:
         raise ValueError('Unexpected micro batch size from loader process.')
+      if total + shard_size > self.batch_size:
+        self._pending.setdefault(proc_id, []).append((batch, epoch))
+        continue
       micro_batches.append(batch)
       weighted_epochs += epoch * shard_size
       total += shard_size
@@ -686,10 +725,80 @@ class DataSourceMP:
     combined_epoch = weighted_epochs / float(self.batch_size)
     return combined_batch, combined_epoch
 
+  def _scheduler_loop(self):
+    while not self._scheduler_stop.is_set():
+      epoch_replays = self._build_epoch_replays()
+      if not epoch_replays:
+        time.sleep(0.1)
+        continue
+      epoch_start = self._epoch_base
+      total = len(epoch_replays)
+      for idx, replay in enumerate(epoch_replays, start=1):
+        if self._scheduler_stop.is_set():
+          break
+        progress = epoch_start + idx / total
+        task = ReplayTask(replay, progress)
+        while not self._scheduler_stop.is_set():
+          try:
+            self.task_queue.put(task, timeout=0.1)
+            break
+          except queue.Full:
+            continue
+      self._epoch_base += 1.0
+
+  def _build_epoch_replays(self) -> list[ReplayInfo]:
+    epoch = list(self._all_replays)
+    if not self._balance_characters:
+      self._rng.shuffle(epoch)
+      return epoch
+
+    by_character: dict[int, list[ReplayInfo]] = collections.defaultdict(list)
+    unknown: list[ReplayInfo] = []
+    for replay in epoch:
+      try:
+        character = int(replay.main_player.character)
+      except Exception:
+        unknown.append(replay)
+        continue
+      by_character[character].append(replay)
+
+    for entries in by_character.values():
+      self._rng.shuffle(entries)
+
+    ordered: list[ReplayInfo] = []
+    active_chars = list(by_character.keys())
+    self._rng.shuffle(active_chars)
+
+    while active_chars and len(ordered) < len(epoch):
+      next_active: list[int] = []
+      for character in active_chars:
+        bucket = by_character[character]
+        if not bucket:
+          continue
+        ordered.append(bucket.pop())
+        if bucket:
+          next_active.append(character)
+        if len(ordered) == len(epoch):
+          break
+      active_chars = next_active
+
+    remaining = []
+    for entries in by_character.values():
+      remaining.extend(entries)
+    remaining.extend(unknown)
+    if remaining:
+      self._rng.shuffle(remaining)
+      ordered.extend(remaining)
+
+    return ordered
+
   def close(self):
     if self._closed:
       return
     self._closed = True
+    self._scheduler_stop.set()
+    if hasattr(self, '_scheduler_thread') and self._scheduler_thread.is_alive():
+      self._scheduler_thread.join(timeout=0.1)
     try:
       while True:
         self.batch_queue.get_nowait()
@@ -697,6 +806,18 @@ class DataSourceMP:
       pass
     finally:
       self.batch_queue.close()
+    try:
+      while True:
+        self.task_queue.get_nowait()
+    except queue.Empty:
+      pass
+    finally:
+      for _ in range(self.batch_size * 2):
+        try:
+          self.task_queue.put_nowait(None)
+        except queue.Full:
+          break
+      self.task_queue.close()
     for process in self._processes:
       if process.is_alive():
         process.terminate()
@@ -758,6 +879,27 @@ class _ThreadSafeIterator:
   def __next__(self) -> ReplayInfo:
     with self._lock:
       return next(self._iterator)
+
+
+class _QueueReplayIterator:
+
+  def __init__(self, data_source: 'DataSource', replay_queue: queue.Queue):
+    self._data_source = data_source
+    self._queue = replay_queue
+
+  def __iter__(self) -> '_QueueReplayIterator':
+    return self
+
+  def __next__(self) -> ReplayInfo:
+    task = self._queue.get()
+    if task is None:
+      raise StopIteration
+    replay, epoch_progress = task
+    if replay is None:
+      raise StopIteration
+    self._data_source.replay_counter += 1
+    self._data_source._latest_epoch = epoch_progress
+    return replay
 
 
 class PrefetchDataIterator:
