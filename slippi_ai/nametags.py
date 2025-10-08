@@ -108,7 +108,7 @@ def name_encoder(name_map: dict[str, int]):
   return encode_name
 
 BANNED_NAMES = {
-    'Mang0',  # Has asked not to be included in AI training
+    #'Mang0',  # Has asked not to be included in AI training
     'Phillip AI',  # This is us!
 }
 for name in BANNED_NAMES:
