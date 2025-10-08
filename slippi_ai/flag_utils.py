@@ -1,5 +1,6 @@
-import enum
 import dataclasses
+import enum
+import types
 import typing as tp
 
 from absl import flags
@@ -18,6 +19,11 @@ TYPE_TO_ITEM = {
 }
 
 def maybe_undo_optional(t: type) -> type:
+  if isinstance(t, types.UnionType):
+    args = tp.get_args(t)
+    if len(args) == 2 and type(None) in args:
+      return next(arg for arg in args if arg is not type(None))
+
   if (
       hasattr(t, '__origin__') and
       t.__origin__ is tp.Union and
@@ -56,6 +62,10 @@ def get_leaf_flag(field_type: type, default: tp.Any) -> tp.Optional[ff.Item]:
 
 def is_leaf(type_: type) -> bool:
   type_ = maybe_undo_optional(type_)
+  if isinstance(type_, types.UnionType):
+    return all(is_leaf(arg) for arg in tp.get_args(type_))
+  if not isinstance(type_, type):
+    return True
   if issubclass(type_, dict) or dataclasses.is_dataclass(type_):
     return False
   return True

@@ -118,6 +118,7 @@ Each step should be its own commit so problems are easy to bisect, and every cod
 2. **Pairing Contract Test** – Using deterministic fake env outputs, assert that consecutive singles envs are paired such that the first contributes to `opp1` and the second to `opp2` across every rollout, while doubles envs pass through untouched. Validate the learner-facing dictionary still exposes ports `{1,2,3,4}` and that each per-port batch has size `config.actor.num_envs`.
 3. **RolloutWorker Mixed-Mode Smoke** – Update the fake-env smoke test to cover the new singles-first layout. Confirm controller commands round-trip in index order and that the singles:doubles ratio (default 50:50) holds over a window of rollouts.
 4. **Port Wiring Snapshot Update** – Refresh the legacy snapshot test to assert the single-Dolphin singles behaviour and note the removal of the old two-port requirement.
+5. **Async Rollout Integration** – Add an async `RolloutWorker` smoke test that patches `AsyncEnvMP` with deterministic stubs, proving the scheduler feeds four-slot trajectories to the learner and routes controller batches to the correct left/right singles roles.
 
 Tests must land and be reviewed before touching production scheduler code.
 

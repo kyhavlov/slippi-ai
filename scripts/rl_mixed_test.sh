@@ -11,9 +11,9 @@
 
 # What player(s) from the dataset should we condition on?
 # This can be a comma-separated list.
-NAME="Master Player,Ralph"
-D=18
-TAG=rl_doubles_delay_${D}_v2
+NAME="Master Player"
+D=21
+TAG=rl_doubles_delay_${D}_mixedtest
 ROOTDIR=$(pwd)
 #DOLPHIN_PATH="$ROOTDIR/Slippi_Online-x86_64-ExiAI.AppImage"
 DOLPHIN_PATH="$ROOTDIR/Slippi_Netplay_Mainline_NoGui-x86_64.AppImage"
@@ -24,7 +24,7 @@ export PYTHONPATH="."
 python slippi_ai/rl/run.py \
   --config.runtime.tag=$TAG \
   --config.runtime.max_step=10000 \
-  --config.runtime.log_interval=300 \
+  --config.runtime.log_interval=30 \
   --config.dolphin.path="$DOLPHIN_PATH" \
   --config.dolphin.iso="$ISO_PATH" \
   --config.dolphin.headless=False \
@@ -35,25 +35,26 @@ python slippi_ai/rl/run.py \
   --config.learner.learning_rate=3e-5 \
   --config.learner.value_cost=1 \
   --config.learner.reward_halflife=4 \
-  --config.learner.reward.damage_ratio=0.00333 \
+  --config.learner.reward.damage_ratio=0.01 \
   --config.learner.reward.ledge_grab_penalty=0.01 \
   --config.learner.policy_gradient_weight=5 \
   --config.learner.kl_teacher_weight=3e-3 \
-  --config.learner.ppo.num_epochs=2 \
-  --config.learner.ppo.num_batches=16 \
+  --config.learner.ppo.num_epochs=1 \
+  --config.learner.ppo.num_batches=4 \
   --config.learner.ppo.beta=3e-1 \
   --config.learner.ppo.epsilon=1e-2 \
   --config.learner.ppo.minibatched=False \
-  --config.teacher="$ROOTDIR/models/latest_inclsingles_4750k.pkl" \
+  --config.teacher="$ROOTDIR/testnew9.pkl" \
   --config.opponent.type=self \
   --config.opponent.train=True \
-  --config.actor.rollout_length=300 \
-  --config.actor.num_envs=4 \
+  --config.actor.rollout_length=60 \
+  --config.actor.num_envs=2 \
   --config.actor.inner_batch_size=2 \
   --config.actor.async_envs=True \
   --config.actor.num_env_steps=0 \
   --config.actor.gpu_inference=True \
-  --config.actor.enable_singles=False \
+  --config.actor.enable_singles=True \
+  --config.actor.singles_ratio=0.5 \
   --config.agent.name="$NAME" \
   --config.agent.batch_steps=4 \
   --config.runtime.reset_every_n_steps=512 \

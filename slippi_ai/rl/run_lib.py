@@ -62,6 +62,7 @@ class ActorConfig:
   gpu_inference: bool = True
   use_fake_envs: bool = False
   enable_singles: bool = False
+  singles_ratio: float = 0.5
 
 @dataclasses.dataclass
 class AgentConfig:
@@ -428,6 +429,7 @@ def run(config: Config):
         num_steps=config.actor.num_env_steps,
         inner_batch_size=config.actor.inner_batch_size,
         enable_singles=config.actor.enable_singles,
+        singles_ratio=config.actor.singles_ratio,
     )
 
   build_actor = lambda: evaluators.RolloutWorker(

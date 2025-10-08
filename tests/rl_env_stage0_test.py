@@ -50,7 +50,7 @@ class Stage0BaselineTests(unittest.TestCase):
     self.assertEqual(game.p2.character, melee.Character.FALCO.value)
     self.assertTrue(game.p3.is_dead)
 
-  def test_environment_singles_spins_up_two_dolphins_today(self):
+  def test_environment_singles_spins_up_one_dolphin_per_role(self):
     players = {
         port: types.SimpleNamespace() for port in (1, 2, 3, 4)
     }
@@ -58,7 +58,6 @@ class Stage0BaselineTests(unittest.TestCase):
     dolphin_kwargs = dict(
         players=players,
         slippi_port=60000,
-        slippi_port2=60001,
     )
 
     class DummyDolphin:
@@ -67,7 +66,7 @@ class Stage0BaselineTests(unittest.TestCase):
       def __init__(self, **kwargs):
         self.kwargs = kwargs
         DummyDolphin.instances.append(self)
-        self.controllers = {1: mock.Mock(), 2: mock.Mock(), 3: mock.Mock(), 4: mock.Mock()}
+        self.controllers = {1: mock.Mock(), 2: mock.Mock()}
 
       def step(self):
         state = melee.GameState()
@@ -80,11 +79,23 @@ class Stage0BaselineTests(unittest.TestCase):
 
     with mock.patch('slippi_ai.envs.dolphin.Dolphin', new=DummyDolphin), \
          mock.patch('slippi_ai.envs.send_controller', side_effect=lambda *args, **kwargs: None):
-      env = envs.Environment(dolphin_kwargs=dolphin_kwargs, enable_singles=True)
+      left_env = envs.Environment(
+          dolphin_kwargs=dolphin_kwargs,
+          enable_singles=True,
+          singles_role='left',
+      )
+      right_env = envs.Environment(
+          dolphin_kwargs=dolphin_kwargs,
+          enable_singles=True,
+          singles_role='right',
+      )
       self.assertEqual(len(DummyDolphin.instances), 2)
-      env.stop()
+      self.assertSetEqual(set(DummyDolphin.instances[0].kwargs['players']), {1, 2})
+      self.assertSetEqual(set(DummyDolphin.instances[1].kwargs['players']), {1, 2})
+      left_env.stop()
+      right_env.stop()
 
-  def test_batched_environment_singles_currently_raises(self):
+  def test_batched_environment_singles_requires_roles(self):
     players = {
         port: types.SimpleNamespace() for port in (1, 2, 3, 4)
     }
@@ -98,11 +109,13 @@ class Stage0BaselineTests(unittest.TestCase):
     class DummySafeEnvironment:
       def __init__(self, *args, **kwargs):
         pass
+      def current_state(self):
+        return envs.EnvOutput({}, False)
       def stop(self):
         pass
 
     with mock.patch('slippi_ai.envs.SafeEnvironment', new=DummySafeEnvironment):
-      with self.assertRaises(IndexError):
+      with self.assertRaises(ValueError):
         envs.BatchedEnvironment(
             num_envs=2,
             dolphin_kwargs=dolphin_kwargs,
@@ -112,6 +125,18 @@ class Stage0BaselineTests(unittest.TestCase):
             swap_ports=False,
             enable_singles=True,
         )
+
+      env = envs.BatchedEnvironment(
+          num_envs=2,
+          dolphin_kwargs=dolphin_kwargs,
+          slippi_ports=[62000, 62001],
+          num_retries=1,
+          agent_names=agent_names,
+          swap_ports=False,
+          enable_singles=True,
+          singles_roles=['left', 'right'],
+      )
+      env.stop()
 
   def test_environment_current_state_returns_four_slots(self):
     players = {port: object() for port in (1, 2, 3, 4)}
@@ -162,46 +187,66 @@ class Stage0BaselineTests(unittest.TestCase):
 
     with mock.patch('slippi_ai.envs.dolphin.Dolphin', new=SinglesDolphin), \
          mock.patch('slippi_ai.envs.send_controller', side_effect=lambda *args, **kwargs: None):
-      env = envs.Environment(
+      left_env = envs.Environment(
           dolphin_kwargs=dict(
               players=singles_players,
               slippi_port=64000,
-              slippi_port2=64001,
           ),
           enable_singles=True,
+          singles_role='left',
       )
-      output = env.current_state()
-      env.stop()
+      right_env = envs.Environment(
+          dolphin_kwargs=dict(
+              players=singles_players,
+              slippi_port=64001,
+          ),
+          enable_singles=True,
+          singles_role='right',
+      )
+      left_output = left_env.current_state()
+      right_output = right_env.current_state()
+      left_env.stop()
+      right_env.stop()
 
-    self.assertSetEqual(set(output.gamestates.keys()), {1, 2, 3, 4})
-    for port in (1, 2, 3, 4):
-      game = output.gamestates[port]
+    self.assertSetEqual(set(left_output.gamestates.keys()), {1, 2})
+    for port in (1, 2):
+      game = left_output.gamestates[port]
       self.assertFalse(game.is_teams)
       self.assertTrue(game.p1.is_dead)
-    game_first = output.gamestates[1]
-    game_second = output.gamestates[3]
-    self.assertFalse(game_first.p2.is_dead)
-    self.assertTrue(game_first.p3.is_dead)
-    self.assertTrue(game_second.p2.is_dead)
-    self.assertFalse(game_second.p3.is_dead)
+    self.assertFalse(left_output.gamestates[1].p2.is_dead)
+    self.assertTrue(left_output.gamestates[1].p3.is_dead)
 
-  def test_async_batched_environment_currently_missing_slippi_port2(self):
+    self.assertSetEqual(set(right_output.gamestates.keys()), {3, 4})
+    for port in (3, 4):
+      game = right_output.gamestates[port]
+      self.assertFalse(game.is_teams)
+      self.assertTrue(game.p1.is_dead)
+    self.assertTrue(right_output.gamestates[3].p2.is_dead)
+    self.assertFalse(right_output.gamestates[3].p3.is_dead)
+
+  def test_async_batched_environment_singles_uses_single_port_per_env(self):
     captured = []
 
     class DummyAsyncEnv:
       def __init__(self, **kwargs):
         captured.append(kwargs)
+        self._send_profiler = types.SimpleNamespace(mean_time=lambda: 0.0, num_calls=0)
+        self._recv_profiler = types.SimpleNamespace(mean_time=lambda: 0.0, num_calls=0)
       def begin_stop(self):
         pass
       def ensure_stopped(self):
         pass
+      def send(self, controllers):
+        pass
+      def recv(self):
+        return envs.EnvOutput({}, False)
       def stop(self):
         pass
 
     players = {port: object() for port in (1, 2, 3, 4)}
     dolphin_kwargs = dict(players=players, slippi_port=65000)
 
-    ports = [65010, 65011, 65012]
+    ports = [65010, 65011, 65012, 65013]
 
     with mock.patch('slippi_ai.envs.AsyncEnvMP', new=DummyAsyncEnv), \
          mock.patch('slippi_ai.envs.utils.find_open_udp_ports', return_value=ports):
@@ -209,18 +254,22 @@ class Stage0BaselineTests(unittest.TestCase):
           num_envs=2,
           dolphin_kwargs=dolphin_kwargs,
           num_steps=0,
-          inner_batch_size=1,
+          inner_batch_size=2,
           swap_ports=False,
           enable_singles=True,
+          singles_ratio=0.5,
           agent_names=[('', '') for _ in range(2)],
       )
       env.stop()
 
     self.assertEqual(len(captured), 2)
-    singles_kwargs = captured[0]
-    self.assertTrue(singles_kwargs['enable_singles'])
-    self.assertEqual(len(singles_kwargs['slippi_ports']), 1)
-    self.assertNotIn('slippi_port2', singles_kwargs['dolphin_kwargs'])
+    left_kwargs, right_kwargs = captured
+    self.assertTrue(left_kwargs['enable_singles'])
+    self.assertEqual(left_kwargs['singles_roles'], ['left', 'left'])
+    self.assertEqual(len(left_kwargs['slippi_ports']), 2)
+    self.assertNotIn('slippi_port2', left_kwargs['dolphin_kwargs'])
+    self.assertEqual(right_kwargs['singles_roles'], ['right', 'right'])
+    self.assertTrue(all(len(kwargs['slippi_ports']) == 2 for kwargs in captured))
 
   def test_rollout_worker_fake_env_smoke(self):
     def dummy_build_agent(**kwargs):
