@@ -639,6 +639,12 @@ def run(config: Config):
         p0=p0_stats,
     )
 
+    learner_metrics = metrics.get('learner')
+    if learner_metrics and 'per_mode' in learner_metrics:
+      totals = learner_metrics['per_mode'].get('totals', {})
+      learner_metrics['effective_batch_size'] = totals.get('active_columns', 0)
+      learner_metrics['singles_ratio'] = totals.get('singles_ratio', 0.0)
+
     return metrics
 
   logger = Logger()
@@ -667,6 +673,27 @@ def run(config: Config):
     teacher_kl = pre_update['teacher_kl']
     logging.info(f'teacher_kl: {teacher_kl:.3g}')
     logging.info(f'uev: {learner_metrics["value"]["uev"]:.3f}')
+
+    per_mode = learner_metrics.get('per_mode')
+    if per_mode:
+      totals = per_mode.get('totals', {})
+      logging.info('effective_batch_columns=%d singles_ratio=%.3f',
+                   totals.get('active_columns', 0),
+                   totals.get('singles_ratio', 0.0))
+      for mode in ['singles', 'doubles']:
+        stats = per_mode.get(mode)
+        if not stats or stats['reward']['count'] == 0:
+          continue
+        reward = stats['reward']
+        logging.info(
+            '%s reward mean=%.4f std=%.4f (n=%d)',
+            mode, reward['mean'], reward['std'], reward['count'])
+        logging.info(
+            '%s actor_kl=%.4g teacher_kl=%.4g uev=%.4f',
+            mode,
+            stats['actor_kl']['mean'],
+            stats['teacher_kl']['mean'],
+            stats['uev']['mean'])
 
   maybe_flush = utils.Periodically(flush, config.runtime.log_interval)
 

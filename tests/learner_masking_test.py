@@ -172,6 +172,15 @@ class LearnerMaskingTest(unittest.TestCase):
         active_mask=mask,
     )
 
+    states = trajectory.states
+    is_teams = np.array(states.is_teams)
+    singles_indices = np.array([0, 2])
+    doubles_indices = np.array([4, 5])
+    is_teams[:, singles_indices] = False
+    is_teams[:, doubles_indices] = True
+    states = states._replace(is_teams=is_teams)
+    trajectory = trajectory._replace(states=states)
+
     return trajectory, mask
 
   def _clone_state(self, state: learner_lib.LearnerState) -> learner_lib.LearnerState:
@@ -204,6 +213,25 @@ class LearnerMaskingTest(unittest.TestCase):
       np.testing.assert_allclose(_to_numpy(grad_a), _to_numpy(grad_b))
 
     _assert_nested_allclose(self, manual_metrics, masked_metrics)
+
+  def test_per_mode_metrics_summary(self):
+    trajectory, mask = self._build_test_trajectory()
+    active_count = int(mask.sum())
+    initial_state = self.learner.initial_state(active_count)
+
+    _, metrics = self.learner.ppo([trajectory], initial_state, num_epochs=0)
+
+    per_mode = metrics['per_mode']
+    totals = per_mode['totals']
+    self.assertEqual(totals['active_columns'], 4)
+    self.assertAlmostEqual(totals['singles_ratio'], 0.5, places=3)
+
+    for mode in ['singles', 'doubles']:
+      stats = per_mode[mode]
+      self.assertGreater(stats['reward']['count'], 0)
+      self.assertIn('mean', stats['actor_kl'])
+      self.assertIn('mean', stats['teacher_kl'])
+      self.assertIn('mean', stats['uev'])
 
 
 if __name__ == '__main__':

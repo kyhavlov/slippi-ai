@@ -102,9 +102,7 @@ class BoolEmbedding(Embedding[bool, np.bool_]):
     logits = tf.squeeze(predicted, [-1])
     labels = tf.cast(target, float_type)
 
-    common_shape = tf.broadcast_static_shape(logits.shape, labels.shape)
-    logits = tf.broadcast_to(logits, common_shape)
-    labels = tf.broadcast_to(labels, common_shape)
+    logits, labels = _broadcast_pair(logits, labels)
 
     return tf.nn.sigmoid_cross_entropy_with_logits(
         logits=logits, labels=labels)
@@ -121,6 +119,23 @@ class BoolEmbedding(Embedding[bool, np.bool_]):
     return tfp.distributions.Bernoulli(logits=logits, dtype=tf.bool)
 
 embed_bool = BoolEmbedding()
+
+
+def _broadcast_pair(x, y):
+  """Broadcast two tensors to a common shape with dynamic fallback."""
+  x_tensor = tf.convert_to_tensor(x)
+  y_tensor = tf.convert_to_tensor(y)
+
+  static_shape = tf.broadcast_static_shape(x_tensor.shape, y_tensor.shape)
+  if static_shape.is_fully_defined():
+    target_shape = static_shape.as_list()
+  else:
+    target_shape = tf.broadcast_dynamic_shape(
+        tf.shape(x_tensor), tf.shape(y_tensor))
+
+  x_broadcast = tf.broadcast_to(x_tensor, target_shape)
+  y_broadcast = tf.broadcast_to(y_tensor, target_shape)
+  return x_broadcast, y_broadcast
 
 class FloatEmbedding(Embedding[float, np.float32]):
   dtype = np.float32

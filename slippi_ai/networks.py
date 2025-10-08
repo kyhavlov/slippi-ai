@@ -40,7 +40,7 @@ class Network(snt.Module, abc.ABC):
       reset: tf.Tensor,
       prev_state: RecurrentState,
   ) -> Tuple[tf.Tensor, RecurrentState]:
-    batch_size = reset.shape[0]
+    batch_size = tf.shape(reset, out_type=tf.int32)[0]
     initial_state = tf.nest.map_structure(
         lambda x, y: tf_utils.where(reset, x, y),
         self.initial_state(batch_size), prev_state)

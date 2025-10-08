@@ -2,7 +2,7 @@
 
 Author: LLM planning pass on 2025-09-29
 
-Status: Implementation in progress (Steps 1–5 complete)
+Status: Implementation in progress (Steps 1–6 complete)
 
 Scope: Enable robust RL training with a controllable mix of singles and doubles environments, targeting a default 50/50 trajectory split. Remove fragile multi-Dolphin-per-env behavior and make shapes, rewards, and logging explicitly support mixed-mode training.
 Much of the core of these changes will likely live in `slippi_ai/rl/run_lib.py` and `slippi_ai/envs.py`.
@@ -152,9 +152,8 @@ This supersedes the earlier outline. Steps will be executed sequentially, each w
    - Notes for Step 6+: per-mode logging should derive singles/doubles membership from the masked trajectory content (e.g., `states.is_teams`) since the learner’s `active_mask` no longer encodes original port placement.
 
 6. **Metrics and logging updates** (`slippi_ai/rl/run_lib.py`)
-   - Log realized singles ratio, per-mode reward mean/std, per-mode PPO metrics (actor_kl, teacher_kl, UEV), and effective active batch size during flushes.
-   - Validate `is_teams` stats now differentiate singles/doubles correctly.
-   - Tests: extend logger tests (or add new) validating the metrics dictionary contains the expected per-mode keys.
+   - Learner now aggregates per-mode statistics during PPO epochs; `metrics['per_mode']` contains reward, actor_kl, teacher_kl, and UEV means plus active-column counts and realized singles ratio. `get_log_data` surfaces effective batch size and ratio for wandb logging, and console logging prints a concise summary for both modes.
+   - Tests: `tests/learner_masking_test.py` validates the per-mode reducer against a synthetic mixed batch.
 
 7. **Docs and script refresh** (this document, `scripts/rl_*.sh`, README snippets)
    - Document new flags and assumptions (50/50 default, team-size normalization reliance).

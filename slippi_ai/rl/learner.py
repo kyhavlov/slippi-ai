@@ -214,9 +214,6 @@ class Learner:
               active_total, message='Active mask must contain at least one entry.'),
       ]):
         mask_tensor = tf.identity(mask_tensor)
-      if tf.reduce_all(mask_tensor):
-        return trajectory
-
       indices = tf.cast(tf.reshape(tf.where(mask_tensor), [-1]), tf.int32)
       mask_size = None
 
@@ -250,9 +247,6 @@ class Learner:
       mask_size = mask_np.size
       if mask_size == 0:
         raise ValueError('Active mask must contain at least one entry.')
-      if np.all(mask_np):
-        return trajectory
-
       indices = np.nonzero(mask_np)[0]
       states = self._slice_time_major(trajectory.states, mask_size, indices)
       name = self._slice_time_major(trajectory.name, mask_size, indices)
@@ -320,6 +314,131 @@ class Learner:
     entropies = controller_embedding.map(lambda _, d: d.entropy(), dist)
     return tf.add_n(list(controller_embedding.flatten(entropies)))
 
+  def _init_mode_accumulators(self) -> dict[str, dict[str, float]]:
+    def make_bucket():
+      return dict(
+          reward_sum=0.0,
+          reward_sq_sum=0.0,
+          reward_count=0,
+          actor_kl_sum=0.0,
+          actor_kl_count=0,
+          teacher_kl_sum=0.0,
+          teacher_kl_count=0,
+          uev_sum=0.0,
+          uev_count=0,
+          columns=0,
+      )
+
+    return {
+        'singles': make_bucket(),
+        'doubles': make_bucket(),
+    }
+
+  def _accumulate_mode_metrics(
+      self,
+      buckets: dict[str, dict[str, float]],
+      trajectory: Trajectory,
+      policy_metrics: dict,
+      value_metrics: dict,
+  ) -> None:
+    is_teams = np.asarray(trajectory.states.is_teams[0]).astype(bool)
+    masks = {
+        'singles': ~is_teams,
+        'doubles': is_teams,
+    }
+
+    rewards = np.asarray(trajectory.rewards)
+    actor_kl = np.asarray(policy_metrics['actor_kl'])
+    teacher_kl = np.asarray(policy_metrics['teacher_kl'])
+    uev = np.asarray(value_metrics.get('uev', ()))
+
+    for mode, mask in masks.items():
+      indices = np.nonzero(mask)[0]
+      if indices.size == 0:
+        continue
+
+      bucket = buckets[mode]
+      bucket['columns'] += int(indices.size)
+
+      mode_rewards = rewards[:, indices].reshape(-1)
+      bucket['reward_sum'] += float(mode_rewards.sum())
+      bucket['reward_sq_sum'] += float(np.square(mode_rewards).sum())
+      bucket['reward_count'] += int(mode_rewards.size)
+
+      mode_actor_kl = actor_kl[:, indices].reshape(-1)
+      bucket['actor_kl_sum'] += float(mode_actor_kl.sum())
+      bucket['actor_kl_count'] += int(mode_actor_kl.size)
+
+      mode_teacher_kl = teacher_kl[:, indices].reshape(-1)
+      bucket['teacher_kl_sum'] += float(mode_teacher_kl.sum())
+      bucket['teacher_kl_count'] += int(mode_teacher_kl.size)
+
+      if uev.size:
+        mode_uev = uev[:, indices].reshape(-1)
+        bucket['uev_sum'] += float(mode_uev.sum())
+        bucket['uev_count'] += int(mode_uev.size)
+
+  def _finalize_mode_metrics(
+      self,
+      buckets: dict[str, dict[str, float]],
+  ) -> dict[str, tp.Any]:
+    result = {}
+    total_columns = 0
+
+    def finalize_bucket(bucket: dict[str, float]) -> dict[str, tp.Any]:
+      stats = {}
+      count = bucket['reward_count']
+      if count:
+        mean = bucket['reward_sum'] / count
+        variance = max(bucket['reward_sq_sum'] / count - mean ** 2, 0.0)
+        stats['reward'] = dict(
+            mean=float(mean),
+            std=float(np.sqrt(variance)),
+            count=int(count),
+        )
+      else:
+        stats['reward'] = dict(mean=0.0, std=0.0, count=0)
+
+      for key in [('actor_kl', 'actor_kl_sum', 'actor_kl_count'),
+                  ('teacher_kl', 'teacher_kl_sum', 'teacher_kl_count')]:
+        metric, total_key, count_key = key
+        denom = bucket[count_key]
+        value = bucket[total_key] / denom if denom else 0.0
+        stats[metric] = dict(mean=float(value), count=int(denom))
+
+      denom = bucket['uev_count']
+      value = bucket['uev_sum'] / denom if denom else 0.0
+      stats['uev'] = dict(mean=float(value), count=int(denom))
+
+      stats['active_columns'] = int(bucket['columns'])
+      return stats
+
+    for mode, bucket in buckets.items():
+      stats = finalize_bucket(bucket)
+      result[mode] = stats
+      total_columns += stats['active_columns']
+
+    singles_columns = result['singles']['active_columns']
+    ratio = singles_columns / total_columns if total_columns else 0.0
+    result['totals'] = dict(
+        active_columns=int(total_columns),
+        singles_ratio=float(ratio),
+    )
+    return result
+
+  def _match_state_dtypes(self, states, template_states):
+    def cast_value(value, template):
+      if tf.is_tensor(value):
+        if value.dtype.is_integer and value.dtype not in (tf.int32, tf.uint8):
+          return tf.cast(value, tf.int32)
+        return value
+      if isinstance(value, np.ndarray) and np.issubdtype(value.dtype, np.integer):
+        if value.dtype not in (np.int32, np.uint8):
+          return value.astype(np.int32)
+      return value
+
+    return tf.nest.map_structure(cast_value, states, template_states)
+
   def unroll(
       self,
       trajectory: Trajectory,
@@ -328,7 +447,10 @@ class Learner:
   ) -> tp.Tuple[LearnerOutputs, LearnerState]:
     assert len(trajectory.delayed_actions) == self._policy.delay
 
+    original_states = trajectory.states
     trajectory = self._mask_trajectory(trajectory)
+    trajectory = trajectory._replace(
+        states=self._match_state_dtypes(trajectory.states, original_states))
 
     teacher_outputs = self._teacher.unroll(
         # TODO: use the teacher's name instead?
@@ -364,11 +486,22 @@ class Learner:
     # Value function outputs are for [0, U] while policy outputs are for
     # [D, U+D]. This means we can only train on steps [D, U].
 
+    original_states = trajectory.states
     trajectory = self._mask_trajectory(trajectory)
+    trajectory = trajectory._replace(
+        states=self._match_state_dtypes(trajectory.states, original_states))
 
     delay = self._policy.delay  # "D"
     remove_first = lambda t: t[delay:]
-    remove_last = lambda t: t[:t.shape[0] - delay]
+
+    def remove_last(arr):
+      if delay == 0:
+        return arr
+      if tf.is_tensor(arr):
+        time_len = tf.shape(arr, out_type=tf.int32)[0]
+        return arr[:time_len - delay]
+      arr_np = np.asarray(arr)
+      return arr_np[:arr_np.shape[0] - delay]
 
     advantages = outputs.value.advantages[delay:]  # [0, U] -> [D, U]
 
@@ -383,7 +516,7 @@ class Learner:
     # We also have to reset the policy state; this isn't visible to
     # the actor as it happens inside the agent (eval_lib.BasicAgent).
     is_resetting = trajectory.is_resetting[0]  # [B]
-    batch_size = is_resetting.shape[0]
+    batch_size = tf.shape(is_resetting, out_type=tf.int32)[0]
     initial_policy_state = tf.nest.map_structure(
         lambda x, y: tf_utils.where(is_resetting, x, y),
         self._policy.initial_state(batch_size), trajectory.initial_state)
@@ -474,15 +607,23 @@ class Learner:
       learner_outputs: list[LearnerOutputs],
       trajectories: list[Trajectory],
       train: bool,
-  ):
+  ) -> tuple[dict, dict[str, tp.Any]]:
     # Could cache this?
     grads_acc = [np.zeros(v.shape, dtype=v.dtype.as_numpy_dtype()) for v in self._policy_vars]
     metrics_acc = []
 
     metrics_acc = []
+    mode_acc = self._init_mode_accumulators()
     for outputs, trajectory in zip(learner_outputs, trajectories):
       metrics, grads_acc = self.compiled_ppo_grads_acc(outputs, trajectory, grads_acc)
       metrics_acc.append(metrics)
+      policy_metrics = tf.nest.map_structure(tf.identity, metrics)
+      self._accumulate_mode_metrics(
+          mode_acc,
+          trajectory,
+          policy_metrics,
+          tf.nest.map_structure(tf.identity, outputs.value.metrics),
+      )
 
     if train:
       self.apply_grads(grads_acc, scale=1 / len(learner_outputs))
@@ -496,7 +637,7 @@ class Learner:
         mean=np.mean(actor_kl),
         max=np.amax(actor_kl),
     )
-    return metrics
+    return metrics, self._finalize_mode_metrics(mode_acc)
 
   @tf.function(autograph=False)
   def ppo_epoch_full_tf(
@@ -548,11 +689,18 @@ class Learner:
       learner_outputs: list[LearnerOutputs],
       trajectories: list[Trajectory],
       train: bool,
-  ):
+  ) -> tuple[dict, dict[str, tp.Any]]:
     """Per-minibatch gradients."""
     metrics = []
+    mode_acc = self._init_mode_accumulators()
     for outputs, trajectory in zip(learner_outputs, trajectories):
       metrics.append(self.ppo_batch(outputs, trajectory, train))
+      self._accumulate_mode_metrics(
+          mode_acc,
+          trajectory,
+          tf.nest.map_structure(tf.identity, metrics[-1]),
+          tf.nest.map_structure(tf.identity, outputs.value.metrics),
+      )
 
     metrics = tf.nest.map_structure(lambda t: t.numpy(), metrics)
     metrics = utils.batch_nest(metrics)
@@ -563,7 +711,7 @@ class Learner:
         mean=np.mean(actor_kl),
         max=np.amax(actor_kl),
     )
-    return metrics
+    return metrics, self._finalize_mode_metrics(mode_acc)
 
   def ppo(
       self,
@@ -604,9 +752,14 @@ class Learner:
     checkpoint_vars = tf.nest.map_structure(tf.identity, self.get_vars())
 
     per_epoch_metrics = []
+    per_epoch_mode_stats = []
     for _ in range(num_epochs):
-      per_epoch_metrics.append(ppo_epoch(learner_outputs, trajectories, train=True))
-    per_epoch_metrics.append(ppo_epoch(learner_outputs, trajectories, train=False))
+      epoch_metrics, epoch_modes = ppo_epoch(learner_outputs, trajectories, train=True)
+      per_epoch_metrics.append(epoch_metrics)
+      per_epoch_mode_stats.append(epoch_modes)
+    eval_metrics, eval_modes = ppo_epoch(learner_outputs, trajectories, train=False)
+    per_epoch_metrics.append(eval_metrics)
+    per_epoch_mode_stats.append(eval_modes)
 
     # If the step was too big, revert to the previous parameters.
     # TODO: if this happens frequently, reduce the learning rate.
@@ -621,6 +774,7 @@ class Learner:
         post_update=per_epoch_metrics[-1],
         value=value_metrics,
         reverted=reverted,
+        per_mode=per_epoch_mode_stats[-1],
     )
 
     return hidden_state, metrics
@@ -634,7 +788,10 @@ class Learner:
     """Initialize model and optimizer variables."""
     # Note that optimizers need to be initialized with variables in the same
     # order as during imitation learning.
+    original_states = trajectory.states
     trajectory = self._mask_trajectory(trajectory)
+    trajectory = trajectory._replace(
+        states=self._match_state_dtypes(trajectory.states, original_states))
     batch_size = trajectory.is_resetting.shape[1]
     self.unroll(trajectory, self.initial_state(batch_size))
     self._value_vars = self._value_function.variables

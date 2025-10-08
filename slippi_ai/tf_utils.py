@@ -77,7 +77,7 @@ def dynamic_rnn(
   # tf.scan also converts inputs to TensorArrays; let's copy them
   inputs = tf.nest.map_structure(
       lambda t: tf.TensorArray(
-          dtype=t.dtype, size=t.shape[0],
+          dtype=t.dtype, size=tf.shape(t)[0],
           element_shape=t.shape[1:]).unstack(t),
       inputs)
 

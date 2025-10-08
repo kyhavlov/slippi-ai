@@ -353,6 +353,28 @@ class RolloutWorker:
     struct_np = self._structure_to_numpy(struct)
     return utils.map_single_structure(lambda arr: arr.copy(), struct_np)
 
+  def _scatter_name(self, port: Port, name_code) -> np.ndarray:
+    name_array = np.zeros((self._num_envs,), dtype=embed.NAME_DTYPE)
+    indices = self._active_indices.get(port)
+
+    arr = np.asarray(name_code)
+    if arr.ndim == 0:
+      try:
+        scalar_value = int(arr)
+      except Exception:
+        scalar_value = 0
+      name_array.fill(np.asarray(scalar_value, dtype=embed.NAME_DTYPE))
+      return name_array
+
+    values = arr.reshape(-1).astype(embed.NAME_DTYPE, copy=False)
+    if indices is None or indices.size == 0:
+      return name_array
+    if values.size != indices.size:
+      raise ValueError(
+          f'Name code length {values.size} does not match active columns {indices.size}')
+    name_array[indices] = values
+    return name_array
+
   def _scatter_sample(self, port: Port, sample: SampleOutputs) -> SampleOutputs:
     active_count = self._active_counts[port]
     if active_count == 0:
@@ -504,16 +526,18 @@ class RolloutWorker:
       agent = self._agents[port]
       if active_masks[port] is None:
         raise ValueError(f'Missing active mask for port {port}.')
+      if agent is None:
+        name_code = self._reference_agent.name_code
+      else:
+        name_code = agent.name_code
+      full_names = self._scatter_name(port, name_code)
+      repeated_names = np.tile(full_names, (num_steps + 1, 1))
       states=utils.batch_nest_nt(gamestates[port])
       policy = self._agents[port]._policy if agent is not None else self._reference_agent._policy
-      name_code = self._agents[port].name_code if agent is not None else self._reference_agent.name_code
       trajectories[port] = Trajectory(
           # TODO: Let the learner call from_state on game
           states=policy.embed_game.from_state(states),
-          name=np.full(
-              [num_steps + 1, self._num_envs],
-              name_code,
-              dtype=embed.NAME_DTYPE),
+          name=repeated_names,
           actions=utils.batch_nest_nt(sample_outputs[port]),
           rewards=reward.compute_rewards(states, self._damage_ratio),
           is_resetting=is_resetting,
