@@ -88,6 +88,50 @@ Each step should be its own commit so problems are easy to bisect, and every cod
    - Wire CLI flags to configure singles:doubles ratios (default 50/50) and document expectations in the RL scripts.
    - Exercise full pipeline smoke (fake envs + short PPO loop) under the new config, then provide guidance for real Dolphin ops.
 
+## Stage 1 Detailed Plan (2025-10-08)
+
+### Objectives
+- Consolidate on a one-Dolphin-per-env architecture while still feeding the learner the four logical port keys (`{1,2,3,4}`) that `LearnerManager._rollout` batches on today (`slippi_ai/rl/run_lib.py:203-232`).
+- Fix singles provisioning by deciding the singles vs doubles mix once at `AsyncBatchedEnvironmentMP` construction time, forcing the first `N` envs to be singles (with `N` even) and the remainder doubles.
+- Pair consecutive singles envs when materialising port data so the learner still observes `[self, teammate, opp1, opp2]` ordering, while the per-port batch dimension stays `config.actor.num_envs`.
+
+### Core Clarifications (2025-10-08)
+- `config.actor.num_envs` continues to represent the learner batch width (one column per logical four-port slot). Singles groups will still present four logical ports to the learner, but each singles group internally owns **two** Dolphin processes. Doubles groups keep a single Dolphin.
+- `RolloutWorker` always exchanges controller tensors indexed by global ports `{1,2,3,4}` and shaped `[num_envs, …]`. Stage 1 must preserve this contract. Singles implementations therefore need to slice those tensors per group and fan them out to the underlying single-Dolphin envs, then stitch the gamestate results back into the same global-port tensors.
+- Singles groups are contiguous: for group index `g < num_singles_groups`, we assign two sub-envs `(env_a, env_b)`.
+  - Controllers: `env_a` receives the per-group rows for ports 1 & 2; `env_b` receives the rows for ports 3 & 4.
+  - Observations: `env_a` populates global ports 1 & 2 using `get_game(..., singles_opponent_port=2)`, leaving ports 3 & 4 dead; `env_b` populates ports 3 & 4 via `singles_opponent_port=3`, leaving ports 1 & 2 dead. Concatenating those fills all four slots for the group without cross-group mixing.
+- Summary table per singles group (`g`):
+
+  | Global port | Backing sub-env | `singles_opponent_port` | Notes |
+  |-------------|-----------------|-------------------------|-------|
+  | 1           | `env_a`         | 2                       | Agent’s own view; teammate slot dead |
+  | 2           | `env_a`         | 2                       | Opponent’s POV for the same match |
+  | 3           | `env_b`         | 3                       | Second match’s agent |
+  | 4           | `env_b`         | 3                       | Second match’s opponent |
+- `inner_batch_size` remains a tuning knob. When singles are enabled we require it to be **even** and we round the singles count to a multiple of `inner_batch_size` so every worker chunk stays homogeneous (all singles or all doubles).
+
+### Test-First Deliverables
+1. **Singles/Doubles Layout Test** – Extend `tests/rl_env_stage0_test.py` (or add `tests/rl_env_stage1_scheduler_test.py`) with a harness that constructs `AsyncBatchedEnvironmentMP` using stub env processes and verifies:
+   - `config.actor.enable_singles=True` yields an even count of singles envs, occupying the first `N` slots; doubles fill the remainder.
+   - Each env receives exactly one Dolphin port at creation time.
+2. **Pairing Contract Test** – Using deterministic fake env outputs, assert that consecutive singles envs are paired such that the first contributes to `opp1` and the second to `opp2` across every rollout, while doubles envs pass through untouched. Validate the learner-facing dictionary still exposes ports `{1,2,3,4}` and that each per-port batch has size `config.actor.num_envs`.
+3. **RolloutWorker Mixed-Mode Smoke** – Update the fake-env smoke test to cover the new singles-first layout. Confirm controller commands round-trip in index order and that the singles:doubles ratio (default 50:50) holds over a window of rollouts.
+4. **Port Wiring Snapshot Update** – Refresh the legacy snapshot test to assert the single-Dolphin singles behaviour and note the removal of the old two-port requirement.
+
+Tests must land and be reviewed before touching production scheduler code.
+
+### Implementation Steps (each should be a standalone commit)
+1. **Async Environment Layout Refactor** – Update `AsyncBatchedEnvironmentMP` to: (a) accept `singles_ratio`, (b) compute `num_single_groups = round_to_multiple(config.actor.num_envs * singles_ratio, inner_batch_size)` while ensuring the result stays even, (c) instantiate `num_single_groups / inner_batch_size` worker chunks for singles (each chunk contains `inner_batch_size` sub-envs, therefore `inner_batch_size` / 2 matches), followed by doubles chunks, and (d) record a `GroupLayout` describing which sub-envs back each learner group.
+2. **Singles Pairing Logic** – Using the `GroupLayout`, route controller tensors and env outputs: per singles chunk, feed the even-index sub-env rows to logical ports `(1,2)` and the odd-index rows to `(3,4)` using the fixed `singles_opponent_port` mapping. Doubles chunks remain pass-through.
+3. **Config Surface & Validation** – Add `config.actor.singles_ratio` (default 0.5) and guardrails ensuring `num_singles` is even and does not exceed `num_envs`. Fail fast if callers request an incompatible split.
+4. **Instrumentation** – Emit debug-level logs around the computed singles/doubles counts and the opponent-slot assignment to aid debugging without flooding stdout.
+
+### Cleanup & Follow-Up
+- Retire the Stage 0 "Port Wiring Snapshot" test once the new expectations are validated.
+- Document the singles-first layout and pairing contract in this file and in `slippi_ai/envs.py` docstrings so future contributors understand the batching expectations.
+- Coordinate with Stage 2 to confirm learner-level metrics consume any new metadata emitted by the scheduler (if we surface mode labels later).
+
 ## Immediate Next Steps
-- Execute the Stage 0 breakdown above. First deliverable is the test scaffolding commit; once the new tests exist and describe current behavior we can review them together before progressing to the fixes.
-- After Stage 0 tests are green, reconvene to lock the Stage 1 scheduler design and unblock implementation.
+- Draft and submit the Stage 1 scheduler tests outlined above. Review them with the team before implementation.
+- Finalize the scheduler design (naming, API surface) based on feedback, then proceed with the commit sequence under "Implementation Steps".
