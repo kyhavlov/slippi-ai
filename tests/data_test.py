@@ -209,6 +209,31 @@ def _make_replay_info(character: int, slug: str) -> data.ReplayInfo:
   )
 
 
+def _make_doubles_replay_info(character: int, slug: str) -> data.ReplayInfo:
+  player = data.PlayerMeta(character=character, name=f'd_player{character}', team=0)
+  teammate = data.PlayerMeta(character=character + 100, name=f'd_team{character}', team=0)
+  opponent_a = data.PlayerMeta(character=character + 200, name=f'd_opp{character}', team=1)
+  opponent_b = data.PlayerMeta(character=character + 201, name=f'd_opp{character}b', team=1)
+  meta = data.ReplayMeta(
+      p0=player,
+      p1=teammate,
+      p2=opponent_a,
+      p3=opponent_b,
+      stage=1,
+      slp_md5=f'slp_{slug}',
+      is_singles=False,
+  )
+
+  return data.ReplayInfo(
+      path=f'/tmp/{slug}.parquet',
+      main_player_index=0,
+      teammate_index=1,
+      main_player_name=player.name,
+      meta=meta,
+      opponent_order=(2, 3),
+  )
+
+
 class DataTest(unittest.TestCase):
 
   def test_replays_from_meta_singles(self):
@@ -703,6 +728,8 @@ class DataTest(unittest.TestCase):
     data_source = data.DataSource.__new__(data.DataSource)
     data_source.replays = replays
     data_source.balance_characters = True
+    data_source.balance_singles_doubles = False
+    data_source.character_balance_ratio = 0.5
     data_source.replay_counter = 0
 
     iterator = data_source.iter_replays()
@@ -718,6 +745,8 @@ class DataTest(unittest.TestCase):
     data_source = data.DataSource.__new__(data.DataSource)
     data_source.replays = replays
     data_source.balance_characters = True
+    data_source.balance_singles_doubles = False
+    data_source.character_balance_ratio = 0.5
     data_source.replay_counter = 0
 
     iterator = data_source.iter_replays()
@@ -744,11 +773,91 @@ class DataTest(unittest.TestCase):
     data_source = data.DataSource.__new__(data.DataSource)
     data_source.replays = replays
     data_source.balance_characters = True
+    data_source.balance_singles_doubles = False
+    data_source.character_balance_ratio = 0.5
     data_source.replay_counter = 0
 
     iterator = data_source.iter_replays()
     observed_paths = [next(iterator).path for _ in range(6)]
     self.assertIn('/tmp/invalid.parquet', observed_paths)
+
+  def test_replay_stream_enforces_mode_balance(self):
+    singles = [
+        _make_replay_info(1, 'singles_mode_a'),
+        _make_replay_info(2, 'singles_mode_b'),
+    ]
+    doubles = [
+        _make_doubles_replay_info(10 + i, f'doubles_mode_{i}')
+        for i in range(4)
+    ]
+
+    iterator = data.replay_stream(
+        singles + doubles,
+        balance_characters=False,
+        balance_singles_doubles=True,
+    )
+
+    samples = [next(iterator) for _ in range(40)]
+    singles_count = sum(1 for info in samples if info.meta.is_singles)
+    doubles_count = len(samples) - singles_count
+    self.assertEqual(singles_count, doubles_count)
+
+  def test_character_balance_ratio_scales_balanced_weight(self):
+    dominant = [_make_replay_info(1, f'dominant_{i}') for i in range(5)]
+    rare = [_make_replay_info(2, 'rare')]
+    replays = dominant + rare
+
+    sample_size = 120
+
+    def _ratio(r):
+      iterator = data.replay_stream(
+          replays,
+          balance_characters=True,
+          balance_singles_doubles=False,
+          character_balance_ratio=r,
+      )
+      samples = [next(iterator) for _ in range(sample_size)]
+      rare_count = sum(1 for info in samples if info.main_player.character == 2)
+      return rare_count / sample_size
+
+    raw_ratio = _ratio(0.0)
+    partial_ratio = _ratio(0.2)
+    half_ratio = _ratio(0.5)
+
+    self.assertGreater(partial_ratio, raw_ratio)
+    self.assertGreater(half_ratio, partial_ratio)
+
+  def test_iter_replays_balances_modes_and_characters(self):
+    singles = [
+        _make_replay_info(1, 'singles_a'),
+        _make_replay_info(2, 'singles_b'),
+    ]
+    doubles = [
+        _make_doubles_replay_info(10, 'doubles_a'),
+        _make_doubles_replay_info(11, 'doubles_b'),
+        _make_doubles_replay_info(12, 'doubles_c'),
+    ]
+    replays = singles + doubles
+
+    data_source = data.DataSource.__new__(data.DataSource)
+    data_source.replays = replays
+    data_source.balance_characters = True
+    data_source.balance_singles_doubles = True
+    data_source.character_balance_ratio = 0.5
+    data_source.replay_counter = 0
+
+    iterator = data_source.iter_replays()
+    samples = [next(iterator) for _ in range(12)]
+
+    singles_count = sum(1 for info in samples if info.meta.is_singles)
+    doubles_count = len(samples) - singles_count
+    self.assertEqual(singles_count, doubles_count)
+
+    singles_chars = {info.main_player.character for info in samples if info.meta.is_singles}
+    self.assertSetEqual(singles_chars, {1, 2})
+
+    doubles_chars = {info.main_player.character for info in samples if not info.meta.is_singles}
+    self.assertSetEqual(doubles_chars, {10, 11, 12})
 
 
 if __name__ == '__main__':

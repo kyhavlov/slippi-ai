@@ -133,6 +133,219 @@ class ReplayTask(NamedTuple):
   replay: ReplayInfo
   epoch_progress: float
 
+
+def _split_replays_by_mode(replays: Iterable[ReplayInfo]) -> Tuple[list[ReplayInfo], list[ReplayInfo], list[ReplayInfo]]:
+  singles: list[ReplayInfo] = []
+  doubles: list[ReplayInfo] = []
+  unknown: list[ReplayInfo] = []
+
+  for replay in replays:
+    meta = getattr(replay, 'meta', ())
+    is_singles = getattr(meta, 'is_singles', None)
+    if is_singles is None:
+      unknown.append(replay)
+    elif is_singles:
+      singles.append(replay)
+    else:
+      doubles.append(replay)
+
+  return singles, doubles, unknown
+
+
+def _cycle_items(items: Iterable[ReplayInfo]) -> Optional[Iterator[ReplayInfo]]:
+  items = tuple(items)
+  if not items:
+    return None
+  return itertools.cycle(items)
+
+
+def _round_robin_iterators(*iterables: Iterable[ReplayInfo]) -> Optional[Iterator[ReplayInfo]]:
+  non_empty = [it for it in iterables if it is not None]
+  if not non_empty:
+    return None
+  return utils.interleave(*non_empty)
+
+
+def _distribute_unknown_between_modes(
+    singles: Iterable[ReplayInfo],
+    doubles: Iterable[ReplayInfo],
+    unknown: Iterable[ReplayInfo],
+) -> Tuple[list[ReplayInfo], list[ReplayInfo]]:
+  singles_list = list(singles)
+  doubles_list = list(doubles)
+  unknown_list = list(unknown)
+
+  for idx, replay in enumerate(unknown_list):
+    if len(singles_list) <= len(doubles_list):
+      singles_list.append(replay)
+    else:
+      doubles_list.append(replay)
+
+  return singles_list, doubles_list
+
+
+def _character_cycle(replays: Iterable[ReplayInfo]) -> Optional[Iterator[ReplayInfo]]:
+  groups: dict[int, list[ReplayInfo]] = collections.defaultdict(list)
+
+  for replay in replays:
+    try:
+      character = int(replay.main_player.character)
+    except Exception:
+      continue
+    groups[character].append(replay)
+
+  valid_groups = [tuple(entries) for entries in groups.values() if entries]
+  if len(valid_groups) <= 1:
+    return None
+
+  iterables = [itertools.cycle(group) for group in valid_groups]
+  return utils.interleave(*iterables)
+
+
+def _character_counts_for_logging(replays: Iterable[ReplayInfo]) -> dict[str, int]:
+  counts: collections.Counter = collections.Counter()
+
+  for replay in replays:
+    try:
+      character = int(replay.main_player.character)
+    except Exception:
+      continue
+    try:
+      name = melee.Character(character).name.lower()
+    except ValueError:
+      name = str(character)
+    counts[name] += 1
+
+  return dict(counts)
+
+
+class _ModeSampler:
+  def __init__(
+      self,
+      replays: Iterable[ReplayInfo],
+      *,
+      label: str,
+      balance_ratio: float,
+  ):
+    self.replays: Tuple[ReplayInfo, ...] = tuple(replays)
+    self.available = bool(self.replays)
+    self._raw_iter = _cycle_items(self.replays)
+    self._balanced_iter = _character_cycle(self.replays) if self.replays else None
+    self.has_balanced = self._balanced_iter is not None
+    self._balance_ratio = max(0.0, min(balance_ratio, 1.0))
+    self._balance_budget = 0.0
+    if self.has_balanced and label != 'global' and self._balance_ratio > 0:
+      logging.info('Character balance counts [%s]: %s',
+                   label, _character_counts_for_logging(self.replays))
+    self._toggle = False
+
+  def next(self, use_balanced: bool) -> ReplayInfo:
+    if self._raw_iter is None:
+      raise RuntimeError('No replays available for sampling.')
+
+    if (use_balanced and self._balanced_iter is not None and
+        self._balance_ratio > 0):
+      if self._balance_ratio >= 1.0:
+        return next(self._balanced_iter)
+
+      self._balance_budget += self._balance_ratio
+      if self._balance_budget >= 1.0:
+        self._balance_budget -= 1.0
+        return next(self._balanced_iter)
+
+    return next(self._raw_iter)
+
+class _ReplaySampler:
+  """Generates replay sequences with optional balancing constraints."""
+
+  def __init__(
+      self,
+      replays: Iterable[ReplayInfo],
+      *,
+      balance_characters: bool = False,
+      balance_singles_doubles: bool = False,
+      character_balance_ratio: float = 0.5,
+  ):
+    replays = tuple(replays)
+    if not replays:
+      raise ValueError('ReplaySampler requires at least one replay.')
+
+    self._replays = replays
+    self._balance_characters = balance_characters
+    self._balance_singles_doubles = balance_singles_doubles
+    self._character_balance_ratio = (
+        max(0.0, min(character_balance_ratio, 1.0))
+        if balance_characters else 0.0)
+
+    singles, doubles, unknown = _split_replays_by_mode(replays)
+    self._singles = singles
+    self._doubles = doubles
+    self._unknown = unknown
+
+    singles_ext, doubles_ext = _distribute_unknown_between_modes(
+        self._singles, self._doubles, self._unknown)
+    self._singles_sampler = _ModeSampler(
+        singles_ext,
+        label='singles',
+        balance_ratio=self._character_balance_ratio)
+    self._doubles_sampler = _ModeSampler(
+        doubles_ext,
+        label='doubles',
+        balance_ratio=self._character_balance_ratio)
+
+    self._mode_toggle = False
+    self._mode_balance_available = (
+        self._balance_singles_doubles
+        and self._singles_sampler.available
+        and self._doubles_sampler.available)
+    self._warned_mode_balance = False
+
+    self._global_sampler = _ModeSampler(
+        self._replays,
+        label='global',
+        balance_ratio=self._character_balance_ratio)
+
+  def next(self) -> ReplayInfo:
+    if self._mode_balance_available:
+      sampler = (self._singles_sampler if not self._mode_toggle
+                 else self._doubles_sampler)
+      self._mode_toggle = not self._mode_toggle
+      return sampler.next(self._balance_characters)
+
+    if self._balance_singles_doubles and not self._warned_mode_balance:
+      logging.info(
+          'Falling back to dataset distribution; unable to balance '
+          'singles/doubles (singles=%d, doubles=%d).',
+          len(self._singles_sampler.replays), len(self._doubles_sampler.replays))
+      self._warned_mode_balance = True
+
+    if self._balance_characters and self._global_sampler.has_balanced:
+      replay = self._global_sampler.next(True)
+    else:
+      replay = self._global_sampler.next(False)
+    return replay
+
+  def iterator(self) -> Iterator[ReplayInfo]:
+    while True:
+      yield self.next()
+
+
+def replay_stream(
+    replays: Iterable[ReplayInfo],
+    *,
+    balance_characters: bool = False,
+    balance_singles_doubles: bool = False,
+    character_balance_ratio: float = 0.5,
+) -> Iterator[ReplayInfo]:
+  """Return an infinite iterator over replays respecting balancing options."""
+  sampler = _ReplaySampler(
+      list(replays),
+      balance_characters=balance_characters,
+      balance_singles_doubles=balance_singles_doubles,
+      character_balance_ratio=character_balance_ratio,
+  )
+  return sampler.iterator()
+
 def _charset(chars: Optional[Iterable[melee.Character]]) -> Set[int]:
   if chars is None:
     chars = list(melee.Character)
@@ -437,6 +650,8 @@ class DataSource:
       allowed_characters: Optional[list[melee.Character]] = None,
       allowed_opponents: Optional[list[melee.Character]] = None,
       balance_characters: bool = False,
+      balance_singles_doubles: bool = False,
+      character_balance_ratio: float = 0.5,
       name_map: Optional[dict[str, int]] = None,
       num_workers: int = 1,
       replay_queue: Optional[queue.Queue] = None,
@@ -449,6 +664,8 @@ class DataSource:
     self.compressed = compressed
     self.batch_counter = 0
     self.balance_characters = balance_characters
+    self.balance_singles_doubles = balance_singles_doubles
+    self.character_balance_ratio = max(0.0, min(character_balance_ratio, 1.0))
 
     self._executor: Optional[futures.ThreadPoolExecutor] = None
     self._num_workers = max(1, num_workers)
@@ -478,57 +695,27 @@ class DataSource:
     self.name_map = name_map or {}
     self.encode_name = nametags.name_encoder(self.name_map)
 
+    self._replay_sampler: Optional[_ReplaySampler] = None
+    if replay_queue is None:
+      self._ensure_sampler()
+
+  def _ensure_sampler(self):
+    if getattr(self, '_replay_sampler', None) is None:
+      balance_characters = getattr(self, 'balance_characters', False)
+      balance_modes = getattr(self, 'balance_singles_doubles', False)
+      balance_ratio = getattr(self, 'character_balance_ratio', 0.5)
+      self._replay_sampler = _ReplaySampler(
+          getattr(self, 'replays', []),
+          balance_characters=balance_characters,
+          balance_singles_doubles=balance_modes,
+          character_balance_ratio=balance_ratio,
+      )
+
   def iter_replays(self) -> Iterator[ReplayInfo]:
-    replay_iter = itertools.cycle(self.replays)
-
-    if not self.balance_characters:
-      for replay in replay_iter:
-        self.replay_counter += 1
-        yield replay
-      return
-
-    by_character: dict[int, list[ReplayInfo]] = collections.defaultdict(list)
-    skipped = 0
-
-    for replay in self.replays:
-      try:
-        character = int(replay.main_player.character)
-      except Exception:
-        skipped += 1
-        continue
-
-      by_character[character].append(replay)
-
-    if len(by_character) <= 1:
-      if skipped:
-        logging.debug(
-            'Skipping character balancing because %d replays lacked metadata.',
-            skipped)
-      for replay in replay_iter:
-        self.replay_counter += 1
-        yield replay
-      return
-
-    character_counts: dict[str, int] = {}
-    for char, entries in by_character.items():
-      try:
-        char_enum = melee.Character(char)
-        char_name = char_enum.name.lower()
-      except ValueError:
-        char_name = str(char)
-      character_counts[char_name] = len(entries)
-
-    if skipped:
-      logging.info(
-          'Skipped %d replay(s) without character metadata while balancing.',
-          skipped)
-    logging.info('Character balance counts: %s', character_counts)
-
-    iterators = [itertools.cycle(entries) for entries in by_character.values()]
-    balanced_iter = utils.interleave(*iterators)
-    combined_iter = utils.interleave(balanced_iter, replay_iter)
-
-    for replay in combined_iter:
+    self._ensure_sampler()
+    assert self._replay_sampler is not None
+    sampler_iter = self._replay_sampler.iterator()
+    for replay in sampler_iter:
       self.replay_counter += 1
       yield replay
 
@@ -646,12 +833,21 @@ class DataSourceMP:
     self._process_sizes: dict[int, int] = {}
     self._closed = False
     self._global_batch_counter = 0
-    self._pending: dict[int, list[tuple[Batch, float]]] = {}
+    self._pending: dict[int, list[Tuple[Batch, float]]] = {}
     self._scheduler_stop = threading.Event()
-    self._rng = random.Random()
     self._balance_characters = kwargs.get('balance_characters', False)
+    self._balance_singles_doubles = kwargs.get('balance_singles_doubles', False)
+    self._character_balance_ratio = max(
+        0.0, min(kwargs.get('character_balance_ratio', 0.5), 1.0))
     self._epoch_base = 0.0
     self._total_replays = len(self._all_replays)
+    self._replay_sampler = _ReplaySampler(
+        self._all_replays,
+        balance_characters=self._balance_characters,
+        balance_singles_doubles=self._balance_singles_doubles,
+        character_balance_ratio=self._character_balance_ratio,
+    )
+    self._scheduler_iter = self._replay_sampler.iterator()
 
     replays = kwargs.get('replays', None)
     num_shards = len(shard_sizes)
@@ -747,50 +943,7 @@ class DataSourceMP:
       self._epoch_base += 1.0
 
   def _build_epoch_replays(self) -> list[ReplayInfo]:
-    epoch = list(self._all_replays)
-    if not self._balance_characters:
-      self._rng.shuffle(epoch)
-      return epoch
-
-    by_character: dict[int, list[ReplayInfo]] = collections.defaultdict(list)
-    unknown: list[ReplayInfo] = []
-    for replay in epoch:
-      try:
-        character = int(replay.main_player.character)
-      except Exception:
-        unknown.append(replay)
-        continue
-      by_character[character].append(replay)
-
-    for entries in by_character.values():
-      self._rng.shuffle(entries)
-
-    ordered: list[ReplayInfo] = []
-    active_chars = list(by_character.keys())
-    self._rng.shuffle(active_chars)
-
-    while active_chars and len(ordered) < len(epoch):
-      next_active: list[int] = []
-      for character in active_chars:
-        bucket = by_character[character]
-        if not bucket:
-          continue
-        ordered.append(bucket.pop())
-        if bucket:
-          next_active.append(character)
-        if len(ordered) == len(epoch):
-          break
-      active_chars = next_active
-
-    remaining = []
-    for entries in by_character.values():
-      remaining.extend(entries)
-    remaining.extend(unknown)
-    if remaining:
-      self._rng.shuffle(remaining)
-      ordered.extend(remaining)
-
-    return ordered
+    return [next(self._scheduler_iter) for _ in range(self._total_replays)]
 
   def close(self):
     if self._closed:
@@ -837,6 +990,8 @@ class DataConfig:
   compressed: bool = True
   in_parallel: bool = True
   balance_characters: bool = False
+  balance_singles_doubles: bool = False
+  character_balance_ratio: float = 0.5
   num_workers: int = 1
   prefetch_buffer: int = 0
   loader_processes: int = 1
