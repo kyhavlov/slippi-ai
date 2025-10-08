@@ -66,7 +66,6 @@ class RolloutWorker:
       use_ray_envs: bool = False,
       agent_names: list[tuple[str, str]] = [],
   ):
-    print("use_gpu = ", use_gpu)
     self._agents = {
         port: eval_lib.build_delayed_agent(
             console_delay=dolphin_kwargs['online_delay'],
@@ -132,8 +131,7 @@ class RolloutWorker:
 
   def _build_env(self):
     if self._use_ray_envs:
-      self._env = env_lib.RayBatchedEnvironment(
-          self._num_envs, self._dolphin_kwargs, **self._env_kwargs)
+      raise NotImplementedError('Ray environments have been removed.')
     elif self._use_fake_envs:
       self._env = env_lib.FakeBatchedEnvironment(
           self._num_envs, players=list(self._agents))

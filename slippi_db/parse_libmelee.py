@@ -118,29 +118,23 @@ def get_game(
   if len(game.players) == 0:
     print("================== NO PLAYERS LEFT IN GAME ====================")
 
-  # For singles mode, create a proper 4-player structure
-  if len(ports) == 2:
-    #print(f"Creating dummy players for singles mode - current players: {list(players.keys())}")
-    
-    # Create a dead player for empty slots
+  is_singles = len(ports) == 2
+
+  if is_singles:
     state = melee.PlayerState()
     state.action = melee.Action.DEAD_DOWN
     state.position = melee.Position(0, -100)
     empty_player = get_player(state)._replace(is_dead=True)
-    
-    # Save the original players
+
     p0 = players['p0']
     p1 = players['p1']
-    
-    # Clear and rebuild the players dictionary with the correct mapping
+
     players = {
-        'p0': p0,                                # Self (port 1)
-        'p1': empty_player,                      # Teammate (empty in singles)
-        'p2': p1 if singles_opponent_port == 2 else empty_player,  # Opponent 1
-        'p3': p1 if singles_opponent_port == 3 else empty_player,  # Opponent 2
+        'p0': p0,
+        'p1': empty_player,
+        'p2': p1 if singles_opponent_port == 2 else empty_player,
+        'p3': p1 if singles_opponent_port == 3 else empty_player,
     }
-    
-    #print(f"Final players after singles mode processing: {list(players.keys())}")
 
   return Game(
       stage=np.uint8(game.stage.value),
@@ -150,7 +144,7 @@ def get_game(
           y=np.float32(0.0),
       ),
       items=Items(**{f'item_{i}': _EMPTY_ITEM for i in range(len(Items._fields))}),
-      is_teams=True,
+      is_teams=not is_singles,
       **players,
   )
 

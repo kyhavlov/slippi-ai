@@ -1,16 +1,18 @@
-import requests
 import json
-import sys # For exiting on error if needed
+import logging
+from collections.abc import Sequence
+
+import requests
 from melee import GameState, Character
 
-url = "http://127.0.0.1:5000/submit_match" # Change if host/port is different
+logger = logging.getLogger(__name__)
+
+url = "http://127.0.0.1:5000/submit_match"  # Change if host/port is different
 
 headers = {'Content-Type': 'application/json'}
 
-# Define a timeout in seconds.
-# You can use a single value for both connect and read timeouts,
-# or a tuple (connect_timeout, read_timeout).
-request_timeout = 10 # Wait max 10 seconds for the server to respond
+# Define a timeout in seconds (connect, read).
+request_timeout = 10
 
 # returns true if one team has no stocks remaining
 def match_is_over(gamestate: GameState):
@@ -35,27 +37,50 @@ def get_winner(gamestate: GameState):
         
     return None # draw/sudden death
 
-def submit_match(gamestate: GameState, agent_names: tuple[str, str], characters: list[Character]):
+def submit_match(
+    gamestate: GameState,
+    agent_names: Sequence[str],
+    characters: Sequence[Character],
+):
     winner = get_winner(gamestate)
     if winner is None:
-        print("Error: No winner found! sudden death?")
+        logger.warning("match reporting skipped: sudden death / no winner")
         return
     
-    def character_to_name(character: Character):
-        charname = next(name for name, value in vars(Character).items() if value == character)
-        name = str(charname).capitalize()
+    if len(agent_names) < 4 or len(characters) < 4:
+        raise ValueError('submit_match expects 4 agent names and characters.')
 
-        # special case for characters that have a space in their name
+    def character_to_name(character: Character) -> str:
+        charname = next(
+            name for name, value in vars(Character).items()
+            if value == character)
+        name = str(charname).capitalize()
         if name == "Cptfalcon":
             name = "Falcon"
-
         return name
-    
+
+    # Agent name list is expected in controller port order 1..4.
+    ports = [0, 1, 2, 3]
+    names_by_port = {port + 1: agent_names[port] for port in ports}
+    chars_by_port = {port + 1: character_to_name(characters[port]) for port in ports}
+
     match_results = {
-        "team1_player1": {"name": agent_names[0], "character": character_to_name(characters[0])},
-        "team1_player2": {"name": agent_names[3], "character": character_to_name(characters[3])},
-        "team2_player1": {"name": agent_names[1], "character": character_to_name(characters[1])},
-        "team2_player2": {"name": agent_names[2], "character": character_to_name(characters[2])},
+        "team1_player1": {
+            "name": names_by_port.get(1, ""),
+            "character": chars_by_port.get(1, ""),
+        },
+        "team1_player2": {
+            "name": names_by_port.get(4, ""),
+            "character": chars_by_port.get(4, ""),
+        },
+        "team2_player1": {
+            "name": names_by_port.get(2, ""),
+            "character": chars_by_port.get(2, ""),
+        },
+        "team2_player2": {
+            "name": names_by_port.get(3, ""),
+            "character": chars_by_port.get(3, ""),
+        },
         "winner": winner
     }
 
@@ -70,25 +95,17 @@ def submit_match(gamestate: GameState, agent_names: tuple[str, str], characters:
         # Raise an exception for bad status codes (4xx or 5xx)
         response.raise_for_status()
 
-        '''print(f"Success!")
-        print(f"Status Code: {response.status_code}")
-        try:
-            print(f"Response JSON: {response.json()}")
-        except json.JSONDecodeError:
-            print(f"Response Content (not JSON): {response.text}")'''
-
     except requests.exceptions.Timeout:
-        print(f"Error: The request timed out after {request_timeout} seconds.")
+        logger.error("match reporting request timed out after %ss", request_timeout)
     except requests.exceptions.ConnectionError as e:
-        print(f"Error: Could not connect to the server at {url}.")
-        print(f"Details: {e}")
+        logger.error("match reporting connection error to %s: %s", url, e)
     except requests.exceptions.HTTPError as e:
-        print(f"Error: HTTP Error occurred: {e.response.status_code} {e.response.reason}")
-        # Try to print the response body if available, it might contain error details
         try:
-            print(f"Server Response: {e.response.json()}")
+            details = e.response.json()
         except json.JSONDecodeError:
-            print(f"Server Response (raw): {e.response.text}")
+            details = e.response.text
+        logger.error(
+            "match reporting HTTP error %s %s: %s",
+            e.response.status_code, e.response.reason, details)
     except requests.exceptions.RequestException as e:
-        # Catch any other request-related errors
-        print(f"Error: An unexpected error occurred during the request: {e}")
+        logger.error("match reporting unexpected error: %s", e)

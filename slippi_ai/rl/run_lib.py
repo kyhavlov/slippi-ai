@@ -245,7 +245,6 @@ class LearnerManager:
       actor_metrics = tf.nest.map_structure(
           lambda *xs: np.mean(xs), *actor_metrics)
       
-      print("collected %d trajectories" % len(trajectories))
 
     with self.learner_profiler:
       self._hidden_state, metrics = self._learner.ppo(
@@ -422,7 +421,6 @@ def run(config: Config):
         name=[name_configuration_batch[j][i-1] for j in range(batch_size)],
         **main_agent_kwargs.copy(),
     )
-    print("port names: ", i, agent_kwargs[i]['name'])
 
   env_kwargs = dict(swap_ports=False)
   if config.actor.async_envs:
@@ -431,7 +429,6 @@ def run(config: Config):
         inner_batch_size=config.actor.inner_batch_size,
         enable_singles=config.actor.enable_singles,
     )
-    print('num steps', config.actor.num_env_steps)
 
   build_actor = lambda: evaluators.RolloutWorker(
       agent_kwargs=agent_kwargs,
