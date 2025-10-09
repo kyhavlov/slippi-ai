@@ -118,6 +118,29 @@ Each step should be its own commit so problems are easy to bisect, and every cod
 2. **Pairing Contract Test** – Using deterministic fake env outputs, assert that consecutive singles envs are paired such that the first contributes to `opp1` and the second to `opp2` across every rollout, while doubles envs pass through untouched. Validate the learner-facing dictionary still exposes ports `{1,2,3,4}` and that each per-port batch has size `config.actor.num_envs`.
 3. **RolloutWorker Mixed-Mode Smoke** – Update the fake-env smoke test to cover the new singles-first layout. Confirm controller commands round-trip in index order and that the singles:doubles ratio (default 50:50) holds over a window of rollouts.
 4. **Port Wiring Snapshot Update** – Refresh the legacy snapshot test to assert the single-Dolphin singles behaviour and note the removal of the old two-port requirement.
+
+## Stage 2 Detailed Plan (2025-10-08)
+
+### Objectives
+- Keep learner-side returns/advantages correct when singles and doubles trajectories share a batch.
+- Publish clear singles vs doubles telemetry (reward, KLs, PPO objective, entropy) so mixed-mode regressions are actionable.
+
+### Core Tasks
+- **Mode Mask Plumbing** – Derive a `[B]` mask from `Trajectory.states.is_teams` that tags each logical slot as singles or doubles after Stage 1 pairing. Thread the mask through learner metrics helpers so aggregations can filter by mode.
+- **Learner Math Updates** – Recompute rewards inside `Learner.ppo` using the refreshed `is_teams` flag, assert `_apply_mode_scale` gets exercised, and normalise reductions by per-mode counts to avoid skew when batches overwhelmingly favour one mode.
+- **Telemetry Surfaces** – Extend the learner metrics dict with nested `singles`/`doubles` stats (reward mean, PPO objective mean, teacher/actor KL, entropy). Update `run_lib.get_log_data` to forward these without flattening so wandb gets the split automatically.
+- **Config Guardrails** – Add validation/warnings when `singles_ratio` rounding collapses to only singles or doubles so operators understand why telemetry goes missing.
+
+### Test-First Deliverables
+1. **Mixed-Mode PPO Regression** – New unittest (e.g., `tests/rl_stage2_learner_test.py`) that constructs a tiny learner with real policy/value stubs, feeds a combined singles+doubles batch, and asserts:
+   - Reward recomputation differentiates modes (singles scale applies when `is_teams=False`).
+   - PPO gradients are non-zero for both modes and remain separable in the returned metrics.
+   - Metrics expose `singles` and `doubles` sub-keys with sensible means.
+2. **Telemetry Smoke** – Extend the async RolloutWorker fake-env smoke to check the logging payload contains the new per-mode metrics both when singles are enabled (split present) and disabled (doubles-only entry present, singles omitted).
+
+### Tooling / Documentation
+- Document the new metrics contract here and in relevant docstrings so later stages (Stage 3 CLI plumbing) can wire wandb dashboards without spelunking the learner.
+- Reinforce the `.linuxvenv` activation requirement in AGENTS.md if future contributors miss the note at the top of this file.
 5. **Async Rollout Integration** – Add an async `RolloutWorker` smoke test that patches `AsyncEnvMP` with deterministic stubs, proving the scheduler feeds four-slot trajectories to the learner and routes controller batches to the correct left/right singles roles.
 
 Tests must land and be reviewed before touching production scheduler code.

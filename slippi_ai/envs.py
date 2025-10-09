@@ -77,6 +77,10 @@ def compute_mixed_mode_layout(
   tentative_singles = max(tentative_singles, min_single_envs)
 
   if tentative_singles == 0:
+    logging.warning(
+        'Mixed-mode layout collapsed to doubles-only (total_envs=%d, '
+        'singles_ratio=%.3f, inner_batch_size=%d).',
+        total_envs, singles_ratio, inner_batch_size)
     chunk_modes = ['doubles'] * outer_batch_size
     chunk_physical_sizes = [inner_batch_size] * outer_batch_size
     return MixedModeLayout(
@@ -109,6 +113,10 @@ def compute_mixed_mode_layout(
       tentative_singles -= remainder
 
   if tentative_singles == 0:
+    logging.warning(
+        'Mixed-mode layout collapsed to doubles-only after rounding '
+        '(total_envs=%d, singles_ratio=%.3f, inner_batch_size=%d).',
+        total_envs, singles_ratio, inner_batch_size)
     chunk_modes = ['doubles'] * outer_batch_size
     chunk_physical_sizes = [inner_batch_size] * outer_batch_size
     return MixedModeLayout(
@@ -138,6 +146,17 @@ def compute_mixed_mode_layout(
       if mode == 'singles' else inner_batch_size
       for mode in chunk_modes
   ]
+
+  if num_double_groups == 0:
+    logging.warning(
+        'Mixed-mode layout rounded to singles-only groups '
+        '(total_envs=%d, singles_ratio=%.3f, inner_batch_size=%d).',
+        total_envs, singles_ratio, inner_batch_size)
+  elif num_single_groups == 0:
+    logging.warning(
+        'Mixed-mode layout rounded to doubles-only groups '
+        '(total_envs=%d, singles_ratio=%.3f, inner_batch_size=%d).',
+        total_envs, singles_ratio, inner_batch_size)
 
   return MixedModeLayout(
       total_envs=total_envs,

@@ -143,31 +143,31 @@ DEFAULT_CONFIG = Config()
 DEFAULT_CONFIG.dolphin.console_timeout = 30
 
 CHARACTER_WEIGHTINGS = {
-      Character.FOX: 2000,
+      Character.FOX: 1000,
       Character.FALCO: 1000,
       Character.MARTH: 1000,
       Character.SHEIK: 1000,
       Character.PEACH: 1000,
       Character.CPTFALCON: 1000,
       Character.JIGGLYPUFF: 1000,
-      Character.PIKACHU: 200,
-      Character.YOSHI: 200,
-      Character.GANONDORF: 200,
-      Character.POPO: 100,
-      Character.SAMUS: 100,
-      Character.DK: 100,
-      Character.LUIGI: 100,
-      Character.DOC: 50,
-      Character.MARIO: 50,
-      Character.YLINK: 50,
-      Character.LINK: 50,
-      Character.GAMEANDWATCH: 50,
-      Character.NESS: 50,
-      Character.ROY: 50,
-      Character.MEWTWO: 50,
-      Character.PICHU: 50,
-      Character.BOWSER: 50,
-      Character.KIRBY: 50,
+      Character.PIKACHU: 1000,
+      Character.YOSHI: 1000,
+      Character.GANONDORF: 1000,
+      Character.POPO: 1000,
+      Character.SAMUS: 1000,
+      Character.DK: 1000,
+      Character.LUIGI: 1000,
+      Character.DOC: 1000,
+      Character.MARIO: 1000,
+      Character.YLINK: 1000,
+      Character.LINK: 1000,
+      Character.GAMEANDWATCH: 1000,
+      Character.NESS: 1000,
+      Character.ROY: 1000,
+      Character.MEWTWO: 1000,
+      Character.PICHU: 1000,
+      Character.BOWSER: 1000,
+      Character.KIRBY: 1000,
 }
 
 class LearnerManager:
@@ -270,6 +270,21 @@ class Logger:
     train_lib.log_stats(to_log, step, take_mean=False)
     self.buffer = []
     return to_log
+
+
+def attach_mode_metrics(metrics: dict) -> dict:
+  """Surface learner mode breakdown alongside top-level metrics."""
+  learner_metrics = metrics.get('learner') if isinstance(metrics, dict) else None
+  if not isinstance(learner_metrics, dict):
+    metrics.pop('mode', None)
+    return metrics
+
+  mode_metrics = learner_metrics.get('mode')
+  if mode_metrics:
+    metrics['mode'] = mode_metrics
+  else:
+    metrics.pop('mode', None)
+  return metrics
 
 def concise_name(name: str) -> str:
   if name == 'Master Player':
@@ -592,6 +607,8 @@ def run(config: Config):
       timings[key] = actor_timing[key]
     for key in ['agent_pop', 'agent_step']:
       timings[key] = actor_timing[key][PORT]
+
+    attach_mode_metrics(metrics)
 
     # Stack to shape [T, P, B] where P is the number of trajectories
     states: Game = utils.map_nt(

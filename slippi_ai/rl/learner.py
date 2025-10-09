@@ -17,6 +17,111 @@ from slippi_ai import tf_utils, utils, reward as reward_lib
 
 field = lambda f: dataclasses.field(default_factory=f)
 
+
+class StatsAccumulator:
+
+  def __init__(self):
+    self.count = 0
+    self.total = 0.0
+    self.total_sq = 0.0
+    self._min = None
+    self._max = None
+
+  def add(self, values: np.ndarray):
+    flat = np.asarray(values, dtype=np.float64).reshape(-1)
+    if flat.size == 0:
+      return
+    self.count += flat.size
+    self.total += float(flat.sum())
+    self.total_sq += float(np.square(flat).sum())
+    current_min = float(flat.min())
+    current_max = float(flat.max())
+    if self._min is None or current_min < self._min:
+      self._min = current_min
+    if self._max is None or current_max > self._max:
+      self._max = current_max
+
+  def finalize(self) -> dict | None:
+    if self.count == 0:
+      return None
+    mean = self.total / self.count
+    variance = max(self.total_sq / self.count - mean * mean, 0.0)
+    return {
+        'mean': float(mean),
+        'variance': float(variance),
+        'stddev': float(np.sqrt(variance)),
+        'min': float(self._min),
+        'max': float(self._max),
+    }
+
+
+class ModeAggregator:
+
+  def __init__(self):
+    def _bucket():
+      return {
+          'envs': 0,
+          'ports': 0,
+          'reward': StatsAccumulator(),
+          'ppo_objective': StatsAccumulator(),
+          'teacher_kl': StatsAccumulator(),
+          'actor_kl': StatsAccumulator(),
+          'entropy': StatsAccumulator(),
+      }
+
+    self._buckets: dict[str, dict] = {
+        'singles': _bucket(),
+        'doubles': _bucket(),
+    }
+
+  def add(self, mode: str, mask: np.ndarray, reward: np.ndarray, metrics: dict[str, np.ndarray]):
+    slot_mask = np.asarray(mask, dtype=bool)
+    slot_count = int(slot_mask.sum())
+    if slot_count == 0:
+      return
+
+    bucket = self._buckets[mode]
+    bucket['ports'] = max(bucket['ports'], slot_count)
+
+    total_ports = slot_mask.size
+    env_mask = None
+    ports_per_env = 4 if reward.shape[1] == total_ports and total_ports % 4 == 0 else None
+    if ports_per_env:
+      try:
+        env_mask = slot_mask.reshape(ports_per_env, -1).any(axis=0)
+      except ValueError:
+        env_mask = None
+
+    if env_mask is not None:
+      env_count = int(env_mask.sum())
+      bucket['envs'] = max(bucket['envs'], env_count)
+
+      reward_reshaped = reward.reshape(reward.shape[0], ports_per_env, -1)
+      ally_reward = reward_reshaped[:, 0, env_mask]
+      bucket['reward'].add(ally_reward)
+    else:
+      bucket['envs'] = max(bucket['envs'], slot_count)
+      bucket['reward'].add(reward[:, slot_mask])
+
+    for name in ('ppo_objective', 'teacher_kl', 'actor_kl', 'entropy'):
+      bucket[name].add(metrics[name][:, slot_mask])
+
+  def finalize(self) -> dict[str, dict]:
+    result: dict[str, dict] = {}
+    for mode, bucket in self._buckets.items():
+      if bucket['envs'] <= 0:
+        continue
+      mode_metrics = {
+          'count': int(bucket['envs']),
+          'ports': int(bucket['ports']),
+      }
+      for name in ('reward', 'ppo_objective', 'teacher_kl', 'actor_kl', 'entropy'):
+        stats = bucket[name].finalize()
+        if stats:
+          mode_metrics[name] = stats
+      result[mode] = mode_metrics
+    return result
+
 @dataclasses.dataclass
 class PPOConfig:
   num_epochs: int = 1
@@ -284,8 +389,6 @@ class Learner:
 
       ppo_objective = tf.minimum(rhos * advantages, clipped_rhos * advantages)
 
-      print("current kl_teacher weight in learner: ", self._config.kl_teacher_weight)
-
       weighted_losses = [
           - self._config.policy_gradient_weight * ppo_objective,
           self._config.ppo.beta * actor_kl,
@@ -326,6 +429,7 @@ class Learner:
       learner_outputs: list[LearnerOutputs],
       trajectories: list[Trajectory],
       train: bool,
+      capture_timeseries: bool = False,
   ):
     # Could cache this?
     grads_acc = [np.zeros(v.shape, dtype=v.dtype.as_numpy_dtype()) for v in self._policy_vars]
@@ -342,12 +446,23 @@ class Learner:
     metrics_acc = tf.nest.map_structure(lambda t: t.numpy(), metrics_acc)
     metrics = utils.batch_nest(metrics_acc)
 
+    timeseries = None
+    if capture_timeseries:
+      timeseries = {
+          'ppo_objective': np.array(metrics['ppo_objective']),
+          'teacher_kl': np.array(metrics['teacher_kl']),
+          'entropy': np.array(metrics['entropy']),
+          'actor_kl': np.array(metrics['actor_kl']),
+      }
+
     # Make sure to take max over whole epoch, not just over the minibatch.
     actor_kl = metrics['actor_kl']
     metrics['actor_kl'] = dict(
         mean=np.mean(actor_kl),
         max=np.amax(actor_kl),
     )
+    if capture_timeseries:
+      metrics['_timeseries'] = timeseries
     return metrics
 
   @tf.function(autograph=False)
@@ -356,6 +471,7 @@ class Learner:
       learner_outputs: list[LearnerOutputs],
       trajectories: list[Trajectory],
       train: bool,
+      capture_timeseries: bool = False,
   ):
     # Accumulate gradients across the entire batch.
     grads_acc = [tf.zeros_like(v) for v in self._policy_vars]
@@ -377,6 +493,15 @@ class Learner:
 
     metrics = tf.nest.map_structure(lambda *xs: tf.stack(xs), *metrics_acc)
 
+    timeseries = None
+    if capture_timeseries:
+      timeseries = {
+          'ppo_objective': tf.convert_to_tensor(metrics['ppo_objective']).numpy(),
+          'teacher_kl': tf.convert_to_tensor(metrics['teacher_kl']).numpy(),
+          'entropy': tf.convert_to_tensor(metrics['entropy']).numpy(),
+          'actor_kl': tf.convert_to_tensor(metrics['actor_kl']).numpy(),
+      }
+
     if train:
       self.policy_optimizer.apply(grads_acc, self._policy_vars)
 
@@ -386,6 +511,8 @@ class Learner:
         mean=tf.reduce_mean(actor_kl),
         max=tf.reduce_max(actor_kl),
     )
+    if capture_timeseries:
+      metrics['_timeseries'] = timeseries
     return metrics
 
   @tf.function
@@ -400,6 +527,7 @@ class Learner:
       learner_outputs: list[LearnerOutputs],
       trajectories: list[Trajectory],
       train: bool,
+      capture_timeseries: bool = False,
   ):
     """Per-minibatch gradients."""
     metrics = []
@@ -409,12 +537,23 @@ class Learner:
     metrics = tf.nest.map_structure(lambda t: t.numpy(), metrics)
     metrics = utils.batch_nest(metrics)
 
+    timeseries = None
+    if capture_timeseries:
+      timeseries = {
+          'ppo_objective': np.array(metrics['ppo_objective']),
+          'teacher_kl': np.array(metrics['teacher_kl']),
+          'entropy': np.array(metrics['entropy']),
+          'actor_kl': np.array(metrics['actor_kl']),
+      }
+
     # Make sure to take max over whole epoch, not just over the minibatch.
     actor_kl = metrics['actor_kl']
     metrics['actor_kl'] = dict(
         mean=np.mean(actor_kl),
         max=np.amax(actor_kl),
     )
+    if capture_timeseries:
+      metrics['_timeseries'] = timeseries
     return metrics
 
   def ppo(
@@ -456,8 +595,10 @@ class Learner:
 
     per_epoch_metrics = []
     for _ in range(num_epochs):
-      per_epoch_metrics.append(ppo_epoch(learner_outputs, trajectories, train=True))
-    per_epoch_metrics.append(ppo_epoch(learner_outputs, trajectories, train=False))
+      per_epoch_metrics.append(ppo_epoch(
+          learner_outputs, trajectories, train=True, capture_timeseries=False))
+    per_epoch_metrics.append(ppo_epoch(
+        learner_outputs, trajectories, train=False, capture_timeseries=True))
 
     # If the step was too big, revert to the previous parameters.
     # TODO: if this happens frequently, reduce the learning rate.
@@ -467,10 +608,15 @@ class Learner:
           lambda v, c: v.assign(c), self.get_vars(), checkpoint_vars)
       reverted = True
 
+    post_update = per_epoch_metrics[-1]
+    timeseries = post_update.pop('_timeseries', None)
+    mode_metrics = self._compute_mode_breakdown(trajectories, timeseries)
+
     metrics = dict(
         ppo_step={str(i): d for i, d in enumerate(per_epoch_metrics)},
-        post_update=per_epoch_metrics[-1],
+        post_update=post_update,
         value=value_metrics,
+        mode=mode_metrics,
         reverted=reverted,
     )
 
@@ -480,6 +626,37 @@ class Learner:
   def trainable_variables(self) -> tp.Sequence[tf.Variable]:
     return (self._policy.trainable_variables +
             self._value_function.trainable_variables)
+
+  def _compute_mode_breakdown(
+      self,
+      trajectories: list[Trajectory],
+      timeseries: tp.Optional[dict[str, np.ndarray]],
+  ) -> dict[str, dict]:
+    if not timeseries:
+      return {}
+
+    aggregator = ModeAggregator()
+
+    objective = np.asarray(timeseries['ppo_objective'])
+    teacher_kl = np.asarray(timeseries['teacher_kl'])
+    entropy = np.asarray(timeseries['entropy'])
+    actor_kl = np.asarray(timeseries['actor_kl'])
+
+    for idx, trajectory in enumerate(trajectories):
+      mode_flags = np.asarray(trajectory.states.is_teams[0], dtype=bool)
+      reward = np.asarray(trajectory.rewards)
+
+      metrics = {
+          'ppo_objective': objective[idx],
+          'teacher_kl': teacher_kl[idx],
+          'entropy': entropy[idx],
+          'actor_kl': actor_kl[idx],
+      }
+
+      aggregator.add('singles', np.logical_not(mode_flags), reward, metrics)
+      aggregator.add('doubles', mode_flags, reward, metrics)
+
+    return aggregator.finalize()
 
   def initialize(self, trajectory: Trajectory):
     """Initialize model and optimizer variables."""
