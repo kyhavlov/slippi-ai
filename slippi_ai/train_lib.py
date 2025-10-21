@@ -160,6 +160,7 @@ class RuntimeConfig:
   max_runtime: int = 1 * 60 * 60  # maximum runtime in seconds
   log_interval: int = 10  # seconds between logging
   save_interval: int = 300  # seconds between saving to disk
+  save_every_n: int = 0  # save every N steps (0 disables)
 
   eval_every_n: int = 100  # number of training steps between evaluations
   num_eval_steps: int = 10  # number of batches per evaluation
@@ -393,17 +394,17 @@ def train(config: Config):
       lambda var, val: var.assign(val),
       tf_state, state)
 
-  def save():
-    # Local Save
+  def _snapshot_state() -> bytes:
     tf_state = get_tf_state()
-
-    # easier to always bundle the config with the state
     combined_state = dict(
         state=tf_state,
         config=dataclasses.asdict(config),
         name_map=name_map,
     )
-    pickled_state = pickle.dumps(combined_state)
+    return pickle.dumps(combined_state)
+
+  def save():
+    pickled_state = _snapshot_state()
 
     logging.info('saving state to %s', pickle_path)
     with open(pickle_path, 'wb') as f:
@@ -412,6 +413,8 @@ def train(config: Config):
     if save_to_s3:
       logging.info('saving state to S3: %s', s3_keys.combined)
       s3_store.put(s3_keys.combined, pickled_state)
+
+    return pickled_state
 
   maybe_save = utils.Periodically(save, runtime.save_interval)
 
@@ -569,4 +572,14 @@ def train(config: Config):
     maybe_log(train_stats)
     maybe_eval()
 
-    maybe_save()
+    pickled_state = maybe_save()
+    if runtime.save_every_n > 0:
+      total_steps = int(step.numpy())
+      if total_steps % runtime.save_every_n == 0:
+        if pickled_state is None:
+          pickled_state = _snapshot_state()
+        step_path = os.path.join(
+            expt_dir, f'step_{total_steps:09d}.pkl')
+        logging.info('saving state to %s', step_path)
+        with open(step_path, 'wb') as f:
+          f.write(pickled_state)

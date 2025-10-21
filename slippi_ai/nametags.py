@@ -68,6 +68,7 @@ name_groups = [
   ('Gosu', 'WIZZ#310'),
   # Most Franz games are local with no name; for those we assume any Doctor Mario is Franz.
   ('Franz', 'XELA#158', 'PLATO#0'),
+  ('Ginger', 'GING#345'),
 
   ('xRunRiot', 'DUBS#185', 'JOKR#744', 'YMCM#734'),
   ('Tempo', 'TEMP#0', 'TMPO#972'),

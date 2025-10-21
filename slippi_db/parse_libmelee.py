@@ -111,7 +111,6 @@ def get_game(
     else:
       state = melee.PlayerState()
       state.action = melee.Action.DEAD_DOWN
-      state.position = melee.Position(0, -100)
       player = get_player(state)
       players[f'p{i}'] = player._replace(is_dead=True)
 
@@ -123,7 +122,6 @@ def get_game(
   if is_singles:
     state = melee.PlayerState()
     state.action = melee.Action.DEAD_DOWN
-    state.position = melee.Position(0, -100)
     empty_player = get_player(state)._replace(is_dead=True)
 
     p0 = players['p0']

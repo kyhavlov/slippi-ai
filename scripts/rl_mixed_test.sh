@@ -11,7 +11,8 @@
 
 # What player(s) from the dataset should we condition on?
 # This can be a comma-separated list.
-NAME="Master Player"
+NAME="Master Player,Cody,Darkatma,Dragunov,xRunRiot,Amsa"
+NAME_ALLOWLIST="ALL:Master Player,Cptfalcon:Buddyboom,Fox:Cody,Darkatma,Dragunov,xRunRiot,Sheik:Darkatma,Peach:Darkatma,Marth:Dragunov,Yoshi:Amsa"
 D=21
 TAG=rl_doubles_delay_${D}_mixedtest
 ROOTDIR=$(pwd)
@@ -27,7 +28,7 @@ python slippi_ai/rl/run.py \
   --config.runtime.log_interval=30 \
   --config.dolphin.path="$DOLPHIN_PATH" \
   --config.dolphin.iso="$ISO_PATH" \
-  --config.dolphin.headless=True \
+  --config.dolphin.headless=False \
   --config.dolphin.console_timeout=60 \
   --config.dolphin.infinite_time=False \
   --config.dolphin.disable_audio=True \
@@ -44,10 +45,10 @@ python slippi_ai/rl/run.py \
   --config.learner.ppo.beta=3e-1 \
   --config.learner.ppo.epsilon=1e-2 \
   --config.learner.ppo.minibatched=False \
-  --config.teacher="$ROOTDIR/testnew9.pkl" \
+  --config.teacher="$ROOTDIR/models/imitation_v3_1200k.pkl" \
   --config.opponent.type=self \
   --config.opponent.train=True \
-  --config.actor.rollout_length=60 \
+  --config.actor.rollout_length=240 \
   --config.actor.num_envs=4 \
   --config.actor.inner_batch_size=2 \
   --config.actor.async_envs=True \
@@ -56,6 +57,7 @@ python slippi_ai/rl/run.py \
   --config.actor.enable_singles=True \
   --config.actor.singles_ratio=0.5 \
   --config.agent.name="$NAME" \
+  --config.agent.name_allowlist="$NAME_ALLOWLIST" \
   --config.agent.batch_steps=4 \
   --config.runtime.reset_every_n_steps=512 \
   --config.runtime.burnin_steps_after_reset=1 \
