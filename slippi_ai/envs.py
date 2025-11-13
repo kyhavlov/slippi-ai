@@ -2,7 +2,7 @@ import collections
 import contextlib
 import logging
 import multiprocessing as mp
-from multiprocessing.connection import Connection
+from multiprocessing.connection import Connection, wait as mp_wait
 import traceback
 import typing as tp
 from typing import Mapping, Optional
@@ -763,6 +763,10 @@ class AsyncEnvMP:
       raise output
     return output
 
+  @property
+  def connection(self) -> Connection:
+    return self._parent_conn
+
 
 def _select_ports(
     controllers: Controllers,
@@ -792,36 +796,62 @@ class _SinglesChunk:
   def __init__(self, left_env: AsyncEnvMP, right_env: AsyncEnvMP):
     self._left_env = left_env
     self._right_env = right_env
+    self._left_conn = getattr(left_env, 'connection', None)
+    self._right_conn = getattr(right_env, 'connection', None)
 
   def send(self, controllers: Controllers):
-    left_controllers = _select_ports(controllers, (1, 2))
-    right_controllers = _select_ports(controllers, (3, 4))
+    # When num_steps>0, controllers arrive as a list/tuple of dicts. Split per step.
+    if isinstance(controllers, (list, tuple)):
+      left_batch = []
+      right_batch = []
+      for step_controllers in controllers:
+        left_batch.append(_select_ports(step_controllers, (1, 2)))
+        right_batch.append(_select_ports(step_controllers, (3, 4)))
+    else:
+      left_batch = _select_ports(controllers, (1, 2))
+      right_batch = _select_ports(controllers, (3, 4))
 
-    self._left_env.send(left_controllers)
-    self._right_env.send(right_controllers)
+    self._left_env.send(left_batch)
+    self._right_env.send(right_batch)
 
   def recv(self) -> EnvOutput:
-    while True:
-      left_output = self._left_env.recv()
-      right_output = self._right_env.recv()
+    left_output, right_output = self._recv_pair()
 
-      if isinstance(left_output, list):
-        if not isinstance(right_output, list):
-          raise EnvError('Mismatched singles chunk outputs: list vs scalar')
-        if len(left_output) != len(right_output):
-          raise EnvError('Mismatched singles chunk batch lengths')
-        if not left_output:
-          # Empty batches can occur during resets; wait for the next payload.
-          continue
-        return [
-            _merge_singles_env_outputs(lo, ro)
-            for lo, ro in zip(left_output, right_output)
-        ]
+    if isinstance(left_output, list):
+      if not isinstance(right_output, list):
+        raise EnvError('Mismatched singles chunk outputs: list vs scalar')
+      if len(left_output) != len(right_output):
+        raise EnvError('Mismatched singles chunk batch lengths')
+      if not left_output:
+        # Empty batches can occur during resets; wait for the next payload.
+        return self.recv()
+      return [
+          _merge_singles_env_outputs(lo, ro)
+          for lo, ro in zip(left_output, right_output)
+      ]
 
-      if isinstance(right_output, list):
-        raise EnvError('Mismatched singles chunk outputs: scalar vs list')
+    if isinstance(right_output, list):
+      raise EnvError('Mismatched singles chunk outputs: scalar vs list')
 
-      return _merge_singles_env_outputs(left_output, right_output)
+    return _merge_singles_env_outputs(left_output, right_output)
+
+  def _recv_pair(self) -> tuple[EnvOutput | list[EnvOutput], EnvOutput | list[EnvOutput]]:
+    if self._left_conn is None or self._right_conn is None:
+      return self._left_env.recv(), self._right_env.recv()
+
+    remaining = {
+        self._left_conn: ('left', self._left_env),
+        self._right_conn: ('right', self._right_env),
+    }
+    outputs: dict[str, EnvOutput | list[EnvOutput]] = {}
+
+    while remaining:
+      ready = mp_wait(list(remaining.keys()))
+      for conn in ready:
+        side, env = remaining.pop(conn)
+        outputs[side] = env.recv()
+
+    return outputs['left'], outputs['right']
 
   def begin_stop(self):
     self._left_env.begin_stop()

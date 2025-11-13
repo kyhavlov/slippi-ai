@@ -56,7 +56,12 @@ class Stage1SchedulerTests(unittest.TestCase):
             port: utils.map_nt(np.copy, game)
             for port, game in gamestates.items()
         }
-        return envs.EnvOutput(gamestates=copied, needs_reset=self._needs_reset.copy())
+        reset_ports = {port: self._needs_reset.copy() for port in self._ports}
+        return envs.EnvOutput(
+            gamestates=copied,
+            needs_reset=self._needs_reset.copy(),
+            needs_reset_ports=reset_ports,
+        )
 
       def stop(self):
         pass
