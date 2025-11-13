@@ -2,11 +2,16 @@
 
 import collections
 import contextlib
+import dataclasses
+import random
 import typing as tp
 import cProfile
 
 import numpy as np
 import ray
+
+from absl import logging
+from melee import Character, Stage
 
 from slippi_ai import envs as env_lib
 from slippi_ai import (
@@ -15,6 +20,7 @@ from slippi_ai import (
     policies,
     reward,
     utils,
+    match_reporting,
 )
 from slippi_ai.types import Game
 from slippi_ai.controller_heads import SampleOutputs
@@ -51,6 +57,26 @@ class Trajectory(tp.NamedTuple):
         batch_dims, *trajectories)
 
 
+@dataclasses.dataclass
+class NameSelectionConfig:
+  per_character: dict[Character, list[str]]
+  fallback: list[str]
+
+
+def _name_pool_for_character(
+    selection: NameSelectionConfig,
+    character: Character,
+) -> list[str]:
+  pool = list(selection.per_character.get(character, []))
+  if selection.fallback:
+    seen = set(pool)
+    for name in selection.fallback:
+      if name not in seen:
+        pool.append(name)
+        seen.add(name)
+  return pool
+
+
 class RolloutWorker:
 
   def __init__(
@@ -65,6 +91,7 @@ class RolloutWorker:
       use_fake_envs: bool = False,
       use_ray_envs: bool = False,
       agent_names: list[tuple[str, str]] = [],
+      name_selection: tp.Optional[NameSelectionConfig] = None,
   ):
     self._agents = {
         port: eval_lib.build_delayed_agent(
@@ -92,7 +119,14 @@ class RolloutWorker:
     self._env_kwargs = env_kwargs
     self._async_envs = async_envs
     self._use_ray_envs = use_ray_envs
-    self._agent_names = agent_names
+    self._name_selection = name_selection
+    self._rng = random.Random()
+
+    self._agent_names = [list(names) for names in agent_names]
+    self._per_port_name_codes: dict[Port, np.ndarray] = {
+        port: np.array(agent.name_code, copy=True) for port, agent in self._agents.items()
+    }
+    self._last_full_state: list[tp.Optional[Game]] = [None] * num_envs
     self._build_env()
 
     self._damage_ratio = damage_ratio
@@ -129,6 +163,9 @@ class RolloutWorker:
     for _ in range(self.env_runahead):
       self._push_actions()
 
+  def _agent_names_payload(self) -> list[tuple[str, str]]:
+    return [tuple(names) for names in self._agent_names]
+
   def _build_env(self):
     if self._use_ray_envs:
       raise NotImplementedError('Ray environments have been removed.')
@@ -141,7 +178,10 @@ class RolloutWorker:
       else:
         env_class = env_lib.AsyncBatchedEnvironmentMP
       self._env = env_class(
-          self._num_envs, self._dolphin_kwargs, agent_names=self._agent_names, **self._env_kwargs)
+          self._num_envs,
+          self._dolphin_kwargs,
+          agent_names=self._agent_names_payload(),
+          **self._env_kwargs)
 
   def reset_env(self):
     self._env.stop()
@@ -174,6 +214,160 @@ class RolloutWorker:
     }
     with self._env_push_profiler:
       self._env.push(decoded_actions)
+
+  def _choose_name_for_port(self, port: Port, character: Character) -> tp.Optional[tuple[str, int]]:
+    if not self._name_selection:
+      return None
+
+    name_pool = _name_pool_for_character(self._name_selection, character)
+
+    if not name_pool:
+      return None
+
+    shuffled = name_pool[:]
+    self._rng.shuffle(shuffled)
+
+    for candidate in shuffled:
+      try:
+        name_code = self._agents[port].get_name_code(candidate)
+      except KeyError:
+        logging.warning('Unknown nametag "%s" requested for port %d; skipping', candidate, port)
+        continue
+      return candidate, name_code
+
+    logging.warning('No valid nametag found for port %d with character %s', port, character.name)
+    return None
+
+  def _handle_env_resets(self, env_output: env_lib.EnvOutput):
+    needs_reset = env_output.needs_reset
+    if isinstance(needs_reset, np.ndarray):
+      reset_indices = np.flatnonzero(needs_reset)
+    elif needs_reset:
+      reset_indices = [0]
+    else:
+      return
+
+    if not len(reset_indices):
+      return
+
+    log_lines: list[str] = []
+    for env_idx in reset_indices:
+      self._report_match(env_idx)
+
+      reset_ports_mask = env_output.needs_reset_ports
+      if reset_ports_mask is not None:
+        ports_to_update: list[int] = []
+        for port in self._agents:
+          mask_value = reset_ports_mask.get(port, env_output.needs_reset)
+          mask_array = np.asarray(mask_value)
+          flag = bool(mask_array if mask_array.ndim == 0 else mask_array[env_idx])
+          if flag:
+            ports_to_update.append(port)
+      else:
+        ports_to_update = list(self._agents)
+
+      if not ports_to_update or self._name_selection is None:
+        continue
+
+      per_port_strings = []
+      stage_strings: list[str] = []
+      for port in ports_to_update:
+        agent = self._agents[port]
+        batched_game = env_output.gamestates[port]
+        try:
+          single_game = utils.map_single_structure(lambda arr: arr[env_idx], batched_game)
+          stage_value = int(np.asarray(single_game.stage).item())
+          stage_name = Stage(stage_value).name
+          character = Character(int(single_game.p0.character))
+        except Exception:
+          stage_name = str(np.asarray(batched_game.stage))
+          character = Character(int(np.asarray(batched_game.p0.character)[env_idx]))
+
+        current_name = self._agent_names[env_idx][port - 1]
+        selection = self._choose_name_for_port(port, character)
+        if selection is None:
+          per_port_strings.append(f'P{port} {current_name} ({character.name})')
+          stage_strings.append(stage_name)
+          continue
+
+        name, name_code = selection
+        if name == current_name:
+          per_port_strings.append(f'P{port} {name} ({character.name})')
+          stage_strings.append(stage_name)
+          continue
+
+        self._agent_names[env_idx][port - 1] = name
+        name_codes = self._per_port_name_codes[port].copy()
+        name_codes[env_idx] = name_code
+        self._per_port_name_codes[port] = name_codes
+        agent.set_name_codes(name_codes)
+
+        per_port_strings.append(f'P{port} {name} ({character.name})')
+        stage_strings.append(stage_name)
+
+      if per_port_strings:
+        seen = set()
+        ordered_stages = []
+        for stage_name in stage_strings:
+          if stage_name not in seen:
+            seen.add(stage_name)
+            ordered_stages.append(stage_name)
+        stage_summary = ', '.join(ordered_stages) if ordered_stages else 'unknown'
+        log_lines.append(
+            f'env {env_idx} stages [{stage_summary}]: '
+            + ', '.join(f'{entry} @ {stage}' for entry, stage in zip(per_port_strings, stage_strings))
+        )
+
+    for line in log_lines:
+      logging.info('Env reset %s', line)
+
+  def _update_state_cache(self, env_output: env_lib.EnvOutput):
+    if not env_output.gamestates:
+      return
+    primary_port = next(iter(env_output.gamestates))
+    game_batch = env_output.gamestates[primary_port]
+
+    for env_idx in range(self._num_envs):
+      self._last_full_state[env_idx] = utils.map_single_structure(
+          lambda x: x[env_idx], game_batch)
+
+  def _report_match(self, env_idx: int):
+    state = self._last_full_state[env_idx]
+    if state is None or not state.is_teams:
+      return
+
+    team1_stocks = int(state.p0.stocks_left) + int(state.p1.stocks_left)
+    team2_stocks = int(state.p2.stocks_left) + int(state.p3.stocks_left)
+
+    if team1_stocks <= 0 and team2_stocks <= 0:
+      return
+    if team1_stocks > 0 and team2_stocks == 0:
+      winner = 1
+    elif team2_stocks > 0 and team1_stocks == 0:
+      winner = 2
+    else:
+      return
+
+    try:
+      characters = [
+          Character(int(state.p0.character)),
+          Character(int(state.p1.character)),
+          Character(int(state.p2.character)),
+          Character(int(state.p3.character)),
+      ]
+    except ValueError:
+      logging.warning('Match reporting skipped: invalid character id in state %s', state)
+      return
+
+    try:
+      match_reporting.submit_match_summary(
+          tuple(self._agent_names[env_idx]),
+          characters,
+          winner)
+    except Exception as exc:
+      logging.warning('Match reporting failed for env %d: %s', env_idx, exc)
+
+    self._last_full_state[env_idx] = None
 
   def rollout(self, num_steps: int) -> tuple[tp.Mapping[Port, Trajectory], Timings]:
     # This ensures that the agent can process all of the states it will be fed.
@@ -213,6 +407,9 @@ class RolloutWorker:
       # state peeked on the previous rollout.
       with step_profiler:
         output = self._env.pop()
+
+      self._handle_env_resets(output)
+      self._update_state_cache(output)
 
       record_state(output, self._prev_agent_outputs.popleft())
 

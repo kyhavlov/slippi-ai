@@ -217,6 +217,8 @@ class DelayedAgent:
   ):
     policy = saving.load_policy_from_state(state)
 
+    self._name_map: dict[str, int] = state.get('name_map', {})
+
     self._batch_steps = batch_steps
     self._input_queue = []
 
@@ -260,6 +262,14 @@ class DelayedAgent:
   @property
   def name_code(self):
     return self._agent._name_code
+
+  def get_name_code(self, name: str) -> int:
+    if name not in self._name_map:
+      raise KeyError(name)
+    return self._name_map[name]
+
+  def set_name_codes(self, name_codes: tp.Sequence[int]):
+    self._agent.set_name_code(list(name_codes))
 
   def step(
       self,
@@ -316,26 +326,38 @@ def _run_agent_mp(
       **agent_kwargs
   )
 
-  while batch_steps == 0:
-    next_item: Optional[tuple[embed.Game, bool]] = state_queue.get()
-    if next_item is None:
-      return
-    game, needs_reset = next_item
-    sampled_controller = agent.step(game, needs_reset)
-    controller_queue.put(sampled_controller)
+  def handle_command(item) -> bool:
+    if isinstance(item, tuple) and item and item[0] == 'set_name_codes':
+      _, codes = item
+      agent.set_name_code(codes)
+      return True
+    return False
 
-  while batch_steps > 0:
-    states = []
-    for _ in range(batch_steps):
+  if batch_steps == 0:
+    while True:
       next_item: Optional[tuple[embed.Game, bool]] = state_queue.get()
       if next_item is None:
         return
-      states.append(next_item)
+      if handle_command(next_item):
+        continue
+      game, needs_reset = next_item
+      sampled_controller = agent.step(game, needs_reset)
+      controller_queue.put(sampled_controller)
+  else:
+    while True:
+      states = []
+      while len(states) < batch_steps:
+        next_item: Optional[tuple[embed.Game, bool]] = state_queue.get()
+        if next_item is None:
+          return
+        if handle_command(next_item):
+          continue
+        states.append(next_item)
 
-    sampled_controllers = agent.multi_step(states)
+      sampled_controllers = agent.multi_step(states)
 
-    for controller in sampled_controllers:
-      controller_queue.put(controller)
+      for controller in sampled_controllers:
+        controller_queue.put(controller)
 
 def _run_agent_mp_wrapper(*args, **kwargs):
   try:
@@ -358,6 +380,12 @@ class AsyncDelayedAgent:
     self._batch_size = batch_size
     self._batch_steps = batch_steps
     self._agent_kwargs = agent_kwargs
+    self._name_map: dict[str, int] = state.get('name_map', {})
+
+    initial_name_code = agent_kwargs.get('name_code')
+    if isinstance(initial_name_code, int):
+      initial_name_code = [initial_name_code] * batch_size
+    self._name_code = np.array(initial_name_code, dtype=embed.NAME_DTYPE)
 
     config = state['config']
     policy_delay = config['policy']['delay']
@@ -387,6 +415,20 @@ class AsyncDelayedAgent:
 
     self.pop = self._output_delay_queue.get
     self.peek_n = self._output_delay_queue.peek_n
+
+  @property
+  def name_code(self):
+    return self._name_code
+
+  def get_name_code(self, name: str) -> int:
+    if name not in self._name_map:
+      raise KeyError(name)
+    return self._name_map[name]
+
+  def set_name_codes(self, name_codes: tp.Sequence[int]):
+    name_codes = list(name_codes)
+    self._name_code = np.array(name_codes, dtype=embed.NAME_DTYPE)
+    self._state_queue.put(('set_name_codes', name_codes))
 
   @property
   def batch_steps(self) -> int:

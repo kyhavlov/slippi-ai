@@ -4,6 +4,7 @@ import itertools
 import logging
 import os
 import pickle
+import re
 import typing as tp
 
 import numpy as np
@@ -18,6 +19,7 @@ from slippi_ai import (
     eval_lib,
     evaluators,
     flag_utils,
+    data,
     nametags,
     policies,
     reward,
@@ -32,6 +34,54 @@ from slippi_ai import value_function as vf_lib
 from slippi_ai.rl import learner as learner_lib
 
 field = lambda f: dataclasses.field(default_factory=f)
+
+
+class NameAllowlist(tp.NamedTuple):
+  per_character: dict[Character, list[str]]
+  fallback: list[str]
+
+
+def _parse_name_allowlist(spec: tp.Optional[str]) -> NameAllowlist:
+  if spec is None:
+    return NameAllowlist(per_character={}, fallback=[])
+
+  spec = spec.strip()
+  if not spec:
+    return NameAllowlist(per_character={}, fallback=[])
+
+  cleaned = spec.replace(';', ',')
+  pattern = re.compile(r'\s*([^:,]+)\s*:\s*([^:]+?)(?=,\s*[^:,]+\s*:|$)')
+  per_character: dict[Character, list[str]] = {}
+  fallback: list[str] = []
+
+  matches = list(pattern.finditer(cleaned))
+  if not matches:
+    raise ValueError(f'Invalid name_allowlist specification: "{spec}"')
+
+  for match in matches:
+    key = match.group(1).strip()
+    values = match.group(2).strip()
+    if not values:
+      continue
+    names = [name.strip() for name in values.split(',') if name.strip()]
+    if not names:
+      continue
+
+    if key.upper() == 'ALL':
+      fallback.extend(names)
+      continue
+
+    char_key = key.lower()
+    character = data.name_to_character.get(char_key)
+    if character is None:
+      raise ValueError(f'Unknown character "{key}" in name_allowlist spec: "{spec}"')
+
+    per_character.setdefault(character, []).extend(names)
+
+  per_character = {char: list(dict.fromkeys(names)) for char, names in per_character.items()}
+  fallback = list(dict.fromkeys(fallback))
+
+  return NameAllowlist(per_character=per_character, fallback=fallback)
 
 @dataclasses.dataclass
 class RuntimeConfig:
@@ -72,6 +122,7 @@ class AgentConfig:
   compile: bool = True
   jit_compile: bool = False
   name: list[str] = field(lambda: [nametags.DEFAULT_NAME])
+  name_allowlist: tp.Optional[str] = None
   batch_steps: int = 0
   async_inference: bool = False
 
@@ -158,16 +209,10 @@ CHARACTER_WEIGHTINGS = {
       Character.DK: 1000,
       Character.LUIGI: 1000,
       Character.DOC: 1000,
-      Character.MARIO: 1000,
       Character.YLINK: 1000,
       Character.LINK: 1000,
       Character.GAMEANDWATCH: 1000,
-      Character.NESS: 1000,
-      Character.ROY: 1000,
-      Character.MEWTWO: 1000,
-      Character.PICHU: 1000,
       Character.BOWSER: 1000,
-      Character.KIRBY: 1000,
 }
 
 class LearnerManager:
@@ -418,6 +463,14 @@ def run(config: Config):
   #main_agent_kwargs['fake'] = True
   batch_size = config.actor.num_envs
 
+  name_allowlist = _parse_name_allowlist(config.agent.name_allowlist)
+  name_selection = None
+  if name_allowlist.per_character or name_allowlist.fallback:
+    name_selection = evaluators.NameSelectionConfig(
+        per_character=name_allowlist.per_character,
+        fallback=name_allowlist.fallback,
+    )
+
   if config.opponent.type is not OpponentType.SELF:
     raise NotImplementedError('Only self-play is currently supported.')
 
@@ -457,6 +510,7 @@ def run(config: Config):
       use_gpu=config.actor.gpu_inference,
       use_fake_envs=config.actor.use_fake_envs,
       agent_names=name_configuration_batch,
+      name_selection=name_selection,
       # Rewards are overridden in the learner.
   )
 
@@ -590,7 +644,8 @@ def run(config: Config):
 
     # TODO: we shouldn't take the mean over these timings
     step_time = step_profiler.mean_time()
-    steps_per_rollout = config.actor.num_envs * config.actor.rollout_length
+    # Each environment produces four per-port trajectories; report FPS on that basis.
+    steps_per_rollout = config.actor.num_envs * config.actor.rollout_length * 4
     fps = len(trajectories) * steps_per_rollout / step_time
     mps = fps / (60 * 60)  # in-game minutes per second
 

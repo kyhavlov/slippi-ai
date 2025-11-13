@@ -196,6 +196,34 @@ def is_initial_frame(gamestate: GameState) -> bool:
 class EnvOutput(tp.NamedTuple):
   gamestates: Mapping[int, Game]
   needs_reset: bool
+  needs_reset_ports: Optional[Mapping[int, tp.Any]] = None
+
+
+def _merge_singles_env_outputs(
+    left_output: 'EnvOutput',
+    right_output: 'EnvOutput',
+) -> 'EnvOutput':
+  gamestates = dict(left_output.gamestates)
+  gamestates.update(right_output.gamestates)
+
+  left_reset = left_output.needs_reset
+  right_reset = right_output.needs_reset
+
+  if isinstance(left_reset, np.ndarray) or isinstance(right_reset, np.ndarray):
+    needs_reset = np.logical_or(np.asarray(left_reset), np.asarray(right_reset))
+  else:
+    needs_reset = bool(left_reset) or bool(right_reset)
+
+  def _ports_from_output(output: 'EnvOutput', fallback: tp.Any) -> dict[int, tp.Any]:
+    if output.needs_reset_ports is not None:
+      return dict(output.needs_reset_ports)
+    return {port: fallback for port in output.gamestates}
+
+  needs_reset_ports: dict[int, tp.Any] = {}
+  needs_reset_ports.update(_ports_from_output(left_output, left_reset))
+  needs_reset_ports.update(_ports_from_output(right_output, right_reset))
+
+  return EnvOutput(gamestates, needs_reset, needs_reset_ports)
 
 def timeout(func, args=(), kwargs={}, timeout_duration=1, default=None):
   def handler(signum, frame):
@@ -245,14 +273,6 @@ class Environment:
         for port, actual_port in self.port_to_actual.items()
     }
 
-    #print("actual_ports: ", actual_ports)
-    #print("actual_players: ", actual_players)
-    '''import random
-    self.test_freeze = False
-    if random.random() < 0.5:
-      self.test_freeze = True
-      print("test_freeze: ", self.test_freeze)'''
-
     if not enable_singles:
       self._dolphin_kwargs = dict(
           dolphin_kwargs,
@@ -298,16 +318,19 @@ class Environment:
       needs_reset = is_initial_frame(self._prev_state)
       for port, ports in DOUBLES_PORT_MAPPINGS.items():
         games[port] = get_game(self._prev_state, ports)
+      needs_reset_ports = {port: needs_reset for port in games}
     else:
       needs_reset = is_initial_frame(self._prev_state)
+      needs_reset_ports = {}
       for port in self._controlled_ports:
         ports = SINGLES_PORT_MAPPINGS[port]
         singles_opponent_port = 2 if port < 3 else 3
         games[port] = get_game(self._prev_state, ports, singles_opponent_port)
+        needs_reset_ports[port] = needs_reset
 
     #print("current_state keys: ", self._enable_singles, games.keys())
 
-    return EnvOutput(games, needs_reset)
+    return EnvOutput(games, needs_reset, needs_reset_ports)
 
   def multi_current_state(self) -> list[EnvOutput]:
     return [self.current_state()]
@@ -333,9 +356,6 @@ class Environment:
 
     if self._prev_state.frame == 1:
       self._current_characters = [player.character for player in self._prev_state.players.values()]
-      
-    if not self._enable_singles and not game_was_over and match_reporting.match_is_over(self._prev_state):
-      match_reporting.submit_match(self._prev_state, self._agent_names, self._current_characters)
 
     # stock stealing hack
     if not self._enable_singles:
@@ -781,20 +801,27 @@ class _SinglesChunk:
     self._right_env.send(right_controllers)
 
   def recv(self) -> EnvOutput:
-    left_output = self._left_env.recv()
-    right_output = self._right_env.recv()
+    while True:
+      left_output = self._left_env.recv()
+      right_output = self._right_env.recv()
 
-    gamestates = {}
-    gamestates.update(left_output.gamestates)
-    gamestates.update(right_output.gamestates)
+      if isinstance(left_output, list):
+        if not isinstance(right_output, list):
+          raise EnvError('Mismatched singles chunk outputs: list vs scalar')
+        if len(left_output) != len(right_output):
+          raise EnvError('Mismatched singles chunk batch lengths')
+        if not left_output:
+          # Empty batches can occur during resets; wait for the next payload.
+          continue
+        return [
+            _merge_singles_env_outputs(lo, ro)
+            for lo, ro in zip(left_output, right_output)
+        ]
 
-    needs_reset = left_output.needs_reset
-    if isinstance(needs_reset, np.ndarray):
-      needs_reset = np.logical_or(needs_reset, right_output.needs_reset)
-    else:
-      needs_reset = needs_reset or right_output.needs_reset
+      if isinstance(right_output, list):
+        raise EnvError('Mismatched singles chunk outputs: scalar vs list')
 
-    return EnvOutput(gamestates, needs_reset)
+      return _merge_singles_env_outputs(left_output, right_output)
 
   def begin_stop(self):
     self._left_env.begin_stop()

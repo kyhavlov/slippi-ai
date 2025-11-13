@@ -37,34 +37,25 @@ def get_winner(gamestate: GameState):
         
     return None # draw/sudden death
 
-def submit_match(
-    gamestate: GameState,
-    agent_names: Sequence[str],
-    characters: Sequence[Character],
-):
-    winner = get_winner(gamestate)
-    if winner is None:
-        logger.warning("match reporting skipped: sudden death / no winner")
-        return
-    
+def character_to_name(character: Character) -> str:
+    charname = next(
+        name for name, value in vars(Character).items()
+        if value == character)
+    name = str(charname).capitalize()
+    if name == "Cptfalcon":
+        name = "Falcon"
+    return name
+
+
+def _build_payload(agent_names: Sequence[str], characters: Sequence[Character], winner: int) -> dict:
     if len(agent_names) < 4 or len(characters) < 4:
         raise ValueError('submit_match expects 4 agent names and characters.')
 
-    def character_to_name(character: Character) -> str:
-        charname = next(
-            name for name, value in vars(Character).items()
-            if value == character)
-        name = str(charname).capitalize()
-        if name == "Cptfalcon":
-            name = "Falcon"
-        return name
-
-    # Agent name list is expected in controller port order 1..4.
     ports = [0, 1, 2, 3]
     names_by_port = {port + 1: agent_names[port] for port in ports}
     chars_by_port = {port + 1: character_to_name(characters[port]) for port in ports}
 
-    match_results = {
+    return {
         "team1_player1": {
             "name": names_by_port.get(1, ""),
             "character": chars_by_port.get(1, ""),
@@ -84,17 +75,16 @@ def submit_match(
         "winner": winner
     }
 
+
+def _post_results(payload: dict):
     try:
         response = requests.post(
             url,
             headers=headers,
-            data=json.dumps(match_results),
-            timeout=request_timeout # Add the timeout parameter here
+            data=json.dumps(payload),
+            timeout=request_timeout
         )
-
-        # Raise an exception for bad status codes (4xx or 5xx)
         response.raise_for_status()
-
     except requests.exceptions.Timeout:
         logger.error("match reporting request timed out after %ss", request_timeout)
     except requests.exceptions.ConnectionError as e:
@@ -109,3 +99,30 @@ def submit_match(
             e.response.status_code, e.response.reason, details)
     except requests.exceptions.RequestException as e:
         logger.error("match reporting unexpected error: %s", e)
+
+
+def submit_match(
+    gamestate: GameState,
+    agent_names: Sequence[str],
+    characters: Sequence[Character],
+):
+    winner = get_winner(gamestate)
+    if winner is None:
+        logger.warning("match reporting skipped: sudden death / no winner")
+        return
+
+    payload = _build_payload(agent_names, characters, winner)
+    _post_results(payload)
+
+
+def submit_match_summary(
+    agent_names: Sequence[str],
+    characters: Sequence[Character],
+    winner: int,
+):
+    if winner not in (1, 2):
+        logger.warning("match reporting skipped: invalid winner %s", winner)
+        return
+
+    payload = _build_payload(agent_names, characters, winner)
+    _post_results(payload)
