@@ -111,7 +111,6 @@ def get_game(
     else:
       state = melee.PlayerState()
       state.action = melee.Action.DEAD_DOWN
-      state.position = melee.Position(0, -100)
       player = get_player(state)
       players[f'p{i}'] = player._replace(is_dead=True)
 
@@ -119,13 +118,14 @@ def get_game(
     print("================== NO PLAYERS LEFT IN GAME ====================")
 
   # For singles mode, create a proper 4-player structure
-  if len(ports) == 2:
+  is_singles = len(ports) == 2
+
+  if is_singles:
     #print(f"Creating dummy players for singles mode - current players: {list(players.keys())}")
     
     # Create a dead player for empty slots
     state = melee.PlayerState()
     state.action = melee.Action.DEAD_DOWN
-    state.position = melee.Position(0, -100)
     empty_player = get_player(state)._replace(is_dead=True)
     
     # Save the original players
@@ -150,7 +150,7 @@ def get_game(
           y=np.float32(0.0),
       ),
       items=Items(**{f'item_{i}': _EMPTY_ITEM for i in range(len(Items._fields))}),
-      is_teams=True,
+      is_teams=not is_singles,
       **players,
   )
 

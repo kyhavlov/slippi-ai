@@ -1,5 +1,10 @@
 # Slippi-AI Agents Guide
 
+> **Environment setup reminder:** on Linux machines use the project virtual
+> environment at `.linuxvenv` (`source .linuxvenv/bin/activate`) before running
+> scripts or tests so TensorFlow, portpicker, fancyflags, etc. resolve
+> correctly.
+
 ## Rules
 - Do not ever add 'skip' annotations to tests, for any reason (dependencies missing or otherwise). If you can't figure out a dependency error, ask me to help resolve it.
 - Do not ever add try/except around imports. Imports MUST succeed, period. If they don't we will fix that root problem. Adding conditionals around import success is UNACCEPTABLE.

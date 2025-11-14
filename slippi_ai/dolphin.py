@@ -80,7 +80,7 @@ class Dolphin:
       path: str,
       iso: str,
       players: Mapping[int, Player],
-      stage: melee.Stage = melee.Stage.FINAL_DESTINATION,
+      stage: melee.Stage = melee.Stage.RANDOM_STAGE,
       online_delay: int = 0,  # overrides Console's default of 2
       blocking_input: bool = True,
       console_timeout: Optional[float] = None,

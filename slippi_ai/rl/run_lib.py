@@ -576,7 +576,7 @@ def run(config: Config):
 
     # TODO: we shouldn't take the mean over these timings
     step_time = step_profiler.mean_time()
-    steps_per_rollout = config.actor.num_envs * config.actor.rollout_length
+    steps_per_rollout = config.actor.num_envs * config.actor.rollout_length * 4
     fps = len(trajectories) * steps_per_rollout / step_time
     mps = fps / (60 * 60)  # in-game minutes per second
 
