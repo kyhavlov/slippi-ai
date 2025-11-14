@@ -684,6 +684,10 @@ class AsyncEnvMP:
         singles_roles=singles_roles,
         **env_kwargs,
     )
+    self._builder_kwargs = builder_kwargs
+    self._batch_time = batch_time
+    self._context = context
+    self._initial_reset_state = None
     # self._stop = mp.Event()
     self._process = context.Process(
         name=f'_run_env({slippi_ports})',
@@ -751,17 +755,50 @@ class AsyncEnvMP:
       raise EnvError("run_env process died")
 
   def recv(self) -> EnvOutput:
-    # TODO: ensure that enough data has been pushed?
-    try:
+    while True:
+      try:
+        with self._recv_profiler:
+          output = self._recv()
+      except ConnectionResetError:
+        logging.warning('Env chunk %s disconnected; restarting.', self._process.name)
+        self._restart_env()
+        return self._consume_initial_state()
+
+      if isinstance(output, Exception):
+        logging.warning('Env chunk %s raised %s; restarting.', self._process.name, type(output).__name__)
+        self._restart_env()
+        return self._consume_initial_state()
+
+      if output is None:
+        logging.warning('Env chunk %s sent sentinel None; restarting.', self._process.name)
+        self._restart_env()
+        return self._consume_initial_state()
+
+      return output
+
+  def _restart_env(self):
+    self.begin_stop()
+    self.ensure_stopped()
+    context = self._context
+    self._parent_conn, child_conn = context.Pipe()
+    self._recv = self._parent_conn.recv
+    self._process = context.Process(
+        name=self._process.name,
+        target=_run_env,
+        args=(self._builder_kwargs, child_conn),
+        kwargs=dict(batch_time=self._batch_time))
+    self._process.start()
+    # Grab the initial reset state for downstream consumers.
+    self._initial_reset_state = self._recv()
+
+  def _consume_initial_state(self) -> EnvOutput:
+    state = self._initial_reset_state
+    if state is None:
+      # Should not happen but fall back to a blocking recv.
       with self._recv_profiler:
-        output = self._recv()
-    except ConnectionResetError as e:
-      self.ensure_stopped()
-      raise EnvError("run_env process died")
-    if isinstance(output, Exception):
-      # Maybe rebuild the environment and start over?
-      raise output
-    return output
+        state = self._recv()
+    self._initial_reset_state = None
+    return state
 
   @property
   def connection(self) -> Connection:
