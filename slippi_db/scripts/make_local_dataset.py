@@ -106,7 +106,7 @@ def _summarize(rows: list[dict]) -> None:
     print(f"({character}): {count}")
   print("")
   print("Player/Character Pairings:")
-  for (name, character), count in player_character_counts.most_common(n=100):
+  for (name, character), count in player_character_counts.most_common(n=300):
     print(f"{name} ({character}): {count}")
 
 
@@ -132,7 +132,7 @@ def _summarize_singles(rows: list[dict]) -> None:
     print(f"({character}): {count}")
   print("")
   print("Singles player/character pairings:")
-  for (name, character), count in singles_player_character_counts.most_common(n=100):
+  for (name, character), count in singles_player_character_counts.most_common(n=300):
     print(f"{name} ({character}): {count}")
 
 
