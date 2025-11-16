@@ -141,7 +141,8 @@ class Config:
 DEFAULT_CONFIG = Config()
 DEFAULT_CONFIG.dolphin.console_timeout = 30
 
-CHARACTER_WEIGHTINGS = {
+# old character weightings, closer to IL replay distribution
+'''CHARACTER_WEIGHTINGS = {
       Character.FOX: 2000,
       Character.FALCO: 1000,
       Character.MARTH: 1000,
@@ -167,6 +168,28 @@ CHARACTER_WEIGHTINGS = {
       Character.PICHU: 50,
       Character.BOWSER: 50,
       Character.KIRBY: 50,
+}'''
+
+CHARACTER_WEIGHTINGS = {
+      Character.FOX: 1000,
+      Character.FALCO: 1000,
+      Character.MARTH: 1000,
+      Character.SHEIK: 1000,
+      Character.PEACH: 1000,
+      Character.CPTFALCON: 1000,
+      Character.JIGGLYPUFF: 1000,
+      Character.PIKACHU: 1000,
+      Character.YOSHI: 1000,
+      Character.GANONDORF: 1000,
+      Character.POPO: 1000,
+      Character.SAMUS: 1000,
+      Character.DK: 1000,
+      Character.LUIGI: 1000,
+      Character.DOC: 1000,
+      Character.YLINK: 1000,
+      Character.LINK: 1000,
+      Character.GAMEANDWATCH: 1000,
+      Character.BOWSER: 1000,
 }
 
 class LearnerManager:
