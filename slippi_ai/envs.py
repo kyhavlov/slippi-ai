@@ -3,6 +3,7 @@ import contextlib
 import logging
 import multiprocessing as mp
 from multiprocessing.connection import Connection
+import socket
 import traceback
 import typing as tp
 from typing import Mapping, Optional

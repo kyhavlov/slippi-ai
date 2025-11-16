@@ -56,8 +56,20 @@ def get_leaf_flag(field_type: type, default: tp.Any) -> tp.Optional[ff.Item]:
 
 def is_leaf(type_: type) -> bool:
   type_ = maybe_undo_optional(type_)
-  if issubclass(type_, dict) or dataclasses.is_dataclass(type_):
+  origin = tp.get_origin(type_)
+
+  # typing.Dict[...] returns a typing.GenericAlias, not an actual class, so
+  # handle it before calling issubclass where it would otherwise crash.
+  if origin is dict:
     return False
+
+  if isinstance(type_, type):
+    if issubclass(type_, dict) or dataclasses.is_dataclass(type_):
+      return False
+    return True
+
+  # Generic aliases (e.g. typing.Any or typing.Dict without args) that reach
+  # this branch are treated as leaves so callers attempt to emit a flag.
   return True
 
 def get_flags_from_default(default) -> tp.Optional[tree.Structure[ff.Item]]:
