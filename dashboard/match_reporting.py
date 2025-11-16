@@ -9,7 +9,8 @@ match_data = {
   "team1_player2": {"name": "Plup", "character": "Sheik"},
   "team2_player1": {"name": "Mew2King", "character": "Marth"},
   "team2_player2": {"name": "Leffen", "character": "Fox"},
-  "winner": 2
+  "winner": 2,
+  "mode": "doubles",
 }
 
 headers = {'Content-Type': 'application/json'}

@@ -38,16 +38,19 @@ def get_winner(gamestate: GameState):
     return None # draw/sudden death
 
 def character_to_name(character: Character) -> str:
-    charname = next(
-        name for name, value in vars(Character).items()
-        if value == character)
-    name = str(charname).capitalize()
+    name = character.name.title().replace('_', ' ')
     if name == "Cptfalcon":
         name = "Falcon"
     return name
 
 
-def _build_payload(agent_names: Sequence[str], characters: Sequence[Character], winner: int) -> dict:
+def _build_payload(
+    agent_names: Sequence[str],
+    characters: Sequence[Character],
+    winner: int,
+    *,
+    is_teams: bool,
+) -> dict:
     if len(agent_names) < 4 or len(characters) < 4:
         raise ValueError('submit_match expects 4 agent names and characters.')
 
@@ -55,24 +58,35 @@ def _build_payload(agent_names: Sequence[str], characters: Sequence[Character], 
     names_by_port = {port + 1: agent_names[port] for port in ports}
     chars_by_port = {port + 1: character_to_name(characters[port]) for port in ports}
 
+    def _player_payload(port: int) -> dict:
+        return {
+            "name": names_by_port.get(port, ""),
+            "character": chars_by_port.get(port, ""),
+        }
+
+    if is_teams:
+        team1_ports = (1, 4)
+        team2_ports = (2, 3)
+    else:
+        team1_ports = (1,)
+        team2_ports = (2,)
+
+    def _team_players(port_tuple: Sequence[int]) -> tuple[dict, dict]:
+        players = [_player_payload(port) for port in port_tuple]
+        if len(players) == 1:
+            players.append({"name": "", "character": ""})
+        return players[0], players[1]
+
+    team1_player1, team1_player2 = _team_players(team1_ports)
+    team2_player1, team2_player2 = _team_players(team2_ports)
+
     return {
-        "team1_player1": {
-            "name": names_by_port.get(1, ""),
-            "character": chars_by_port.get(1, ""),
-        },
-        "team1_player2": {
-            "name": names_by_port.get(4, ""),
-            "character": chars_by_port.get(4, ""),
-        },
-        "team2_player1": {
-            "name": names_by_port.get(2, ""),
-            "character": chars_by_port.get(2, ""),
-        },
-        "team2_player2": {
-            "name": names_by_port.get(3, ""),
-            "character": chars_by_port.get(3, ""),
-        },
-        "winner": winner
+        "team1_player1": team1_player1,
+        "team1_player2": team1_player2,
+        "team2_player1": team2_player1,
+        "team2_player2": team2_player2,
+        "winner": winner,
+        "mode": "doubles" if is_teams else "singles",
     }
 
 
@@ -105,13 +119,15 @@ def submit_match(
     gamestate: GameState,
     agent_names: Sequence[str],
     characters: Sequence[Character],
+    *,
+    is_teams: bool = True,
 ):
     winner = get_winner(gamestate)
     if winner is None:
         logger.warning("match reporting skipped: sudden death / no winner")
         return
 
-    payload = _build_payload(agent_names, characters, winner)
+    payload = _build_payload(agent_names, characters, winner, is_teams=is_teams)
     _post_results(payload)
 
 
@@ -119,10 +135,12 @@ def submit_match_summary(
     agent_names: Sequence[str],
     characters: Sequence[Character],
     winner: int,
+    *,
+    is_teams: bool,
 ):
     if winner not in (1, 2):
         logger.warning("match reporting skipped: invalid winner %s", winner)
         return
 
-    payload = _build_payload(agent_names, characters, winner)
+    payload = _build_payload(agent_names, characters, winner, is_teams=is_teams)
     _post_results(payload)

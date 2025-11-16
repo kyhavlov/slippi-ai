@@ -2,6 +2,7 @@ import dataclasses
 import enum
 import itertools
 import logging
+import multiprocessing as mp
 import os
 import pickle
 import re
@@ -113,6 +114,8 @@ class ActorConfig:
   use_fake_envs: bool = False
   enable_singles: bool = False
   singles_ratio: float = 0.5
+  character_warmup_steps: int = 0
+  character_blend_steps: int = 0
 
 @dataclasses.dataclass
 class AgentConfig:
@@ -193,7 +196,7 @@ class Config:
 DEFAULT_CONFIG = Config()
 DEFAULT_CONFIG.dolphin.console_timeout = 30
 
-CHARACTER_WEIGHTINGS = {
+TARGET_CHARACTER_WEIGHTINGS = {
       Character.FOX: 1000,
       Character.FALCO: 1000,
       Character.MARTH: 1000,
@@ -215,6 +218,29 @@ CHARACTER_WEIGHTINGS = {
       Character.BOWSER: 1000,
 }
 
+# Initial warm-up weights close-ish to the IL sampling distribution (50/50 singles/doubles, imitation_21_v12).
+CHARACTER_WEIGHTINGS = {
+      Character.FOX: 1500,
+      Character.FALCO: 1000,
+      Character.MARTH: 1000,
+      Character.SHEIK: 1000,
+      Character.CPTFALCON: 1000,
+      Character.PEACH: 1000,
+      Character.JIGGLYPUFF: 1000,
+      Character.GANONDORF: 215,
+      Character.YOSHI: 210,
+      Character.SAMUS: 205,
+      Character.LUIGI: 200,
+      Character.PIKACHU: 200,
+      Character.DOC: 110,
+      Character.BOWSER: 105,
+      Character.POPO: 105,
+      Character.DK: 100,
+      Character.LINK: 100,
+      Character.GAMEANDWATCH: 100,
+      Character.YLINK: 100,
+}
+
 class LearnerManager:
 
   def __init__(
@@ -224,6 +250,7 @@ class LearnerManager:
       build_actor: tp.Callable[[], evaluators.RolloutWorker],
       port: int = 1,
       enemy_port: int = 2,
+      character_weights: tp.Optional[tp.MutableMapping] = None,
   ):
     self._config = config
     self._learner = learner
@@ -233,6 +260,7 @@ class LearnerManager:
     self._enemy_port = enemy_port
     self._num_ppo_batches = config.learner.ppo.num_batches
     self._burnin_steps_after_reset = config.runtime.burnin_steps_after_reset
+    self._character_weights = character_weights
 
     batch_size = config.actor.num_envs
     if config.opponent.should_train():
@@ -244,8 +272,14 @@ class LearnerManager:
     self.rollout_profiler = utils.Profiler()
     self.reset_profiler = utils.Profiler(burnin=0)
 
+    self._character_warmup = config.actor.character_warmup_steps or 0
+    self._character_blend = config.actor.character_blend_steps or 0
+    self._current_weight_alpha = None
+    self._latest_schedule_step = 0
+
     with self.reset_profiler:
       self.actor = self._build_actor()
+      self._maybe_update_character_weights(step=0)
       self.actor.start()
 
       for _ in range(self._burnin_steps_after_reset):
@@ -254,6 +288,7 @@ class LearnerManager:
   def reset_env(self):
     with self.reset_profiler:
       self.actor.reset_env()
+      self._maybe_update_character_weights(step=self._latest_schedule_step)
 
       for _ in range(self._burnin_steps_after_reset):
         self.unroll()
@@ -267,12 +302,50 @@ class LearnerManager:
 
     return trajectory, timings
 
+  def _character_alpha(self, step: int) -> float:
+    if step <= self._character_warmup:
+      return 0.0
+    if self._character_blend <= 0:
+      return 1.0
+    progress = (step - self._character_warmup) / self._character_blend
+    return float(np.clip(progress, 0.0, 1.0))
+
+  def _blend_character_weights(self, alpha: float) -> dict:
+    keys = set(TARGET_CHARACTER_WEIGHTINGS.keys()) | set(CHARACTER_WEIGHTINGS.keys())
+    blended: dict[Character, int] = {}
+    for char in keys:
+      start = CHARACTER_WEIGHTINGS.get(char, TARGET_CHARACTER_WEIGHTINGS.get(char, 0))
+      target = TARGET_CHARACTER_WEIGHTINGS.get(char, start)
+      value = (1 - alpha) * start + alpha * target
+      if value <= 0:
+        continue
+      blended[char] = max(1, int(round(value)))
+    return blended
+
+  def _maybe_update_character_weights(self, step: int):
+    if self._character_weights is None:
+      return
+    alpha = self._character_alpha(step)
+    if self._current_weight_alpha is not None and abs(alpha - self._current_weight_alpha) < 1e-6:
+      if step % 50 == 0:
+        logging.info('character_weights alpha=%.3f table=%s', alpha, dict(self._character_weights))
+      return
+    blended = self._blend_character_weights(alpha)
+    if not blended:
+      return
+    self._character_weights.clear()
+    self._character_weights.update(blended)
+    self._current_weight_alpha = alpha
+    logging.info('character_weights alpha=%.3f table=%s', alpha, blended)
+
   def unroll(self):
     trajectory, _ = self._rollout()
     _, self._hidden_state = self._learner.compiled_unroll(
         trajectory, self._hidden_state)
 
   def step(self, step: int, ppo_steps: int = None) -> tuple[list[evaluators.Trajectory], dict]:
+    self._latest_schedule_step = step
+    self._maybe_update_character_weights(step)
     with self.update_profiler:
       variables = {}
       for port in [1, 2, 3, 4]:
@@ -453,8 +526,11 @@ def run(config: Config):
   PORT = 1
 
   # set ports 1-4 to AI
+  character_weight_manager = mp.Manager()
+  character_weight_table = character_weight_manager.dict(CHARACTER_WEIGHTINGS)
+
   dolphin_kwargs = dict(
-      players={port: dolphin_lib.AI(character_weight_table=CHARACTER_WEIGHTINGS) for port in range(1, 5)},
+      players={port: dolphin_lib.AI(character_weight_table=character_weight_table) for port in range(1, 5)},
       **config.dolphin.to_kwargs(),
   )
 
@@ -517,9 +593,8 @@ def run(config: Config):
   learner_manager = LearnerManager(
       config=config,
       learner=learner,
-      #port=PORT,
-      #enemy_port=ENEMY_PORT,
       build_actor=build_actor,
+      character_weights=character_weight_table,
   )
 
   step_profiler = utils.Profiler()
@@ -822,3 +897,4 @@ def run(config: Config):
 
   finally:
     learner_manager.actor.stop()
+    character_weight_manager.shutdown()

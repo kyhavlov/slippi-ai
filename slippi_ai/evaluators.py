@@ -127,6 +127,9 @@ class RolloutWorker:
         port: np.array(agent.name_code, copy=True) for port, agent in self._agents.items()
     }
     self._last_full_state: list[tp.Optional[Game]] = [None] * num_envs
+    self._last_known_characters: list[list[tp.Optional[Character]]] = [
+        [None] * 4 for _ in range(num_envs)
+    ]
     self._build_env()
 
     self._damage_ratio = damage_ratio
@@ -324,16 +327,42 @@ class RolloutWorker:
   def _update_state_cache(self, env_output: env_lib.EnvOutput):
     if not env_output.gamestates:
       return
-    primary_port = next(iter(env_output.gamestates))
-    game_batch = env_output.gamestates[primary_port]
 
+    primary_port = next(iter(env_output.gamestates))
+    primary_batch = env_output.gamestates[primary_port]
     for env_idx in range(self._num_envs):
       self._last_full_state[env_idx] = utils.map_single_structure(
-          lambda x: x[env_idx], game_batch)
+          lambda x: x[env_idx], primary_batch)
+
+    for port, game_batch in env_output.gamestates.items():
+      for env_idx in range(self._num_envs):
+        game = utils.map_single_structure(
+            lambda x: x[env_idx], game_batch)
+        self._update_character_cache(env_idx, port, game)
+
+  def _update_character_cache(self, env_idx: int, port: int, game: Game):
+    cache = self._last_known_characters[env_idx]
+    if not (1 <= port <= 4):
+      return
+
+    char_array = np.asarray(game.p0.character)
+    try:
+      char_id = int(char_array.item())
+    except ValueError:
+      return
+    if char_id == Character.UNKNOWN_CHARACTER.value:
+      return
+    cache[port - 1] = Character(char_id)
+
+  def _characters_for_env(self, env_idx: int) -> list[Character]:
+    characters: list[Character] = []
+    for cached in self._last_known_characters[env_idx]:
+      characters.append(cached or Character.UNKNOWN_CHARACTER)
+    return characters
 
   def _report_match(self, env_idx: int):
     state = self._last_full_state[env_idx]
-    if state is None or not state.is_teams:
+    if state is None:
       return
 
     team1_stocks = int(state.p0.stocks_left) + int(state.p1.stocks_left)
@@ -348,26 +377,19 @@ class RolloutWorker:
     else:
       return
 
-    try:
-      characters = [
-          Character(int(state.p0.character)),
-          Character(int(state.p1.character)),
-          Character(int(state.p2.character)),
-          Character(int(state.p3.character)),
-      ]
-    except ValueError:
-      logging.warning('Match reporting skipped: invalid character id in state %s', state)
-      return
+    characters = self._characters_for_env(env_idx)
 
     try:
       match_reporting.submit_match_summary(
           tuple(self._agent_names[env_idx]),
           characters,
-          winner)
+          winner,
+          is_teams=bool(state.is_teams))
     except Exception as exc:
       logging.warning('Match reporting failed for env %d: %s', env_idx, exc)
 
     self._last_full_state[env_idx] = None
+    self._last_known_characters[env_idx] = [None] * 4
 
   def rollout(self, num_steps: int) -> tuple[tp.Mapping[Port, Trajectory], Timings]:
     # This ensures that the agent can process all of the states it will be fed.

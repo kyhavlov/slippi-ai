@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Melee 2v2 Stats</title>
+    <title>Melee Match Stats</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 </head>
 <body>
-    <h1>Super Smash Bros. Melee 2v2 Stats</h1>
+    <h1>Super Smash Bros. Melee Match Stats</h1>
 
     <div class="filter-controls">
         <div class="filter-nav">
@@ -33,6 +33,8 @@
         {% if min_games > 0 %}
         Minimum games threshold: {{ min_games }}
         {% endif %}
+        <br>
+        Singles contribute to character and player tables, while team compositions, pairings, and teammate stats reflect doubles-only games.
     </div>
 
     <div class="main-layout">

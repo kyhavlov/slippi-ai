@@ -10,6 +10,8 @@ import logging # Import logging
 DATA_DIR = "melee_data"
 DATE_FORMAT = "%Y-%m-%d"
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%f" # ISO 8601 like format
+DEFAULT_MODE = "doubles"
+VALID_MODES = {"doubles", "singles"}
 
 # --- Global State ---
 matches_data = [] # Holds all match data in memory
@@ -36,6 +38,9 @@ def save_match(match_record):
     ensure_data_dir()
     now = datetime.utcnow()
     match_record["timestamp"] = now.strftime(TIMESTAMP_FORMAT) # Add timestamp before saving
+    mode = match_record.get("mode")
+    if mode not in VALID_MODES:
+        match_record["mode"] = DEFAULT_MODE
 
     filename = get_daily_filename(now)
     try:
@@ -81,6 +86,10 @@ def load_matches():
                                 if "timestamp" in match:
                                     try:
                                          match["timestamp_dt"] = datetime.strptime(match["timestamp"], TIMESTAMP_FORMAT)
+                                         mode = match.get("mode") or DEFAULT_MODE
+                                         if mode not in VALID_MODES:
+                                             mode = DEFAULT_MODE
+                                         match["mode"] = mode
                                          loaded_matches.append(match)
                                     except ValueError:
                                         app.logger.warning(f"Skipping record with invalid timestamp format in {filename} (line {i+1}): {match.get('timestamp')}")
@@ -104,6 +113,20 @@ def load_matches():
 
     except Exception as e:
         app.logger.error(f"Failed to list or process files in {DATA_DIR}: {e}")
+
+
+def _normalize_player_entry(player_data):
+    if not isinstance(player_data, dict):
+        return None
+    name = player_data.get("name", "")
+    character = player_data.get("character", "")
+    if name is None or character is None:
+        return None
+    name = str(name).strip()
+    character = str(character).strip()
+    if not name or not character:
+        return None
+    return {"name": name, "character": character}
 
 
 def calculate_stats(filtered_matches):
@@ -131,59 +154,44 @@ def calculate_stats(filtered_matches):
 
     for match in filtered_matches:
         try:
-            # Extract player and character info
-            p11 = match["team1_player1"]
-            p12 = match["team1_player2"]
-            p21 = match["team2_player1"]
-            p22 = match["team2_player2"]
+            mode = match.get("mode", DEFAULT_MODE)
+            is_doubles = (mode == "doubles")
 
-            players_team1 = [p11, p12]
-            players_team2 = [p21, p22]
+            p11 = _normalize_player_entry(match.get("team1_player1"))
+            p12 = _normalize_player_entry(match.get("team1_player2"))
+            p21 = _normalize_player_entry(match.get("team2_player1"))
+            p22 = _normalize_player_entry(match.get("team2_player2"))
 
-            team1_chars = sorted([p11["character"], p12["character"]])
-            team2_chars = sorted([p21["character"], p22["character"]])
+            players_team1 = [p for p in (p11, p12) if p]
+            players_team2 = [p for p in (p21, p22) if p]
 
-            # Canonical team composition (sorted tuple of characters)
+            if not players_team1 or not players_team2:
+                app.logger.warning(f"Skipping match with missing players: {match.get('timestamp')}")
+                continue
+
+            team1_chars = sorted(p["character"] for p in players_team1)
+            team2_chars = sorted(p["character"] for p in players_team2)
+
             team1_comp = tuple(team1_chars)
             team2_comp = tuple(team2_chars)
-
-            # Canonical player pairing (sorted tuple of names)
-            team1_pairing = tuple(sorted([p11["name"], p12["name"]]))
-            team2_pairing = tuple(sorted([p21["name"], p22["name"]]))
+            team1_pairing = tuple(sorted(p["name"] for p in players_team1)) if is_doubles else None
+            team2_pairing = tuple(sorted(p["name"] for p in players_team2)) if is_doubles else None
 
             winner = match["winner"]
-            winning_players = []
-            losing_players = []
-            winning_chars = []
-            losing_chars = []
-            winning_comp = None
-            losing_comp = None
-            winning_pairing = None
-            losing_pairing = None
+            if winner not in (1, 2):
+                app.logger.warning(f"Skipping match with invalid winner ({winner}): {match.get('timestamp')}")
+                continue
 
             if winner == 1:
-                winning_players = players_team1
-                losing_players = players_team2
-                winning_chars = team1_chars
-                losing_chars = team2_chars
-                winning_comp = team1_comp
-                losing_comp = team2_comp
-                winning_pairing = team1_pairing
-                losing_pairing = team2_pairing
-            elif winner == 2:
-                winning_players = players_team2
-                losing_players = players_team1
-                winning_chars = team2_chars
-                losing_chars = team1_chars
-                winning_comp = team2_comp
-                losing_comp = team1_comp
-                winning_pairing = team2_pairing
-                losing_pairing = team1_pairing
+                winning_players, losing_players = players_team1, players_team2
+                winning_chars, losing_chars = team1_chars, team2_chars
+                winning_comp, losing_comp = team1_comp, team2_comp
+                winning_pairing, losing_pairing = team1_pairing, team2_pairing
             else:
-                app.logger.warning(f"Skipping match with invalid winner ({winner}): {match.get('timestamp')}")
-                continue # Skip if winner info is invalid
-
-            # --- Update Stats ---
+                winning_players, losing_players = players_team2, players_team1
+                winning_chars, losing_chars = team2_chars, team1_chars
+                winning_comp, losing_comp = team2_comp, team1_comp
+                winning_pairing, losing_pairing = team2_pairing, team1_pairing
 
             # Characters
             for char in winning_chars:
@@ -192,67 +200,63 @@ def calculate_stats(filtered_matches):
             for char in losing_chars:
                 char_games[char] += 1
 
-            # Character teammate stats (process each character individually)
-            for i, char in enumerate(winning_chars):
-                teammate = winning_chars[1-i]  # Get the teammate character
-                char_teammate_stats[char][teammate][0] += 1  # Win
-                char_teammate_stats[char][teammate][1] += 1  # Game
-                
-            for i, char in enumerate(losing_chars):
-                teammate = losing_chars[1-i]  # Get the teammate character
-                char_teammate_stats[char][teammate][1] += 1  # Game only, no win
-            
+            # Character teammate stats (doubles only)
+            if is_doubles and len(winning_chars) == 2 and len(losing_chars) == 2:
+                for i, char in enumerate(winning_chars):
+                    teammate = winning_chars[1 - i]
+                    char_teammate_stats[char][teammate][0] += 1
+                    char_teammate_stats[char][teammate][1] += 1
+                for i, char in enumerate(losing_chars):
+                    teammate = losing_chars[1 - i]
+                    char_teammate_stats[char][teammate][1] += 1
+
             # Character player stats
-            for p in winning_players:
-                p_name = p["name"]
-                p_char = p["character"]
-                char_player_stats[p_char][p_name][0] += 1  # Win
-                char_player_stats[p_char][p_name][1] += 1  # Game
-            
-            for p in losing_players:
-                p_name = p["name"]
-                p_char = p["character"]
-                char_player_stats[p_char][p_name][1] += 1  # Game only, no win
-            
+            for player in winning_players:
+                char_player_stats[player["character"]][player["name"]][0] += 1
+                char_player_stats[player["character"]][player["name"]][1] += 1
+            for player in losing_players:
+                char_player_stats[player["character"]][player["name"]][1] += 1
+
             # Character opponent stats
             for char in winning_chars:
                 for opp_char in losing_chars:
-                    char_opponent_stats[char][opp_char][0] += 1  # Win
-                    char_opponent_stats[char][opp_char][1] += 1  # Game
-            
+                    char_opponent_stats[char][opp_char][0] += 1
+                    char_opponent_stats[char][opp_char][1] += 1
             for char in losing_chars:
                 for opp_char in winning_chars:
-                    char_opponent_stats[char][opp_char][1] += 1  # Game only, no win
+                    char_opponent_stats[char][opp_char][1] += 1
 
-            # Team Compositions
-            if winning_comp:
-                team_wins[winning_comp] += 1
-                team_games[winning_comp] += 1
-            if losing_comp:
-                team_games[losing_comp] += 1
+            # Team compositions (doubles only)
+            if is_doubles:
+                if winning_comp:
+                    team_wins[winning_comp] += 1
+                    team_games[winning_comp] += 1
+                if losing_comp:
+                    team_games[losing_comp] += 1
 
             # Players and Player+Character
-            for p in winning_players:
-                p_name = p["name"]
-                p_char = p["character"]
-                p_key = f"{p_name} ({p_char})"
+            for player in winning_players:
+                p_name = player["name"]
+                p_char = player["character"]
+                key = f"{p_name} ({p_char})"
                 player_wins[p_name] += 1
                 player_games[p_name] += 1
-                player_char_wins[p_key] += 1
-                player_char_games[p_key] += 1
-            for p in losing_players:
-                p_name = p["name"]
-                p_char = p["character"]
-                p_key = f"{p_name} ({p_char})"
+                player_char_wins[key] += 1
+                player_char_games[key] += 1
+            for player in losing_players:
+                p_name = player["name"]
+                p_char = player["character"]
+                key = f"{p_name} ({p_char})"
                 player_games[p_name] += 1
-                player_char_games[p_key] += 1
+                player_char_games[key] += 1
 
-            # Player Pairings
-            if winning_pairing:
-                pairing_wins[winning_pairing] += 1
-                pairing_games[winning_pairing] += 1
-            if losing_pairing:
-                pairing_games[losing_pairing] += 1
+            # Player Pairings (doubles only)
+            if is_doubles:
+                if winning_pairing:
+                    pairing_wins[winning_pairing] += 1
+                    pairing_games[winning_pairing] += 1
+                if losing_pairing:
+                    pairing_games[losing_pairing] += 1
 
         except KeyError as e:
             app.logger.warning(f"Skipping match due to missing key {e}: {match.get('timestamp')}")
@@ -484,42 +488,54 @@ def submit_match():
 
     data = request.get_json()
 
-    # Basic Validation (can be expanded)
-    required_fields = ["team1_player1", "team1_player2", "team2_player1", "team2_player2", "winner"]
-    player_fields = ["name", "character"]
+    mode = str(data.get("mode", DEFAULT_MODE)).lower()
+    if mode not in VALID_MODES:
+        return jsonify({"status": "error", "message": f"Invalid mode '{mode}'."}), 400
 
-    missing_req = [f for f in required_fields if f not in data]
-    if missing_req:
-         return jsonify({"status": "error", "message": f"Missing required fields: {', '.join(missing_req)}"}), 400
+    def extract_player(key, allow_empty=False):
+        value = data.get(key)
+        if value is None:
+            if allow_empty:
+                return {"name": "", "character": ""}
+            raise ValueError(f"Missing field '{key}'")
+        if not isinstance(value, dict):
+            raise ValueError(f"Field '{key}' must be an object")
+        name = value.get("name", "")
+        character = value.get("character", "")
+        name = str(name).strip()
+        character = str(character).strip()
+        if (not name or not character) and not allow_empty:
+            raise ValueError(f"Player name/character cannot be empty in '{key}'")
+        if not name and not character and allow_empty:
+            return {"name": "", "character": ""}
+        return {"name": name, "character": character}
 
-    for team_player_key in ["team1_player1", "team1_player2", "team2_player1", "team2_player2"]:
-        player_data = data.get(team_player_key)
-        if not isinstance(player_data, dict):
-             return jsonify({"status": "error", "message": f"Field '{team_player_key}' must be a JSON object"}), 400
-        missing_p_fields = [pf for pf in player_fields if pf not in player_data]
-        if missing_p_fields:
-             return jsonify({"status": "error", "message": f"Missing fields in '{team_player_key}': {', '.join(missing_p_fields)}"}), 400
-        # Ensure values are not empty strings
-        if not player_data.get("name", "").strip() or not player_data.get("character", "").strip():
-             return jsonify({"status": "error", "message": f"Player name and character cannot be empty in '{team_player_key}'"}), 400
+    allow_optional = (mode == "singles")
+    try:
+        team1_player1 = extract_player("team1_player1")
+        team2_player1 = extract_player("team2_player1")
+        team1_player2 = extract_player("team1_player2", allow_empty=allow_optional)
+        team2_player2 = extract_player("team2_player2", allow_empty=allow_optional)
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
 
-    if data.get("winner") not in [1, 2]:
+    winner = data.get("winner")
+    try:
+        winner = int(winner)
+    except (TypeError, ValueError):
         return jsonify({"status": "error", "message": "Winner must be 1 or 2"}), 400
 
-    # Prepare the record (perform basic string conversion for safety)
-    try:
-        match_record = {
-            "team1_player1": {"name": str(data["team1_player1"]["name"]).strip(), "character": str(data["team1_player1"]["character"]).strip()},
-            "team1_player2": {"name": str(data["team1_player2"]["name"]).strip(), "character": str(data["team1_player2"]["character"]).strip()},
-            "team2_player1": {"name": str(data["team2_player1"]["name"]).strip(), "character": str(data["team2_player1"]["character"]).strip()},
-            "team2_player2": {"name": str(data["team2_player2"]["name"]).strip(), "character": str(data["team2_player2"]["character"]).strip()},
-            "winner": int(data["winner"]),
-            # timestamp will be added by save_match
-        }
-    except Exception as e:
-         app.logger.error(f"Error preparing match record from input data: {e}. Data: {data}")
-         return jsonify({"status": "error", "message": "Invalid data format during record preparation"}), 400
+    if winner not in (1, 2):
+        return jsonify({"status": "error", "message": "Winner must be 1 or 2"}), 400
 
+    match_record = {
+        "team1_player1": team1_player1,
+        "team1_player2": team1_player2,
+        "team2_player1": team2_player1,
+        "team2_player2": team2_player2,
+        "winner": winner,
+        "mode": mode,
+    }
 
     if save_match(match_record):
         return jsonify({"status": "success", "message": "Match recorded"}), 201
