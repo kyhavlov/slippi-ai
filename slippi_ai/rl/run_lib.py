@@ -1,6 +1,5 @@
 import dataclasses
 import enum
-import itertools
 import logging
 import os
 import pickle
@@ -30,6 +29,7 @@ from slippi_ai import (
 from slippi_ai.types import Game
 from slippi_ai import value_function as vf_lib
 from slippi_ai.rl import learner as learner_lib
+from slippi_ai.rl import character_scheduler as scheduler_lib
 
 field = lambda f: dataclasses.field(default_factory=f)
 
@@ -73,6 +73,15 @@ class AgentConfig:
   name: list[str] = field(lambda: [nametags.DEFAULT_NAME])
   batch_steps: int = 0
   async_inference: bool = False
+  name_allowlist: tp.Optional[str] = None
+  name_layout_seed: int = 0
+  scheduler_seed: int = 0
+  scheduler_char_weight: float = 1.0
+  scheduler_matchup_weight: float = 1.0
+  scheduler_team_weight: float = 1.0
+  scheduler_char_name_weight: float = 0.2
+  scheduler_max_candidates: int = 1024
+  scheduler_max_slot_options: int = 4
 
   def get_kwargs(self) -> dict:
     if self.jit_compile:
@@ -415,9 +424,45 @@ def run(config: Config):
 
   PORT = 1
 
-  # set ports 1-4 to AI
+  if not config.agent.name_allowlist:
+    raise ValueError('--config.agent.name_allowlist must be provided for scheduler-driven runs.')
+
+  allowlist = scheduler_lib.parse_name_allowlist(config.agent.name_allowlist)
+  normalized_names = scheduler_lib.normalize_name_list(config.agent.name)
+  layout = scheduler_lib.allocate_name_slots(
+      normalized_names,
+      allowlist,
+      config.actor.num_envs,
+      config.agent.name_layout_seed,
+  )
+  slot_specs = scheduler_lib.build_slot_specs(layout, config.actor.num_envs)
+  env_name_layout = [
+      tuple(layout[i * 4:(i + 1) * 4])
+      for i in range(config.actor.num_envs)
+  ]
+  port_name_batches: dict[int, list[str]] = {port: [] for port in range(1, 5)}
+  for names in env_name_layout:
+    for idx, name in enumerate(names):
+      port_name_batches[idx + 1].append(name)
+
+  scheduler_manager = None
+  scheduler_proxy = None
+  scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
+      allowlist=allowlist,
+      slot_specs=slot_specs,
+      rng_seed=config.agent.scheduler_seed,
+      char_weight=config.agent.scheduler_char_weight,
+      matchup_weight=config.agent.scheduler_matchup_weight,
+      team_weight=config.agent.scheduler_team_weight,
+      char_name_weight=config.agent.scheduler_char_name_weight,
+      max_candidates=config.agent.scheduler_max_candidates,
+      max_slot_options=config.agent.scheduler_max_slot_options,
+      max_outstanding_per_env=2,
+  )
+
+  # set ports 1-4 to scheduled AI
   dolphin_kwargs = dict(
-      players={port: dolphin_lib.AI(character_weight_table=CHARACTER_WEIGHTINGS) for port in range(1, 5)},
+      players={port: dolphin_lib.ScheduledAI() for port in range(1, 5)},
       **config.dolphin.to_kwargs(),
   )
 
@@ -429,20 +474,10 @@ def run(config: Config):
   if config.opponent.type is not OpponentType.SELF:
     raise NotImplementedError('Only self-play is currently supported.')
 
-  # Generate all possible permutations of 4 players
-  all_permutations = list(itertools.product(config.agent.name, repeat=4))
-  num_permutations = len(all_permutations)
-
-  # Create the batch by cycling through the permutations in a round-robin manner
-  name_configuration_batch = [
-      all_permutations[(i * num_permutations // batch_size + i) % num_permutations]
-      for i in range(batch_size)
-  ]
-
   agent_kwargs: tp.Mapping[int, dict] = {}
   for i in range(1, 5):
     agent_kwargs[i] = dict(
-        name=[name_configuration_batch[j][i-1] for j in range(batch_size)],
+        name=port_name_batches[i],
         **main_agent_kwargs.copy(),
     )
     print("port names: ", i, agent_kwargs[i]['name'])
@@ -465,7 +500,8 @@ def run(config: Config):
       async_envs=config.actor.async_envs,
       use_gpu=config.actor.gpu_inference,
       use_fake_envs=config.actor.use_fake_envs,
-      agent_names=name_configuration_batch,
+      agent_names=env_name_layout,
+      scheduler=scheduler_proxy,
       # Rewards are overridden in the learner.
   )
 
@@ -498,7 +534,7 @@ def run(config: Config):
         name_combination: [] for name_combination in ordered_name_combinations
     }
 
-    for i, name_combination in enumerate(name_configuration_batch):
+    for i, name_combination in enumerate(env_name_layout):
       if name_combination in ordered_name_combination_indices:
         ordered_name_combination_indices[name_combination].append(i)
       elif rev(name_combination) in reversed_name_combination_indices:
@@ -514,7 +550,7 @@ def run(config: Config):
       Computes the mean KO differential for each player across a batch of trajectories.
       Expects:
         - states: an array of shape [T, B] where each element is a Game namedtuple with p0, p1, p2, p3 fields.
-      Uses the global variable name_configuration_batch (a list of length B where each element is a 4-tuple
+      Uses the global variable env_name_layout (a list of length B where each element is a 4-tuple
       of player names corresponding to positions p0, p1, p2, p3).
 
       For each environment (rollout) in the batch:
@@ -523,7 +559,7 @@ def run(config: Config):
         * For each player slot, compute the KO differential:
               diff = (team_avg - opponent_avg) * MINUTES_PER_FRAME
           where team_avg is the average reward for the player's own team and opponent_avg is the other team's.
-        * Use the corresponding value from name_configuration_batch as the player's unique identifier.
+        * Use the corresponding value from env_name_layout as the player's unique identifier.
       Finally, average the differences across all environments where the player appears.
       """
       # Compute rewards over time. tm_kos: [T, P, B]
@@ -541,7 +577,7 @@ def run(config: Config):
           team2_avg = np.mean([pm_kos[2, b], pm_kos[3, b]])
           
           # Lookup the 4-tuple of player names for environment b from the global variable.
-          names_tuple = name_configuration_batch[b]
+          names_tuple = env_name_layout[b]
           for p_idx in range(4):
               player_name = names_tuple[p_idx]
               # Compute KO differential for the player.
@@ -774,3 +810,5 @@ def run(config: Config):
 
   finally:
     learner_manager.actor.stop()
+    if scheduler_manager is not None:
+      scheduler_manager.shutdown()

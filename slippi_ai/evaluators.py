@@ -65,6 +65,7 @@ class RolloutWorker:
       use_fake_envs: bool = False,
       use_ray_envs: bool = False,
       agent_names: list[tuple[str, str]] = [],
+      scheduler = None,
   ):
     print("use_gpu = ", use_gpu)
     self._agents = {
@@ -94,6 +95,8 @@ class RolloutWorker:
     self._async_envs = async_envs
     self._use_ray_envs = use_ray_envs
     self._agent_names = agent_names
+    self._scheduler = scheduler
+    self._env_ids = list(range(num_envs))
     self._build_env()
 
     self._damage_ratio = damage_ratio
@@ -142,8 +145,15 @@ class RolloutWorker:
         env_class = env_lib.BatchedEnvironment
       else:
         env_class = env_lib.AsyncBatchedEnvironmentMP
+      env_kwargs = dict(self._env_kwargs)
+      env_kwargs.setdefault('env_ids', self._env_ids)
       self._env = env_class(
-          self._num_envs, self._dolphin_kwargs, agent_names=self._agent_names, **self._env_kwargs)
+          self._num_envs,
+          self._dolphin_kwargs,
+          agent_names=self._agent_names,
+          scheduler=self._scheduler,
+          **env_kwargs,
+      )
 
   def reset_env(self):
     self._env.stop()

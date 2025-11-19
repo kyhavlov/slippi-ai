@@ -6,7 +6,8 @@ import math
 import random
 import threading
 import uuid
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from multiprocessing.managers import SyncManager
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from melee import Character
 
@@ -42,6 +43,11 @@ class Assignment:
   env_id: int
   characters: Tuple[Character, Character, Character, Character]
   names: Tuple[str, str, str, str]
+
+
+# In doubles we treat ports 0 & 3 as one team vs ports 1 & 2.
+_TEAM_PORTS: tuple[tuple[int, int], ...] = ((0, 3), (1, 2))
+_TEAMMATE_PORT: dict[int, int] = {a: b for pair in _TEAM_PORTS for a, b in (pair, (pair[1], pair[0]))}
 
 
 def _normalize_character_key(raw: str) -> Optional[Character]:
@@ -109,10 +115,120 @@ def parse_name_allowlist(spec: str) -> Mapping[Character, set[str]]:
   return char_map
 
 
+def normalize_name_list(display_names: Sequence[str]) -> list[tuple[str, str]]:
+  names: list[tuple[str, str]] = []
+  for raw in display_names:
+    display = raw.strip()
+    if not display:
+      continue
+    normalized = nametags.normalize_name(display)
+    names.append((normalized, display))
+  if not names:
+    raise ValueError('At least one non-empty name is required to build the layout.')
+  return names
+
+
+def parse_name_csv(raw: str) -> list[tuple[str, str]]:
+  tokens = [token.strip() for token in raw.split(',')]
+  return normalize_name_list(tokens)
+
+
+def allocate_name_slots(
+    names: list[tuple[str, str]],
+    allowlist: Mapping[Character, set[str]],
+    num_envs: int,
+    layout_seed: int,
+) -> list[str]:
+  normalized_to_display: dict[str, str] = {}
+  for normalized, display in names:
+    normalized_to_display.setdefault(normalized, display)
+
+  referenced_names = set().union(*allowlist.values())
+  missing = referenced_names - set(normalized_to_display)
+  if missing:
+    raise ValueError(
+        'Names referenced by the allowlist are missing from the provided list: '
+        + ', '.join(sorted(missing)))
+
+  total_slots = num_envs * 4
+  weights: dict[str, float] = {name: 0.0 for name in referenced_names}
+  for allowed_names in allowlist.values():
+    if not allowed_names:
+      continue
+    share = 1.0 / len(allowed_names)
+    for name in allowed_names:
+      weights[name] += share
+
+  total_weight = sum(weights.values())
+  if total_weight == 0:
+    raise ValueError('Allowlist does not assign any names to characters.')
+
+  ideal_counts = {
+      name: weights[name] / total_weight * total_slots
+      for name in weights
+  }
+  slot_counts = {name: int(count) for name, count in ideal_counts.items()}
+  remainders = {name: ideal_counts[name] - slot_counts[name] for name in weights}
+
+  for name in weights:
+    if slot_counts[name] == 0:
+      slot_counts[name] = 1
+      remainders[name] = 0.0
+
+  current_total = sum(slot_counts.values())
+  if current_total > total_slots:
+    surplus = current_total - total_slots
+    ordered = sorted(
+        slot_counts.items(),
+        key=lambda item: (slot_counts[item[0]], -remainders[item[0]]),
+        reverse=True,
+    )
+    idx = 0
+    while surplus > 0 and idx < len(ordered):
+      name, _ = ordered[idx]
+      if slot_counts[name] > 1:
+        slot_counts[name] -= 1
+        surplus -= 1
+      else:
+        idx += 1
+
+  current_total = sum(slot_counts.values())
+  while current_total < total_slots:
+    best = max(weights.keys(), key=lambda n: (remainders[n], weights[n]))
+    slot_counts[best] += 1
+    current_total += 1
+
+  slots: list[str] = []
+  ordered_names = sorted(
+      slot_counts.keys(),
+      key=lambda name: (-slot_counts[name], name),
+  )
+  for name in ordered_names:
+    display = normalized_to_display[name]
+    slots.extend([display] * slot_counts[name])
+
+  rng = random.Random(layout_seed)
+  rng.shuffle(slots)
+  return slots
+
+
+def build_slot_specs(layout: Sequence[str], num_envs: int) -> list['SlotSpec']:
+  if len(layout) != num_envs * 4:
+    raise ValueError('Layout length must be exactly num_envs * 4.')
+  specs: list[SlotSpec] = []
+  for idx, name in enumerate(layout):
+    env_id = idx // 4
+    port_index = idx % 4
+    specs.append(SlotSpec(env_id=env_id, port_index=port_index, name=name))
+  return specs
+
+
 def _canonical_matchup(characters: Sequence[Character]) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-  team1 = tuple(sorted((characters[0].value, characters[1].value)))
-  team2 = tuple(sorted((characters[2].value, characters[3].value)))
-  return tuple(sorted((team1, team2)))
+  teams = tuple(
+      _canonical_team(characters[a], characters[b])
+      for (a, b) in _TEAM_PORTS
+  )
+  return tuple(sorted(teams))
 
 
 def _canonical_team(char_a: Character, char_b: Character) -> Tuple[int, int]:
@@ -149,6 +265,7 @@ class CharacterScheduler:
       rng_seed: int = 0,
       max_candidates: int = 1024,
       max_slot_options: int = 4,
+      max_outstanding_per_env: int = 2,
   ):
     if not slot_specs:
       raise ValueError('CharacterScheduler requires at least one slot.')
@@ -159,6 +276,7 @@ class CharacterScheduler:
     self._rng = random.Random(rng_seed)
     self._max_candidates = max_candidates
     self._max_slot_options = max_slot_options
+    self._max_outstanding_per_env = max(1, max_outstanding_per_env)
     self._lock = threading.RLock()
 
     self._allowlist = {char: set(names) for char, names in allowlist.items()}
@@ -217,8 +335,9 @@ class CharacterScheduler:
     self._team_pending: collections.Counter = collections.Counter()
     self._char_name_completed: collections.Counter = collections.Counter()
     self._char_name_pending: collections.Counter = collections.Counter()
-    self._active_assignments: Dict[int, Assignment] = {}
     self._pending_assignments: Dict[str, Assignment] = {}
+    self._env_active_counts: collections.Counter[int] = collections.Counter()
+    self._env_assignment_ids: Dict[int, set[str]] = collections.defaultdict(set)
     self._char_allowed_names: Dict[Character, frozenset[str]] = {
         char: frozenset(names)
         for char, names in self._allowlist.items()
@@ -228,30 +347,41 @@ class CharacterScheduler:
 
   def request_assignment(self, env_id: int) -> Assignment:
     with self._lock:
-      if env_id in self._active_assignments:
-        raise ValueError(f'Env {env_id} already has an active assignment.')
+      if self._env_active_counts[env_id] >= self._max_outstanding_per_env:
+        raise ValueError(
+            f'Env {env_id} has {self._env_active_counts[env_id]} outstanding assignments; '
+            f'max {self._max_outstanding_per_env}.')
       slots = self._env_slots[env_id]
-      characters = self._choose_characters(env_id, slots)
-      assignment_id = uuid.uuid4().hex
-      assignment = Assignment(
-          assignment_id=assignment_id,
-          env_id=env_id,
-          characters=characters,
-          names=tuple(slot.name for slot in slots),
-      )
+    stats = self._build_scoring_stats()
+    characters = self._choose_characters(env_id, slots, stats)
+    assignment_id = uuid.uuid4().hex
+    assignment = Assignment(
+        assignment_id=assignment_id,
+        env_id=env_id,
+        characters=characters,
+        names=tuple(slot.name for slot in slots),
+    )
+    with self._lock:
+      if self._env_active_counts[env_id] >= self._max_outstanding_per_env:
+        raise ValueError(
+            f'Env {env_id} exceeded outstanding assignments while scheduling.')
       self._apply_pending_counts(assignment)
-      self._active_assignments[env_id] = assignment
-      self._pending_assignments[assignment_id] = assignment
-      return assignment
+      self._pending_assignments[assignment.assignment_id] = assignment
+      self._env_active_counts[env_id] += 1
+      self._env_assignment_ids[env_id].add(assignment.assignment_id)
+    return assignment
 
   def report_outcome(self, env_id: int, assignment_id: str, status: AssignmentStatus):
     with self._lock:
       assignment = self._pending_assignments.pop(assignment_id, None)
       if assignment is None:
         raise ValueError(f'Assignment {assignment_id} not found.')
-      if env_id not in self._active_assignments:
-        raise ValueError(f'Env {env_id} has no recorded assignment.')
-      del self._active_assignments[env_id]
+      if assignment_id not in self._env_assignment_ids.get(env_id, set()):
+        raise ValueError(f'Env {env_id} not tracking assignment {assignment_id}.')
+      self._env_assignment_ids[env_id].discard(assignment_id)
+      self._env_active_counts[env_id] -= 1
+      if self._env_active_counts[env_id] <= 0:
+        del self._env_active_counts[env_id]
       if status is AssignmentStatus.ABORTED:
         self._revert_pending_counts(assignment)
         return
@@ -297,17 +427,29 @@ class CharacterScheduler:
     return result
 
   def _build_scoring_stats(self) -> _ScoringStats:
-    char_counts = self._combined_counter(self._char_completed, self._char_pending)
-    matchup_counts = self._combined_counter(self._matchup_completed, self._matchup_pending)
-    char_name_counts = self._combined_counter(self._char_name_completed, self._char_name_pending)
-    team_counts = self._combined_counter(self._team_completed, self._team_pending)
+    with self._lock:
+      char_completed = self._char_completed.copy()
+      char_pending = self._char_pending.copy()
+      matchup_completed = self._matchup_completed.copy()
+      matchup_pending = self._matchup_pending.copy()
+      char_name_completed = self._char_name_completed.copy()
+      char_name_pending = self._char_name_pending.copy()
+      team_completed = self._team_completed.copy()
+      team_pending = self._team_pending.copy()
+      allowlist = self._allowlist
+      names_by_char = self._names_by_char
+
+    char_counts = self._combined_counter(char_completed, char_pending)
+    matchup_counts = self._combined_counter(matchup_completed, matchup_pending)
+    char_name_counts = self._combined_counter(char_name_completed, char_name_pending)
+    team_counts = self._combined_counter(team_completed, team_pending)
     total_char_counts = sum(char_counts.values())
     mean_char = (
-        total_char_counts / len(self._allowlist)
-        if self._allowlist else 0.0
+        total_char_counts / len(allowlist)
+        if allowlist else 0.0
     )
     per_char_name_mean: Dict[Character, float] = {}
-    for char, names in self._names_by_char.items():
+    for char, names in names_by_char.items():
       if not names:
         per_char_name_mean[char] = 0.0
         continue
@@ -354,10 +496,9 @@ class CharacterScheduler:
       self._char_pending[char] += 1
     matchup = _canonical_matchup(assignment.characters)
     self._matchup_pending[matchup] += 1
-    team1 = _canonical_team(assignment.characters[0], assignment.characters[1])
-    team2 = _canonical_team(assignment.characters[2], assignment.characters[3])
-    self._team_pending[team1] += 1
-    self._team_pending[team2] += 1
+    for idx_a, idx_b in _TEAM_PORTS:
+      team = _canonical_team(assignment.characters[idx_a], assignment.characters[idx_b])
+      self._team_pending[team] += 1
     for char, slot in zip(assignment.characters, slots):
       key = (slot.env_id, slot.port_index)
       normalized = self._slot_normalized_names[key]
@@ -373,9 +514,8 @@ class CharacterScheduler:
     self._matchup_pending[matchup] -= 1
     if self._matchup_pending[matchup] <= 0:
       del self._matchup_pending[matchup]
-    team1 = _canonical_team(assignment.characters[0], assignment.characters[1])
-    team2 = _canonical_team(assignment.characters[2], assignment.characters[3])
-    for team in (team1, team2):
+    for idx_a, idx_b in _TEAM_PORTS:
+      team = _canonical_team(assignment.characters[idx_a], assignment.characters[idx_b])
       self._team_pending[team] -= 1
       if self._team_pending[team] <= 0:
         del self._team_pending[team]
@@ -399,9 +539,8 @@ class CharacterScheduler:
     if self._matchup_pending[matchup] <= 0:
       del self._matchup_pending[matchup]
     self._matchup_completed[matchup] += 1
-    team1 = _canonical_team(assignment.characters[0], assignment.characters[1])
-    team2 = _canonical_team(assignment.characters[2], assignment.characters[3])
-    for team in (team1, team2):
+    for idx_a, idx_b in _TEAM_PORTS:
+      team = _canonical_team(assignment.characters[idx_a], assignment.characters[idx_b])
       self._team_pending[team] -= 1
       if self._team_pending[team] <= 0:
         del self._team_pending[team]
@@ -416,7 +555,7 @@ class CharacterScheduler:
         del self._char_name_pending[key]
       self._char_name_completed[key] += 1
 
-  def _choose_characters(self, env_id: int, slots: Sequence[SlotSpec]) -> Tuple[Character, ...]:
+  def _choose_characters(self, env_id: int, slots: Sequence[SlotSpec], stats: _ScoringStats) -> Tuple[Character, ...]:
     option_lists = [
         self._slot_characters[(env_id, slot.port_index)]
         for slot in slots
@@ -449,8 +588,6 @@ class CharacterScheduler:
     best_score = None
     best_combos: list[Tuple[Character, ...]] = []
     epsilon = 1e-6
-
-    stats = self._build_scoring_stats()
 
     if truncated_total <= self._max_candidates:
       candidates = itertools.product(*truncated_options)
@@ -497,8 +634,10 @@ class CharacterScheduler:
           new_chars = chars + [char]
           new_team_ctr = team_ctr.copy()
           new_score = partial_score + char_diff + name_diff
-          if slot_index % 2 == 1:
-            team_key = _canonical_team(new_chars[slot_index - 1], new_chars[slot_index])
+          teammate_port = _TEAMMATE_PORT.get(slot.port_index)
+          if teammate_port is not None and teammate_port < len(new_chars):
+            teammate_char = new_chars[teammate_port]
+            team_key = _canonical_team(teammate_char, new_chars[slot_index])
             repeats = new_team_ctr[team_key]
             existing = stats.team_counts.get(team_key, 0)
             team_variance = stats.team_variance or 1.0
@@ -532,9 +671,8 @@ class CharacterScheduler:
     score += self._matchup_weight * ((matchup_existing + 1) - stats.mean_matchup) / math.sqrt(matchup_variance)
 
     team_variance = stats.team_variance or 1.0
-    team1 = _canonical_team(combo[0], combo[1])
-    team2 = _canonical_team(combo[2], combo[3])
-    for team in (team1, team2):
+    for idx_a, idx_b in _TEAM_PORTS:
+      team = _canonical_team(combo[idx_a], combo[idx_b])
       existing = stats.team_counts.get(team, 0)
       score += self._team_weight * ((existing + 1) - stats.mean_team) / math.sqrt(team_variance)
 
@@ -546,3 +684,17 @@ class CharacterScheduler:
 
     score += self._rng.random() * 1e-4
     return score
+
+
+class _SchedulerManager(SyncManager):
+  pass
+
+
+_SchedulerManager.register('CharacterScheduler', CharacterScheduler)
+
+
+def start_scheduler_manager(**scheduler_kwargs):
+  manager = _SchedulerManager()
+  manager.start()
+  scheduler = manager.CharacterScheduler(**scheduler_kwargs)
+  return manager, scheduler

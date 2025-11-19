@@ -11,111 +11,11 @@ from slippi_ai.rl.character_scheduler import (
     AssignmentStatus,
     CharacterScheduler,
     SlotSpec,
+    allocate_name_slots,
+    build_slot_specs,
     parse_name_allowlist,
+    parse_name_csv,
 )
-from slippi_ai import nametags
-
-
-def _parse_names(raw: str) -> list[tuple[str, str]]:
-  names = []
-  for token in raw.split(','):
-    display = token.strip()
-    if not display:
-      continue
-    normalized = nametags.normalize_name(display)
-    names.append((normalized, display))
-  if not names:
-    raise ValueError('You must provide at least one name via --names.')
-  return names
-
-
-def _allocate_name_slots(
-    names: list[tuple[str, str]],
-    allowlist: Mapping[Character, set[str]],
-    num_envs: int,
-    layout_seed: int,
-) -> list[str]:
-  normalized_to_display: dict[str, str] = {}
-  for normalized, display in names:
-    normalized_to_display.setdefault(normalized, display)
-
-  referenced_names = set().union(*allowlist.values())
-  missing = referenced_names - set(normalized_to_display)
-  if missing:
-    raise ValueError(
-        'The following names appear in the allowlist but not in --names: '
-        + ', '.join(sorted(missing)))
-
-  total_slots = num_envs * 4
-  weights: dict[str, float] = {name: 0.0 for name in referenced_names}
-  for allowed_names in allowlist.values():
-    if not allowed_names:
-      continue
-    for name in allowed_names:
-      weights[name] += 1.0 / len(allowed_names)
-
-  total_weight = sum(weights.values())
-  if total_weight == 0:
-    raise ValueError('Allowlist does not assign any names to characters.')
-
-  ideal_counts = {name: weights[name] / total_weight * total_slots for name in weights}
-  slot_counts = {name: int(count) for name, count in ideal_counts.items()}
-  remainders = {name: ideal_counts[name] - slot_counts[name] for name in weights}
-
-  for name in weights:
-    if slot_counts[name] == 0:
-      slot_counts[name] = 1
-      remainders[name] = 0.0
-
-  current_total = sum(slot_counts.values())
-  if current_total > total_slots:
-    surplus = current_total - total_slots
-    ordered = sorted(
-        slot_counts.items(),
-        key=lambda item: (slot_counts[item[0]], -remainders[item[0]]),
-        reverse=True,
-    )
-    idx = 0
-    while surplus > 0 and idx < len(ordered):
-      name, _ = ordered[idx]
-      if slot_counts[name] > 1:
-        slot_counts[name] -= 1
-        surplus -= 1
-      else:
-        idx += 1
-
-  current_total = sum(slot_counts.values())
-  while current_total < total_slots:
-    best = max(
-        weights.keys(),
-        key=lambda n: (remainders[n], weights[n]),
-    )
-    slot_counts[best] += 1
-    current_total += 1
-
-  slots: list[str] = []
-  ordered_names = sorted(
-      slot_counts.keys(),
-      key=lambda name: (-slot_counts[name], name),
-  )
-  for name in ordered_names:
-    display = normalized_to_display[name]
-    slots.extend([display] * slot_counts[name])
-
-  rng = random.Random(layout_seed)
-  rng.shuffle(slots)
-  return slots
-
-
-def _build_slot_specs(layout: list[str], num_envs: int) -> list[SlotSpec]:
-  if len(layout) != num_envs * 4:
-    raise ValueError('Layout length must equal num_envs * 4.')
-  specs: list[SlotSpec] = []
-  for idx, name in enumerate(layout):
-    env_id = idx // 4
-    port = idx % 4
-    specs.append(SlotSpec(env_id=env_id, port_index=port, name=name))
-  return specs
 
 
 def _spread(values: Iterable[int]) -> Tuple[int, int, int]:
@@ -179,10 +79,10 @@ def main():
                       help='Random seed for shuffling the computed nametag layout.')
 
   args = parser.parse_args()
-  names = _parse_names(args.names)
+  names = parse_name_csv(args.names)
   allowlist = parse_name_allowlist(args.name_allowlist)
-  layout = _allocate_name_slots(names, allowlist, args.num_envs, args.layout_seed)
-  slots = _build_slot_specs(layout, args.num_envs)
+  layout = allocate_name_slots(names, allowlist, args.num_envs, args.layout_seed)
+  slots = build_slot_specs(layout, args.num_envs)
   scheduler = CharacterScheduler(
       allowlist=allowlist,
       slot_specs=slots,

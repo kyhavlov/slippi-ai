@@ -59,6 +59,24 @@ class AI(Player):
   def menuing_kwargs(self) -> Dict:
       return dict(character_selected=self.character)
 
+
+@dataclasses.dataclass
+class ScheduledAI(AI):
+  """AI player whose character is set explicitly each match."""
+
+  _next_character: Optional[melee.Character] = dataclasses.field(default=None, init=False)
+
+  def set_next_character(self, character: melee.Character):
+    if not isinstance(character, melee.Character):
+      character = melee.Character(character)
+    self._next_character = character
+
+  def shuffle_character(self):
+    if self._next_character is None:
+      raise RuntimeError('ScheduledAI requires set_next_character before shuffle_character().')
+    self.character = self._next_character
+    self._next_character = None
+
 class RemoteAI(Player):
 
   def controller_type(self) -> melee.ControllerType:

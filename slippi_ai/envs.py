@@ -1,5 +1,6 @@
 import collections
 import contextlib
+import copy
 import logging
 import multiprocessing as mp
 from multiprocessing.connection import Connection
@@ -21,6 +22,7 @@ from slippi_ai.types import Controller, Game
 from slippi_ai import data
 from slippi_db.parse_libmelee import get_game
 from slippi_ai import match_reporting
+from slippi_ai.rl.character_scheduler import AssignmentStatus, Assignment
 import signal
 
 Port = int
@@ -73,16 +75,31 @@ class Environment:
       swap_ports: bool = False,
       check_controller_outputs: bool = False,
       enable_singles: bool = False,
+      env_id: Optional[int] = None,
+      scheduler = None,
   ):
     players: dict[Port, dolphin.Player] = dolphin_kwargs['players']
     if len(players) != 4:
       raise ValueError('Environment requires exactly 4 players.')
-    
+
     print("Creating environment on", socket.gethostname(), "with slippi_port:", dolphin_kwargs.get('slippi_port'))
     self._agent_names = agent_names
     print("agent_names in base env: ", self._agent_names)
     self._enable_singles = enable_singles
     self._env_port = dolphin_kwargs.get('slippi_port')
+    self._env_id = env_id
+    self._scheduler = scheduler
+    self._active_assignment: Optional[Assignment] = None
+    self._prefetched_assignment: Optional[Assignment] = None
+    self._logical_ports = sorted(players.keys())
+    self._players = players
+
+    if self._scheduler is not None:
+      if self._env_id is None:
+        raise ValueError('env_id must be provided when scheduler is enabled.')
+      for port in self._logical_ports:
+        if not isinstance(players[port], dolphin.ScheduledAI):
+          raise TypeError('Scheduler requires dolphin.ScheduledAI players.')
 
     ports = list(players)
     actual_ports = list(reversed(ports)) if swap_ports else ports
@@ -123,7 +140,10 @@ class Environment:
     self._prev_state: Optional[GameState] = None
     self._prev_state2: Optional[GameState] = None
 
+    self._ensure_assignment()
+
   def stop(self):
+    self.abort_active_assignment(request_next=False)
     self._dolphin.stop()
     if self._enable_singles:
       self._dolphin2.stop()
@@ -187,6 +207,7 @@ class Environment:
       self._current_characters = [player.character for player in self._prev_state.players.values()]
       
     if not game_was_over and match_reporting.match_is_over(self._prev_state):
+      self._finalize_assignment(AssignmentStatus.COMPLETE)
       match_reporting.submit_match(self._prev_state, self._agent_names, self._current_characters)
 
     # stock stealing hack
@@ -233,17 +254,82 @@ class Environment:
     """Batched step to reduce communication overhead."""
     return [self.step(c) for c in controllers]
 
+  def abort_active_assignment(self, request_next: bool = True):
+    self._finalize_assignment(AssignmentStatus.ABORTED, request_next=request_next)
+
+  def _ensure_assignment(self):
+    if self._scheduler is None:
+      return
+    if self._active_assignment is None:
+      if self._prefetched_assignment is not None:
+        self._set_active_from_prefetch()
+      else:
+        assignment = self._scheduler.request_assignment(self._env_id)
+        self._set_active_assignment(assignment)
+
+  def _set_active_assignment(self, assignment: Assignment):
+    self._active_assignment = assignment
+    for idx, port in enumerate(self._logical_ports):
+      player = self._players[port]
+      if isinstance(player, dolphin.ScheduledAI):
+        player.set_next_character(assignment.characters[idx])
+
+  def _prefetch_next(self):
+    if self._scheduler is None or self._prefetched_assignment is not None:
+      return
+    self._prefetched_assignment = self._scheduler.request_assignment(self._env_id)
+
+  def _set_active_from_prefetch(self):
+    if self._prefetched_assignment is None:
+      self._active_assignment = None
+      return
+    assignment = self._prefetched_assignment
+    self._prefetched_assignment = None
+    self._set_active_assignment(assignment)
+
+  def _finalize_assignment(self, status: AssignmentStatus, *, request_next: bool = True):
+    if self._scheduler is None or self._active_assignment is None:
+      return
+
+    self._scheduler.report_outcome(
+        self._env_id,
+        self._active_assignment.assignment_id,
+        status,
+    )
+    self._active_assignment = None
+
+    if status is AssignmentStatus.ABORTED and self._prefetched_assignment is not None:
+      self._scheduler.report_outcome(
+          self._env_id,
+          self._prefetched_assignment.assignment_id,
+          AssignmentStatus.ABORTED,
+      )
+      self._prefetched_assignment = None
+
+    # Get the next assignment.
+    if self._prefetched_assignment is not None:
+      self._set_active_from_prefetch()
+    elif request_next:
+      assignment = self._scheduler.request_assignment(self._env_id)
+      self._set_active_assignment(assignment)
+    
+    # Prefetch the one after that.
+    if request_next:
+      self._prefetch_next()
+
 T = tp.TypeVar('T')
 
 
 class SafeEnvironment:
   """Wraps an environment with retries on disconnect."""
 
-  def __init__(self, dolphin_kwargs: dict, num_retries: int = 4, agent_names: tuple[str, str] = [], **env_kwargs):
+  def __init__(self, dolphin_kwargs: dict, num_retries: int = 4, agent_names: tuple[str, str] = [], env_id: Optional[int] = None, scheduler = None, **env_kwargs):
     self._dolphin_kwargs = dolphin_kwargs.copy()
     self._num_retries = num_retries
     self._env_kwargs = env_kwargs
     self._agent_names = agent_names
+    self._env_id = env_id
+    self._scheduler = scheduler
     self._build_environment()
 
   def _reset_port(self):
@@ -254,11 +340,18 @@ class SafeEnvironment:
 
   def _build_environment(self):
     self._env = utils.retry(
-        lambda: Environment(self._dolphin_kwargs, agent_names=self._agent_names, **self._env_kwargs),
+        lambda: Environment(
+            self._dolphin_kwargs,
+            agent_names=self._agent_names,
+            env_id=self._env_id,
+            scheduler=self._scheduler,
+            **self._env_kwargs,
+        ),
         on_exception={dolphin.ConnectFailed: self._reset_port},
         num_retries=2)
 
   def _reset_env(self):
+    self._env.abort_active_assignment()
     self._env.stop()  # closes associated dolphin instances, freeing up ports
     self._build_environment()
 
@@ -311,9 +404,12 @@ class BatchedEnvironment:
       agent_names: list[tuple[str, str]] = [],
       swap_ports: bool = True,  # Swap ports on half of the environments.
       enable_singles: bool = False,  # Enable singles mode for half the envs
+      env_ids: Optional[list[int]] = None,
+      scheduler = None,
   ):
     self._dolphin_kwargs = dolphin_kwargs
     slippi_ports = slippi_ports or utils.find_open_udp_ports(num_envs)
+    env_ids = env_ids or list(range(num_envs))
 
     if swap_ports and num_envs % 2 != 0:
       raise ValueError('swap_ports=True requires an even number of environments.')
@@ -321,13 +417,20 @@ class BatchedEnvironment:
     print("batched env, enable_singles: ", enable_singles, "slippi_ports: ", slippi_ports)
 
     envs: list[SafeEnvironment] = []
+    base_players = dolphin_kwargs.get('players', {})
     for i in range(num_envs):
       dolphin_kwargs_i = dolphin_kwargs.copy()
+      if base_players:
+        dolphin_kwargs_i['players'] = _clone_players(base_players)
       dolphin_kwargs_i.update(slippi_port=slippi_ports[i])
       if enable_singles:
         dolphin_kwargs_i.update(slippi_port2=slippi_ports[i*2 + 1])
       env = SafeEnvironment(
-          dolphin_kwargs_i, num_retries=num_retries, agent_names=agent_names[i],
+          dolphin_kwargs_i,
+          num_retries=num_retries,
+          agent_names=agent_names[i],
+          env_id=env_ids[i],
+          scheduler=scheduler,
           swap_ports=swap_ports and i >= num_envs // 2,
           enable_singles=enable_singles)
       envs.append(env)
@@ -395,6 +498,8 @@ def build_environment(
     slippi_ports: Optional[list[int]] = None,
     num_retries: int = 2,
     agent_names: list[tuple[str, str]] = [],
+    env_ids: Optional[list[int]] = None,
+    scheduler = None,
     **env_kwargs,
 ) -> tp.Union[SafeEnvironment, BatchedEnvironment]:
   if num_envs == 0:
@@ -402,11 +507,31 @@ def build_environment(
       assert len(slippi_ports) == 1
       dolphin_kwargs = dolphin_kwargs.copy()
       dolphin_kwargs['slippi_port'] = slippi_ports[0]
-    return SafeEnvironment(dolphin_kwargs, num_retries=num_retries, agent_names=agent_names[0], **env_kwargs)
+    base_players = dolphin_kwargs.get('players', {})
+    if base_players:
+      dolphin_kwargs['players'] = _clone_players(base_players)
+    env_id = env_ids[0] if env_ids else 0
+    names = agent_names[0] if agent_names else tuple()
+    return SafeEnvironment(
+        dolphin_kwargs,
+        num_retries=num_retries,
+        agent_names=names,
+        env_id=env_id,
+        scheduler=scheduler,
+        **env_kwargs,
+    )
 
   # BatchedEnvironment uses SafeEnvironment internally
   return BatchedEnvironment(
-      num_envs, dolphin_kwargs, slippi_ports, num_retries, agent_names, **env_kwargs)
+      num_envs,
+      dolphin_kwargs,
+      slippi_ports,
+      num_retries,
+      agent_names,
+      env_ids=env_ids,
+      scheduler=scheduler,
+      **env_kwargs,
+  )
 
 def _run_env(
     build_env_kwargs: dict,
@@ -446,6 +571,7 @@ def _run_env(
     # The other end closed the connection.
     return
   except Exception:
+    logging.exception("Exception in _run_env")
     send(EnvError(traceback.format_exc()))
     send(None)  # signal end of outputs
   finally:
@@ -466,6 +592,8 @@ class AsyncEnvMP:
       num_retries: int = 2,
       batch_time: bool = False,
       agent_names: list[tuple[str, str]] = [],
+      env_ids: Optional[list[int]] = None,
+      scheduler = None,
       **env_kwargs,
   ):
     context = mp.get_context('forkserver')
@@ -478,6 +606,8 @@ class AsyncEnvMP:
         slippi_ports=slippi_ports,
         num_retries=num_retries,
         agent_names=agent_names,
+        env_ids=env_ids,
+        scheduler=scheduler,
         **env_kwargs,
     )
     self._builder_kwargs = builder_kwargs
@@ -595,13 +725,22 @@ class AsyncEnvMP:
     self._initial_reset_state = self._recv()
 
   def _consume_initial_state(self) -> EnvOutput:
-    state = self._initial_reset_state
-    if state is None:
-      # Should not happen but fall back to a blocking recv.
-      with self._recv_profiler:
-        state = self._recv()
-    self._initial_reset_state = None
-    return state
+    while True:
+      state = self._initial_reset_state
+      if state is None:
+        # Should not happen but fall back to a blocking recv.
+        with self._recv_profiler:
+          state = self._recv()
+      self._initial_reset_state = None
+      if isinstance(state, Exception):
+        logging.warning('Env chunk %s initial state raised %s; restarting again.', self._process.name, type(state).__name__)
+        self._restart_env()
+        continue
+      if state is None:
+        logging.warning('Env chunk %s initial state missing; restarting again.', self._process.name)
+        self._restart_env()
+        continue
+      return state
 
 class AsyncBatchedEnvironmentMP:
   """A set of asynchronous environments with batched input/output."""
@@ -616,6 +755,8 @@ class AsyncBatchedEnvironmentMP:
       swap_ports: bool = True,
       enable_singles: bool = False, # Enable singles mode for half the envs
       agent_names: list[tuple[str, str]] = [],
+      env_ids: Optional[list[int]] = None,
+      scheduler = None,
   ):
     if num_envs % inner_batch_size != 0:
       raise ValueError(
@@ -631,6 +772,7 @@ class AsyncBatchedEnvironmentMP:
     self._slice = lambda i, x: x[i * inner_batch_size:(i + 1) * inner_batch_size]
 
     self._dolphin_kwargs = dolphin_kwargs
+    env_ids = env_ids or list(range(num_envs))
 
     self._envs: list[AsyncEnvMP] = []
     slippi_ports = utils.find_open_udp_ports(num_envs + num_envs // 2)
@@ -642,6 +784,7 @@ class AsyncBatchedEnvironmentMP:
 
       # take the slice of names for the envs in this AsyncEnvMP
       env_agent_names = agent_names[i * inner_batch_size:(i + 1) * inner_batch_size]
+      env_chunk_ids = env_ids[i * inner_batch_size:(i + 1) * inner_batch_size]
 
       env = AsyncEnvMP(
           dolphin_kwargs=dolphin_kwargs,
@@ -652,6 +795,8 @@ class AsyncBatchedEnvironmentMP:
           swap_ports=swap_ports,
           enable_singles=enable_singles and i % 2 == 0,
           agent_names=env_agent_names,
+          env_ids=env_chunk_ids,
+          scheduler=scheduler,
       )
       self._envs.append(env)
 
@@ -921,3 +1066,5 @@ class ReplayBatchedEnvironment:
 
   def peek(self) -> EnvOutput:
     return self._output_queue[0]
+def _clone_players(players: Mapping[int, dolphin.Player]) -> dict[int, dolphin.Player]:
+  return {port: copy.deepcopy(player) for port, player in players.items()}
