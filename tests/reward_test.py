@@ -96,6 +96,7 @@ def make_player(
     y: list[float] | None = None,
     invulnerable: list[bool] | None = None,
     is_dead: list[bool] | None = None,
+    on_ground: list[bool] | None = None,
 ) -> Player:
   percent_arr = np.asarray(percent, dtype=np.uint16)
   length = percent_arr.shape[0]
@@ -117,7 +118,8 @@ def make_player(
       character=characters,
       jumps_left=_zeros_uint8(length),
       shield_strength=_zeros_float32(length),
-      on_ground=_zeros_bool(length),
+      on_ground=np.asarray(
+          on_ground if on_ground is not None else [False] * length, dtype=np.bool_),
       is_dead=np.asarray(
           is_dead if is_dead is not None else [False] * length, dtype=np.bool_),
       stocks_left=np.asarray(stocks_left, dtype=np.uint8),
@@ -342,6 +344,7 @@ class RewardTest(unittest.TestCase):
             melee.Character.ZELDA,
             melee.Character.SHEIK,
         ],
+        on_ground=[False, True, False],
     )
     p1 = make_placeholder(length)
     p2 = make_player(
@@ -358,6 +361,34 @@ class RewardTest(unittest.TestCase):
 
     self.assertAlmostEqual(penalized[0], baseline[0] - 0.002, places=6)
     self.assertAlmostEqual(penalized[1], baseline[1], places=6)
+
+  def test_zelda_penalty_requires_grounded(self):
+    length = 3
+    p0 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        character_sequence=[
+            melee.Character.SHEIK,
+            melee.Character.ZELDA,
+            melee.Character.SHEIK,
+        ],
+        on_ground=[False, False, False],
+    )
+    p1 = make_placeholder(length)
+    p2 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+    )
+    p3 = make_placeholder(length)
+
+    game = make_game((p0, p1), (p2, p3), is_teams=False)
+
+    baseline = reward.compute_rewards(game)
+    penalized = reward.compute_rewards(game, zelda_penalty=0.002)
+
+    np.testing.assert_allclose(penalized, baseline)
 
   def test_death_weighting_toggle(self):
     length = 3

@@ -200,7 +200,9 @@ _ZELDA = melee.Character.ZELDA.value
 
 def _zelda_frames(player: Player) -> np.ndarray:
   characters = np.asarray(player.character)
-  return (characters[1:] == _ZELDA).astype(np.float32)
+  grounded = np.asarray(player.on_ground, dtype=bool)
+  is_grounded_zelda = np.logical_and(characters[1:] == _ZELDA, grounded[1:])
+  return is_grounded_zelda.astype(np.float32)
 
 
 def _team_reward(
