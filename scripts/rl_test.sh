@@ -5,6 +5,7 @@
 # the rollout_length until you run out of GPU memory. The inner_batch_size should
 # be set so that num_envs / inner_batch_size is approximately the number of CPU
 # threads you have available. The rest of the parameters can be left as is.
+# Mixed singles mode has been removed; this script now exercises doubles-only RL.
 
 # Slippi_Online-x86_64-ExiAI.AppImage
 # Slippi_Netplay_Mainline_NoGui-x86_64.AppImage
@@ -55,7 +56,6 @@ python slippi_ai/rl/run.py \
   --config.actor.ray_envs=False \
   --config.actor.num_env_steps=0 \
   --config.actor.gpu_inference=True \
-  --config.actor.enable_singles=True \
   --config.agent.name="$NAME" \
   --config.agent.batch_steps=4 \
   --config.runtime.reset_every_n_steps=512 \
