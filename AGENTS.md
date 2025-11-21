@@ -92,6 +92,7 @@
 5. **Document large-impact changes** – extend this guide, adjust README, annotate scripts when altering workflows.
 6. **Validate** – run unit/smoke tests relevant to touched modules; note skipped tests and why.
 7. **Preserve data hygiene** – never commit regenerated parquet/checkpoints; add `.gitignore` rules when needed.
+8. **W&B exports reference** – see `agent_tools/wandb_export_notes.md` for the API export commands and run IDs used on 2025-11-20.
 
 ## Observed Opportunities / TODO Seeds
 - Consolidate singles/doubles env handling (feature flags in `slippi_ai/envs.py:80`).
