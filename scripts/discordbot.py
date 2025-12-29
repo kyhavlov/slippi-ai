@@ -368,7 +368,10 @@ def get_valid_playstyle_choices():
         "Darkatma",
         "Dragunov",
         "Tempo",
-        "xRunRiot"
+        "xRunRiot",
+        "Cody",
+        "Ginger",
+        "Buddyboom",
     ]
     
     return [app_commands.Choice(name=p, value=p) for p in personalities]

@@ -184,6 +184,21 @@ class Environment:
   
   def _step(self, controllers: Controllers) -> EnvOutput:
     """Send controllers for each AI. Return the next state."""
+    # Make sure the scheduled-character queue is primed before Dolphin hits the
+    # character select screen. We occasionally saw long‑running jobs crash
+    # because ScheduledAI._next_character had been cleared but no new
+    # assignment was pushed (e.g. after an aborted game or env restart). If
+    # that happens, reapply the current assignment so shuffle_character() has
+    # something to consume.
+    if self._scheduler is not None:
+      if self._active_assignment is None:
+        self._ensure_assignment()
+      if self._active_assignment is not None:
+        for idx, port in enumerate(self._logical_ports):
+          player = self._players[port]
+          if isinstance(player, dolphin.ScheduledAI) and getattr(player, '_next_character', None) is None:
+            player.set_next_character(self._active_assignment.characters[idx])
+
     if not self._enable_singles:
       for port, controller in controllers.items():
         actual_port = self.port_to_actual[port]
