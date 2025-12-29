@@ -360,7 +360,7 @@ class DatasetConfig:
   # comma-separated lists of characters, or "all"
   allowed_characters: str = 'all'
   allowed_opponents: str = 'all'
-  swap: bool = True  # yield swapped versions of each replay
+  swap: bool = True  # yield both p2/p3 opponent permutations
   seed: int = 0
   include2v2: bool = True
 
@@ -415,30 +415,36 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
 
         hash_val = int(replay_meta.slp_md5[-1], 16)
         opponent_order = tuple(other_ports if hash_val % 2 == 0 else reversed(other_ports))
+        opponent_orders = [opponent_order]
+        if config.swap:
+          swapped = tuple(reversed(opponent_order))
+          if swapped != opponent_order:
+            opponent_orders.append(swapped)
 
-        meta_slots = [empty_player, empty_player, empty_player, empty_player]
-        meta_slots[main_index] = player
-        meta_slots[opponent_order[0]] = opponent
-        meta_slots[opponent_order[1]] = empty_player
+        for order in opponent_orders:
+          meta_slots = [empty_player, empty_player, empty_player, empty_player]
+          meta_slots[main_index] = player
+          meta_slots[order[0]] = opponent
+          meta_slots[order[1]] = empty_player
 
-        meta = ReplayMeta(
-            p0=meta_slots[0],
-            p1=meta_slots[1],
-            p2=meta_slots[2],
-            p3=meta_slots[3],
-            stage=replay_meta.stage,
-            slp_md5=replay_meta.slp_md5,
-            is_singles=True,
-        )
+          meta = ReplayMeta(
+              p0=meta_slots[0],
+              p1=meta_slots[1],
+              p2=meta_slots[2],
+              p3=meta_slots[3],
+              stage=replay_meta.stage,
+              slp_md5=replay_meta.slp_md5,
+              is_singles=True,
+          )
 
-        replays.append(ReplayInfo(
-            replay_path,
-            main_player_index=main_index,
-            teammate_index=teammate_index,
-            main_player_name=player.name,
-            meta=meta,
-            opponent_order=opponent_order,
-        ))
+          replays.append(ReplayInfo(
+              replay_path,
+              main_player_index=main_index,
+              teammate_index=teammate_index,
+              main_player_name=player.name,
+              meta=meta,
+              opponent_order=order,
+          ))
 
       continue
 
@@ -474,14 +480,19 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
       if teammate_index != -1:
         other_ports = tuple(i for i in range(4) if i not in (player_index, teammate_index))
         assert len(other_ports) == 2
-        replays.append(ReplayInfo(
+        info = ReplayInfo(
             replay_path,
             player_index,
             teammate_index,
             players[player_index].name,
             replay_meta,
             other_ports,
-        ))
+        )
+        replays.append(info)
+        if config.swap:
+          swapped = tuple(reversed(other_ports))
+          if swapped != other_ports:
+            replays.append(info._replace(opponent_order=swapped))
       else:
         invalid_team_id_count += 1
 

@@ -180,3 +180,6 @@ match_data/
 *.png
 .linuxvenv/
 .oldvenv/
+testmodels/
+melee_data/
+wandb_*

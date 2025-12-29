@@ -16,6 +16,8 @@ import time
 import typing as tp
 import zipfile
 
+from slippi_db import slpz as slpz_lib
+
 T = tp.TypeVar('T')
 
 class Timer:
@@ -159,9 +161,13 @@ class SimplePath(LocalFile):
 
   def read(self):
     with open(os.path.join(self.root, self.path), 'rb') as f:
-      return f.read()
+      data = f.read()
+    if self.path.endswith(_SLPZ_SUFFIX):
+      return slpz_lib.decompress_slpz_bytes(data)
+    return data
 
 _GZ_SUFFIX = '.gz'
+_SLPZ_SUFFIX = '.slpz'
 
 class GZipFile(LocalFile):
   """A gzipped file."""
@@ -178,12 +184,44 @@ class GZipFile(LocalFile):
 
   def read(self) -> bytes:
     with gzip.open(os.path.join(self.root, self.path)) as f:
-      return f.read()
+      data = f.read()
+    if self.name.endswith(_SLPZ_SUFFIX):
+      return slpz_lib.decompress_slpz_bytes(data)
+    return data
 
   @contextmanager
   def extract(self, tmpdir: str) -> Generator[str, None, None]:
     try:
       path = os.path.join(tmpdir, self.name)
+      with open(path, 'wb') as f:
+        f.write(self.read())
+      yield path
+    finally:
+      os.remove(path)
+
+class SlpzFile(LocalFile):
+  """An SLPZ-compressed Slippi replay (zstd + event reordering)."""
+
+  def __init__(self, root: str, path: str):
+    self.root = root
+    self.path = path
+    if not path.endswith(_SLPZ_SUFFIX):
+      raise ValueError(f'{root}/{path} is not an slpz file?')
+
+  @property
+  def name(self) -> str:
+    return self.path
+
+  def read(self) -> bytes:
+    with open(os.path.join(self.root, self.path), 'rb') as f:
+      data = f.read()
+    return slpz_lib.decompress_slpz_bytes(data)
+
+  @contextmanager
+  def extract(self, tmpdir: str) -> Generator[str, None, None]:
+    try:
+      # Use a fixed name since slpz doesn't map 1:1 to a filesystem path.
+      path = os.path.join(tmpdir, 'game.slp')
       with open(path, 'wb') as f:
         f.write(self.read())
       yield path
@@ -206,7 +244,10 @@ class SevenZipFile(LocalFile):
         result = subprocess.run(
             ['7z', 'e', '-so', self.root, self.path],
             stdout=subprocess.PIPE)
-        return result.stdout
+        data = result.stdout
+        if self.path.endswith(_SLPZ_SUFFIX):
+          return slpz_lib.decompress_slpz_bytes(data)
+        return data
 
     @contextmanager
     def extract(self, tmpdir: str) -> Generator[str, None, None]:
@@ -240,6 +281,8 @@ class ZipFile(LocalFile):
     self.root = root
     self.path = path
     self.is_gzipped = path.endswith(_GZ_SUFFIX)
+    inner_name = path.removesuffix(_GZ_SUFFIX) if self.is_gzipped else path
+    self.is_slpz = inner_name.endswith(_SLPZ_SUFFIX)
 
   @property
   def name(self) -> str:
@@ -255,6 +298,8 @@ class ZipFile(LocalFile):
     data = result.stdout
     if self.is_gzipped:
       data = gzip.decompress(data)
+    if self.is_slpz:
+      data = slpz_lib.decompress_slpz_bytes(data)
     return data
 
   @contextmanager
@@ -265,6 +310,14 @@ class ZipFile(LocalFile):
         f.write(self.read())
       yield path
 
+def local_file(root: str, path: str) -> LocalFile:
+  """Create a LocalFile wrapper based on filename suffix."""
+  if path.endswith(_SLPZ_SUFFIX):
+    return SlpzFile(root, path)
+  if path.endswith(_GZ_SUFFIX):
+    return GZipFile(root, path)
+  return SimplePath(root, path)
+
 def traverse_slp_files(root: str) -> list[LocalFile]:
   files = []
   for abspath, _, filenames in os.walk(root):
@@ -272,11 +325,19 @@ def traverse_slp_files(root: str) -> list[LocalFile]:
       if name.endswith('.slp'):
         reldir = os.path.relpath(abspath, root)
         relpath = os.path.join(reldir, name)
-        files.append(SimplePath(root, relpath))
+        files.append(local_file(root, relpath))
       elif name.endswith('.slp.gz'):
         reldir = os.path.relpath(abspath, root)
         relpath = os.path.join(reldir, name)
-        files.append(GZipFile(root, relpath))
+        files.append(local_file(root, relpath))
+      elif name.endswith('.slpz'):
+        reldir = os.path.relpath(abspath, root)
+        relpath = os.path.join(reldir, name)
+        files.append(local_file(root, relpath))
+      elif name.endswith('.slpz.gz'):
+        reldir = os.path.relpath(abspath, root)
+        relpath = os.path.join(reldir, name)
+        files.append(local_file(root, relpath))
 
   return files
 
@@ -284,7 +345,7 @@ def traverse_slp_files_7z(root: str) -> list[SevenZipFile]:
   files = []
   relpaths = py7zr.SevenZipFile(root).getnames()
   for path in relpaths:
-    if path.endswith('.slp'):
+    if path.endswith('.slp') or path.endswith('.slpz'):
       files.append(SevenZipFile(root, path))
   return files
 
@@ -310,7 +371,7 @@ class SevenZipChunk:
     """Extract the chunk to a temporary directory and return the files."""
     with tempfile.TemporaryDirectory(dir=get_tmp_dir(in_memory=in_memory)) as tmpdir:
       py7zr.SevenZipFile(self.path).extract(targets=self.files, path=tmpdir)
-      yield [SimplePath(tmpdir, f) for f in self.files]
+      yield [local_file(tmpdir, f) for f in self.files]
 
 def traverse_7z_fast(
     path: str,
@@ -387,7 +448,12 @@ def traverse_7z_fast(
   return [SevenZipChunk(path, chunk) for chunk in chunks]
 
 _SLP_SUFFIX = '.slp'
-VALID_SUFFIXES = [_SLP_SUFFIX, _SLP_SUFFIX + _GZ_SUFFIX]
+VALID_SUFFIXES = [
+    _SLP_SUFFIX,
+    _SLP_SUFFIX + _GZ_SUFFIX,
+    _SLPZ_SUFFIX,
+    _SLPZ_SUFFIX + _GZ_SUFFIX,
+]
 
 def traverse_slp_files_zip(root: str) -> list[LocalFile]:
   files = []

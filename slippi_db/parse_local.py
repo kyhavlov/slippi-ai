@@ -9,7 +9,8 @@ Root
   parsed.pkl
   meta.json
 
-Raw contains .zip and .7z archives of .slp files, possibly nested under
+Raw contains .zip and .7z archives of .slp/.slpz files (and may also contain
+standalone .slp/.slpz files), possibly nested under
 subdirectories. The raw.json metadata file contains information about each
 raw archive, including whether it has been processed. Once a raw archive has
 been processed, it may be removed to save space.
@@ -319,6 +320,32 @@ def parse_zip_archive(
 
   return results
 
+def parse_replay_file(
+    archive: RawArchive,
+    local_root: str,
+    output_dir: str,
+    tmpdir: str,
+    compression_options: dict = {},
+    staging_dir: Optional[str] = None,
+) -> list[dict]:
+  """Parse a standalone .slp/.slpz file under Raw/."""
+  print(f"Processing replay file: {archive.name}")
+  with stage_archive(archive, local_root, staging_dir) as local_path:
+    file = utils.local_file(
+        os.path.dirname(local_path),
+        os.path.basename(local_path),
+    )
+    result = parse_slp(
+        file,
+        output_dir=output_dir,
+        tmpdir=tmpdir,
+        **compression_options,
+    )
+    # Preserve the original Raw/ relative path for metadata/debugging.
+    result['name'] = archive.name
+    result['raw'] = archive.name
+    return [result]
+
 MD5_KEY = 'slp_md5'
 
 def get_key(row: dict):
@@ -452,6 +479,15 @@ def run_parsing(
           num_threads,
           compression_options,
           log_interval,
+          staging_dir,
+      )
+    elif archive.name.endswith(('.slp', '.slp.gz', '.slpz', '.slpz.gz')):
+      archive_results = parse_replay_file(
+          archive,
+          raw_dir,
+          output_dir,
+          tmpdir,
+          compression_options,
           staging_dir,
       )
     else:

@@ -1,7 +1,7 @@
 pandas
 dm-sonnet
 gdown
-tensorflow
+tensorflow[and-cuda]
 tensorflow_probability[tf]
 wandb
 git+https://github.com/mbr/simplekv.git
