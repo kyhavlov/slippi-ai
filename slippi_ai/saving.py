@@ -2,12 +2,14 @@ import dataclasses
 import pickle
 
 import logging
+import numpy as np
 import tree
 import tensorflow as tf
 
 from slippi_ai import (
     data,
     embed,
+    opponent_pooling as opponent_pooling_lib,
     policies,
     networks,
     controller_heads,
@@ -16,7 +18,7 @@ from slippi_ai import (
 )
 from slippi_ai.flag_utils import dataclass_from_dict
 
-VERSION = 4
+VERSION = 5
 
 def upgrade_config(config: dict):
   """Upgrades a config to the latest version."""
@@ -41,6 +43,7 @@ def upgrade_config(config: dict):
   if config['version'] == 2:
     assert 'embed' not in config
     old_embed_config = embed.EmbedConfig(
+        num_players=2,
         player=embed.PlayerConfig(
             xy_scale=0.05,
             shield_scale=0.01,
@@ -69,6 +72,21 @@ def upgrade_config(config: dict):
 
     config['version'] = 4
     logging.warning('Upgraded config version 3 -> 4')
+
+  if config['version'] == 4:
+    policy_cfg = config.setdefault('policy', {})
+    policy_cfg.setdefault(
+        'opponent_pooling',
+        dataclasses.asdict(opponent_pooling_lib.OpponentPoolingConfig()),
+    )
+    vf_cfg = config.setdefault('value_function', {})
+    vf_cfg.setdefault(
+        'opponent_pooling',
+        dataclasses.asdict(opponent_pooling_lib.OpponentPoolingConfig()),
+    )
+
+    config['version'] = 5
+    logging.warning('Upgraded config version 4 -> 5')
 
   assert config['version'] == VERSION
   return config
@@ -106,6 +124,7 @@ def policy_from_config(config: dict) -> policies.Policy:
           **config['embed']['controller']),
       embed_game=embed.make_game_embedding(
           player_config=config['embed']['player'],
+          num_players=config['embed'].get('num_players', 4),
           with_randall_xy=config['embed'].get('with_randall_xy', False),
           items_config=dataclass_from_dict(
               embed.ItemsConfig, config['embed'].get('items', {}))),
@@ -118,8 +137,48 @@ def load_policy_from_state(state: dict) -> policies.Policy:
 
   # assign using saved params
   params = state['state']['policy']
+
+  def assign_compatible(var: tf.Variable, val):
+    val_arr = val
+    if isinstance(val_arr, tf.Tensor):
+      val_arr = val_arr.numpy()
+    val_arr = np.asarray(val_arr)
+
+    if tuple(var.shape) == tuple(val_arr.shape):
+      var.assign(val_arr)
+      return
+
+    if var.shape.rank != val_arr.ndim:
+      raise ValueError(
+          f"Cannot assign {var.name}: rank mismatch {var.shape} vs {val_arr.shape}")
+
+    # Allow old checkpoints that had smaller input embeddings: pad/truncate on the
+    # leading dimension when the trailing dimensions match.
+    if var.shape.rank == 2 and int(var.shape[1]) == int(val_arr.shape[1]):
+      target0 = int(var.shape[0])
+      if val_arr.shape[0] < target0:
+        pad0 = target0 - int(val_arr.shape[0])
+        val_arr = np.pad(val_arr, [(0, pad0), (0, 0)], mode="constant")
+      elif val_arr.shape[0] > target0:
+        val_arr = val_arr[:target0, :]
+      var.assign(val_arr)
+      return
+
+    if var.shape.rank == 1:
+      target0 = int(var.shape[0])
+      if val_arr.shape[0] < target0:
+        pad0 = target0 - int(val_arr.shape[0])
+        val_arr = np.pad(val_arr, [(0, pad0)], mode="constant")
+      elif val_arr.shape[0] > target0:
+        val_arr = val_arr[:target0]
+      var.assign(val_arr)
+      return
+
+    raise ValueError(
+        f"Cannot assign {var.name}: shape mismatch {var.shape} vs {val_arr.shape}")
+
   tree.map_structure(
-      lambda var, val: var.assign(val),
+      assign_compatible,
       policy.variables, params)
 
   return policy

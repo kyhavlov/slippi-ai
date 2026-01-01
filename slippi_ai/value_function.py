@@ -5,7 +5,8 @@ import sonnet as snt
 
 from melee.enums import Action
 
-from slippi_ai import data, embed, networks, tf_utils, types
+from slippi_ai import data, embed, networks, opponent_pooling as opponent_pooling_lib, tf_utils, types
+from slippi_ai.flag_utils import dataclass_from_dict
 from slippi_ai.rl_lib import discounted_returns
 from slippi_ai.networks import RecurrentState
 
@@ -27,11 +28,27 @@ class ValueFunction(snt.Module):
   def __init__(
       self,
       network_config: dict,
+      embed_game: embed.StructEmbedding[data.Game],
       embed_state_action: embed.StructEmbedding[embed.StateAction],
+      opponent_pooling: tp.Optional[tp.Union[opponent_pooling_lib.OpponentPoolingConfig, dict]] = None,
   ):
     super().__init__(name='ValueFunction')
     self.network = networks.construct_network(**network_config)
+
+    if opponent_pooling is None:
+      opp_pool_cfg = opponent_pooling_lib.OpponentPoolingConfig()
+    elif isinstance(opponent_pooling, dict):
+      opp_pool_cfg = dataclass_from_dict(
+          opponent_pooling_lib.OpponentPoolingConfig, opponent_pooling)
+    else:
+      opp_pool_cfg = opponent_pooling
+
     self.embed_state_action = embed_state_action
+    self._opponent_pooling = opponent_pooling_lib.OpponentPoolingPreprocessor(
+        embed_game=embed_game,
+        config=opp_pool_cfg,
+        name="opponent_pooling",
+    )
     self.value_head = snt.Linear(1, name='value_head')
     self.initial_state = self.network.initial_state
 
@@ -54,7 +71,7 @@ class ValueFunction(snt.Module):
     """
     rewards = frames.reward
 
-    all_inputs = self.embed_state_action(frames.state_action)
+    all_inputs = self._opponent_pooling(self.embed_state_action(frames.state_action))
     inputs, last_input = all_inputs[:-1], all_inputs[-1]
     outputs, final_state = self.network.unroll(
         inputs, frames.is_resetting[:-1], initial_state)

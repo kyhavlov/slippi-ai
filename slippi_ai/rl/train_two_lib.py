@@ -171,7 +171,9 @@ class AgentManager:
         value_net_config = vf_config.network
       value_function = vf_lib.ValueFunction(
           network_config=value_net_config,
+          embed_game=self.policy.embed_game,
           embed_state_action=self.policy.embed_state_action,
+          opponent_pooling=vf_config.opponent_pooling,
       )
 
     self.learner = learner_lib.Learner(

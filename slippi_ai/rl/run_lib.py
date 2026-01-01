@@ -407,7 +407,9 @@ def run(config: Config):
       value_net_config = vf_config.network
     value_function = vf_lib.ValueFunction(
         network_config=value_net_config,
+        embed_game=policy.embed_game,
         embed_state_action=policy.embed_state_action,
+        opponent_pooling=vf_config.opponent_pooling,
     )
 
   learner = learner_lib.Learner(

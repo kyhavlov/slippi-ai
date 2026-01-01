@@ -11,7 +11,8 @@ from slippi_ai.controller_heads import (
     SampleOutputs,
 )
 from slippi_ai.rl_lib import discounted_returns
-from slippi_ai import data, networks, embed, types, tf_utils
+from slippi_ai import data, networks, embed, opponent_pooling as opponent_pooling_lib, types, tf_utils, utils
+from slippi_ai.flag_utils import dataclass_from_dict
 from slippi_ai.value_function import ValueOutputs
 
 Outputs = tf_utils.Outputs
@@ -41,6 +42,7 @@ class Policy(snt.Module):
       num_names: int,
       train_value_head: bool = True,
       delay: int = 0,
+      opponent_pooling: tp.Optional[tp.Union[opponent_pooling_lib.OpponentPoolingConfig, dict]] = None,
   ):
     super().__init__(name='Policy')
     self.network = network
@@ -50,6 +52,19 @@ class Policy(snt.Module):
         embed_game=embed_game,
         embed_action=self.controller_embedding,
         num_names=num_names,
+    )
+
+    if opponent_pooling is None:
+      opp_pool_cfg = opponent_pooling_lib.OpponentPoolingConfig()
+    elif isinstance(opponent_pooling, dict):
+      opp_pool_cfg = dataclass_from_dict(
+          opponent_pooling_lib.OpponentPoolingConfig, opponent_pooling)
+    else:
+      opp_pool_cfg = opponent_pooling
+    self._opponent_pooling = opponent_pooling_lib.OpponentPoolingPreprocessor(
+        embed_game=embed_game,
+        config=opp_pool_cfg,
+        name="opponent_pooling",
     )
 
     self.initial_state = self.network.initial_state
@@ -125,7 +140,7 @@ class Policy(snt.Module):
       value_cost: Weighting of value function loss.
       discount: Per-frame discount factor for returns.
     """
-    all_inputs = self.embed_state_action(frames.state_action)
+    all_inputs = self._opponent_pooling(self.embed_state_action(frames.state_action))
     inputs, last_input = all_inputs[:-1], all_inputs[-1]
     outputs, final_state = self.network.unroll(
         inputs, frames.is_resetting[:-1], initial_state)
@@ -216,7 +231,7 @@ class Policy(snt.Module):
       initial_state: RecurrentState,
       discount: float = 0.99,
   ):
-    all_inputs = self.embed_state_action(frames.state_action)
+    all_inputs = self._opponent_pooling(self.embed_state_action(frames.state_action))
     inputs, last_input = all_inputs[:-1], all_inputs[-1]
     outputs, final_state = self.network.unroll(
         inputs, frames.is_resetting[:-1], initial_state)
@@ -259,7 +274,7 @@ class Policy(snt.Module):
       is_resetting: tp.Optional[tf.Tensor] = None,
       **kwargs,
   ) -> tp.Tuple[SampleOutputs, RecurrentState]:
-    input = self.embed_state_action(state_action)
+    input = self._opponent_pooling(self.embed_state_action(state_action))
 
     if is_resetting is None:
       batch_size = input.shape[0]
@@ -300,3 +315,4 @@ class Policy(snt.Module):
 class PolicyConfig:
   train_value_head: bool = True
   delay: int = 0
+  opponent_pooling: opponent_pooling_lib.OpponentPoolingConfig = utils.field(opponent_pooling_lib.OpponentPoolingConfig)

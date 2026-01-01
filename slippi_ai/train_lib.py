@@ -26,6 +26,7 @@ from slippi_ai import (
     nametags,
     networks,
     policies,
+    opponent_pooling as opponent_pooling_lib,
     saving,
     s3_lib,
     tf_utils,
@@ -169,6 +170,7 @@ class ValueFunctionConfig:
   train_separate_network: bool = True
   separate_network_config: bool = True
   network: dict = _field(lambda: networks.DEFAULT_CONFIG)
+  opponent_pooling: opponent_pooling_lib.OpponentPoolingConfig = _field(opponent_pooling_lib.OpponentPoolingConfig)
 
 @dataclasses.dataclass
 class Config:
@@ -305,7 +307,9 @@ def train(config: Config):
       value_net_config = config.value_function.network
     value_function = vf_lib.ValueFunction(
         network_config=value_net_config,
+        embed_game=policy.embed_game,
         embed_state_action=policy.embed_state_action,
+        opponent_pooling=config.value_function.opponent_pooling,
     )
 
   learner_kwargs = dataclasses.asdict(config.learner)

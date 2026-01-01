@@ -583,9 +583,13 @@ _PORTS = (0, 1)
 
 def make_game_embedding(
     player_config: dict | PlayerConfig | None = None,
+    num_players: int = 4,
     with_randall_xy: bool = False,
     items_config: ItemsConfig = ItemsConfig(),
 ):
+  if num_players not in (2, 4):
+    raise ValueError(f"num_players must be 2 or 4, got {num_players}")
+
   if player_config is None:
     player_config_dict: dict[str, Any] = {}
   elif dataclasses.is_dataclass(player_config):
@@ -600,12 +604,17 @@ def make_game_embedding(
   embedding_fields: list[tuple[str, Embedding]] = [
       ('p0', embed_player),
       ('p1', embed_player),
-      ('p2', embed_player),
-      ('p3', embed_player),
+  ]
+  if num_players == 4:
+    embedding_fields.extend([
+        ('p2', embed_player),
+        ('p3', embed_player),
+    ])
+  embedding_fields.extend([
       ('stage', embed_stage),
       ('randall_phase', embed_randall_phase),
       ('is_teams', embed_bool),
-  ]
+  ])
 
   if with_randall_xy:
     embed_xy = FloatEmbedding("randall_xy", scale=xy_scale)
@@ -694,6 +703,7 @@ class ControllerConfig:
 
 @dataclasses.dataclass
 class EmbedConfig:
+  num_players: int = 4
   player: PlayerConfig = utils.field(PlayerConfig)
   controller: ControllerConfig = utils.field(ControllerConfig)
   with_randall_xy: bool = False
