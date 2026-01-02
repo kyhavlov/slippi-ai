@@ -25,6 +25,7 @@ flags.DEFINE_float('emulation_speed', 0.0, 'Mainline-only; set 0 for unlimited.'
 flags.DEFINE_boolean('infinite_time', True, 'Infinite time / no stocks.')
 flags.DEFINE_integer('console_timeout', 30, 'Seconds before console timeout.')
 flags.DEFINE_integer('log_level', 0, 'Dolphin log level (0 to disable).')
+flags.DEFINE_boolean('include_controller_state', True, 'Include controller state in observations.')
 
 
 def _neutral_controllers(batch_size: int):
@@ -81,6 +82,7 @@ def main(_):
       env_ids=list(range(num_envs)),
       scheduler=None,
       enable_singles=False,
+      include_controller_state=bool(FLAGS.include_controller_state),
   )
 
   controllers = _neutral_controllers(num_envs)
