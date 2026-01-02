@@ -68,7 +68,6 @@ class RolloutWorker:
       scheduler = None,
       fuse_ports_inference: bool = False,
   ):
-    print("use_gpu = ", use_gpu)
     self._ports = tuple(sorted(agent_kwargs))
     self._num_envs = num_envs
     if fuse_ports_inference and len(self._ports) > 1:

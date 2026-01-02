@@ -277,8 +277,6 @@ class LearnerManager:
 
       actor_metrics = tf.nest.map_structure(
           lambda *xs: np.mean(xs), *actor_metrics)
-      
-      print("collected %d trajectories" % len(trajectories))
 
     with self.learner_profiler:
       self._hidden_state, metrics = self._learner.ppo(
@@ -450,18 +448,19 @@ def run(config: Config):
 
   scheduler_manager = None
   scheduler_proxy = None
-  scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
-      allowlist=allowlist,
-      slot_specs=slot_specs,
-      rng_seed=config.agent.scheduler_seed,
-      char_weight=config.agent.scheduler_char_weight,
-      matchup_weight=config.agent.scheduler_matchup_weight,
-      team_weight=config.agent.scheduler_team_weight,
-      char_name_weight=config.agent.scheduler_char_name_weight,
-      max_candidates=config.agent.scheduler_max_candidates,
-      max_slot_options=config.agent.scheduler_max_slot_options,
-      max_outstanding_per_env=2,
-  )
+  if not config.actor.use_fake_envs:
+    scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
+        allowlist=allowlist,
+        slot_specs=slot_specs,
+        rng_seed=config.agent.scheduler_seed,
+        char_weight=config.agent.scheduler_char_weight,
+        matchup_weight=config.agent.scheduler_matchup_weight,
+        team_weight=config.agent.scheduler_team_weight,
+        char_name_weight=config.agent.scheduler_char_name_weight,
+        max_candidates=config.agent.scheduler_max_candidates,
+        max_slot_options=config.agent.scheduler_max_slot_options,
+        max_outstanding_per_env=2,
+    )
 
   # set ports 1-4 to scheduled AI
   dolphin_kwargs = dict(
@@ -483,7 +482,6 @@ def run(config: Config):
         name=port_name_batches[i],
         **main_agent_kwargs.copy(),
     )
-    print("port names: ", i, agent_kwargs[i]['name'])
 
   env_kwargs = dict(swap_ports=False)
   if config.actor.async_envs:
@@ -492,7 +490,6 @@ def run(config: Config):
         inner_batch_size=config.actor.inner_batch_size,
         enable_singles=config.actor.enable_singles,
     )
-    print('num steps', config.actor.num_env_steps)
 
   build_actor = lambda: evaluators.RolloutWorker(
       agent_kwargs=agent_kwargs,
