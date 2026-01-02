@@ -39,6 +39,22 @@ def get_controller(cs: melee.ControllerState) -> Controller:
       buttons=get_buttons(cs.button),
   )
 
+_EMPTY_CONTROLLER = Controller(
+    main_stick=Stick(np.float32(0.5), np.float32(0.5)),
+    c_stick=Stick(np.float32(0.5), np.float32(0.5)),
+    shoulder=np.float32(0.0),
+    buttons=Buttons(
+        A=False,
+        B=False,
+        X=False,
+        Y=False,
+        Z=False,
+        L=False,
+        R=False,
+        D_UP=False,
+    ),
+)
+
 _EMPTY_NANA = utils.map_nt(
     lambda t: t(0),
     utils.reify_tuple_type(Nana),
@@ -63,7 +79,7 @@ def get_player(player: melee.PlayerState) -> Player:
       on_ground=np.bool_(player.on_ground),
       is_dead=np.bool_(player.stock == 0),
       stocks_left=np.uint8(player.stock),
-      controller=get_controller(player.controller_state),
+      controller=_EMPTY_CONTROLLER,
   )
 
   if player.nana is not None:
@@ -93,6 +109,7 @@ def get_game(
     game: melee.GameState,
     ports: Optional[Sequence[int]] = None,
     singles_opponent_port: int = 2,
+    include_controller_state: bool = True,
 ) -> Game:
   ports = ports or sorted(game.players)
   
@@ -107,7 +124,10 @@ def get_game(
   players = {}
   for i, p in enumerate(ports):
     if p in game.players:
-      players[f'p{i}'] = get_player(game.players[p])
+      player = get_player(game.players[p])
+      if include_controller_state:
+        player = player._replace(controller=get_controller(game.players[p].controller_state))
+      players[f'p{i}'] = player
     else:
       state = melee.PlayerState()
       state.action = melee.Action.DEAD_DOWN

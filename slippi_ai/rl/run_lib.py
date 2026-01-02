@@ -483,7 +483,16 @@ def run(config: Config):
         **main_agent_kwargs.copy(),
     )
 
-  env_kwargs = dict(swap_ports=False)
+  include_controller_state = bool(
+      rl_state.get('config', {})
+      .get('embed', {})
+      .get('player', {})
+      .get('with_controller', False)
+  )
+  env_kwargs = dict(
+      swap_ports=False,
+      include_controller_state=include_controller_state,
+  )
   if config.actor.async_envs:
     env_kwargs.update(
         num_steps=config.actor.num_env_steps,

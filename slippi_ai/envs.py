@@ -75,6 +75,7 @@ class Environment:
       swap_ports: bool = False,
       check_controller_outputs: bool = False,
       enable_singles: bool = False,
+      include_controller_state: bool = True,
       env_id: Optional[int] = None,
       scheduler = None,
   ):
@@ -86,6 +87,7 @@ class Environment:
     self._agent_names = agent_names
     print("agent_names in base env: ", self._agent_names)
     self._enable_singles = enable_singles
+    self._include_controller_state = include_controller_state
     self._env_port = dolphin_kwargs.get('slippi_port')
     self._env_id = env_id
     self._scheduler = scheduler
@@ -168,12 +170,21 @@ class Environment:
     # return one game per port in DOUBLES_PORT_MAPPINGS
     if not self._enable_singles:
       for port, ports in DOUBLES_PORT_MAPPINGS.items():
-        games[port] = get_game(self._prev_state, ports)
+        games[port] = get_game(
+            self._prev_state,
+            ports,
+            include_controller_state=self._include_controller_state,
+        )
     else:
       for port, ports in SINGLES_PORT_MAPPINGS.items():
         actual_port = self.port_to_actual[port]
         singles_opponent_port = 2 if port < 3 else 3
-        games[port] = get_game(self._prev_state if actual_port <= 2 else self._prev_state2, ports, singles_opponent_port)
+        games[port] = get_game(
+            self._prev_state if actual_port <= 2 else self._prev_state2,
+            ports,
+            singles_opponent_port,
+            include_controller_state=self._include_controller_state,
+        )
 
     #print("current_state keys: ", self._enable_singles, games.keys())
 
@@ -419,6 +430,7 @@ class BatchedEnvironment:
       agent_names: list[tuple[str, str]] = [],
       swap_ports: bool = True,  # Swap ports on half of the environments.
       enable_singles: bool = False,  # Enable singles mode for half the envs
+      include_controller_state: bool = True,
       env_ids: Optional[list[int]] = None,
       scheduler = None,
   ):
@@ -447,7 +459,9 @@ class BatchedEnvironment:
           env_id=env_ids[i],
           scheduler=scheduler,
           swap_ports=swap_ports and i >= num_envs // 2,
-          enable_singles=enable_singles)
+          enable_singles=enable_singles,
+          include_controller_state=include_controller_state,
+      )
       envs.append(env)
 
     self._envs = envs
@@ -744,8 +758,7 @@ class AsyncEnvMP:
       state = self._initial_reset_state
       if state is None:
         # Should not happen but fall back to a blocking recv.
-        with self._recv_profiler:
-          state = self._recv()
+        state = self._recv()
       self._initial_reset_state = None
       if isinstance(state, Exception):
         logging.warning('Env chunk %s initial state raised %s; restarting again.', self._process.name, type(state).__name__)
@@ -769,6 +782,7 @@ class AsyncBatchedEnvironmentMP:
       num_retries: int = 2,
       swap_ports: bool = True,
       enable_singles: bool = False, # Enable singles mode for half the envs
+      include_controller_state: bool = True,
       agent_names: list[tuple[str, str]] = [],
       env_ids: Optional[list[int]] = None,
       scheduler = None,
@@ -809,6 +823,7 @@ class AsyncBatchedEnvironmentMP:
           num_retries=num_retries,
           swap_ports=swap_ports,
           enable_singles=enable_singles and i % 2 == 0,
+          include_controller_state=include_controller_state,
           agent_names=env_agent_names,
           env_ids=env_chunk_ids,
           scheduler=scheduler,
