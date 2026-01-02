@@ -230,8 +230,11 @@ class Dolphin:
         if isinstance(player, AI):
           player.shuffle_character()
           new_characters.append(player.character)
-      
-      print(f"shuffled characters for next game: {new_characters} port: {self.console.slippi_port}")
+      logging.debug(
+          "Shuffled characters for next game on port %s: %s",
+          self.console.slippi_port,
+          new_characters,
+      )
 
     self._prev_menu_state = is_menu_state(gamestate)
 
