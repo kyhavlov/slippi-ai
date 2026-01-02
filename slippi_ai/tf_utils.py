@@ -315,14 +315,21 @@ def packed_compile(
   that TF has to handle. This is particularly noticeable when passing large
   nested structures with many small arrays.
   """
-  pack_args, unpack_args = packing_fns(signature)
+  plan = packing_plan(signature)
+
+  # Preallocate packed buffers once per wrapper to avoid per-call np.concatenate
+  # overhead. This is safe as long as the wrapper is not called concurrently.
+  packed_buffers: list[np.ndarray] = [
+      np.empty((plan.packed_sizes[dtype],), dtype=dtype) for dtype in plan.dtypes
+  ]
+  skipped: list = []
 
   @tf.function(**compile_kwargs)
   def packed_fn(packed, skipped):
-    return fn(*unpack_args(packed, skipped))
+    return fn(*plan.unpack(packed, skipped))
 
   def wrapped(*args):
-    packed, skipped = pack_args(*args)
-    return packed_fn(packed, skipped)
+    plan.pack_into(packed_buffers, skipped, *args)
+    return packed_fn(packed_buffers, skipped)
 
   return wrapped
