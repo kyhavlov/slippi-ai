@@ -62,6 +62,7 @@ class ActorConfig:
   gpu_inference: bool = True
   use_fake_envs: bool = False
   enable_singles: bool = False
+  fuse_ports_inference: bool = False
 
 @dataclasses.dataclass
 class AgentConfig:
@@ -502,6 +503,7 @@ def run(config: Config):
       async_envs=config.actor.async_envs,
       use_gpu=config.actor.gpu_inference,
       use_fake_envs=config.actor.use_fake_envs,
+      fuse_ports_inference=config.actor.fuse_ports_inference,
       agent_names=env_name_layout,
       scheduler=scheduler_proxy,
       # Rewards are overridden in the learner.

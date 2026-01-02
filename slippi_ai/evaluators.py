@@ -66,8 +66,20 @@ class RolloutWorker:
       use_ray_envs: bool = False,
       agent_names: list[tuple[str, str]] = [],
       scheduler = None,
+      fuse_ports_inference: bool = False,
   ):
     print("use_gpu = ", use_gpu)
+    self._ports = tuple(sorted(agent_kwargs))
+    self._num_envs = num_envs
+    if fuse_ports_inference and len(self._ports) > 1:
+      self._init_fused_agents(
+          agent_kwargs=agent_kwargs,
+          dolphin_kwargs=dolphin_kwargs,
+          num_envs=num_envs,
+          use_gpu=use_gpu,
+      )
+    else:
+      self._fused_agent = None
     self._agents = {
         port: eval_lib.build_delayed_agent(
             console_delay=dolphin_kwargs['online_delay'],
@@ -76,20 +88,32 @@ class RolloutWorker:
             **kwargs,
         )
         for port, kwargs in agent_kwargs.items()
-    }
+    } if self._fused_agent is None else {}
     self._dolphin_kwargs = dolphin_kwargs.copy()
-    for port, kwargs in agent_kwargs.items():
-      eval_lib.update_character(
-          self._dolphin_kwargs['players'][port],
-          kwargs['state']['config'])
+    if self._fused_agent is None:
+      for port, kwargs in agent_kwargs.items():
+        eval_lib.update_character(
+            self._dolphin_kwargs['players'][port],
+            kwargs['state']['config'])
+    else:
+      # In fused mode, all ports share the same policy/config.
+      any_kwargs = agent_kwargs[self._ports[0]]
+      for port in self._ports:
+        eval_lib.update_character(
+            self._dolphin_kwargs['players'][port],
+            any_kwargs['state']['config'])
 
     self._prev_agent_outputs = collections.deque()
-    self._prev_agent_outputs.append({
-        port: agent.dummy_sample_outputs
-        for port, agent in self._agents.items()
-    })
+    if self._fused_agent is None:
+      self._prev_agent_outputs.append({
+          port: agent.dummy_sample_outputs
+          for port, agent in self._agents.items()
+      })
+    else:
+      self._prev_agent_outputs.append(
+          self._split_outputs(self._fused_agent.dummy_sample_outputs)
+      )
 
-    self._num_envs = num_envs
     self._use_fake_envs = use_fake_envs
     self._env_kwargs = env_kwargs
     self._async_envs = async_envs
@@ -101,14 +125,18 @@ class RolloutWorker:
 
     self._damage_ratio = damage_ratio
 
-    self._agent_profilers = {
-        port: utils.Profiler() for port in self._agents}
+    if self._fused_agent is None:
+      self._agent_profilers = {
+          port: utils.Profiler() for port in self._agents}
+    else:
+      self._agent_profilers = {port: utils.Profiler() for port in self._ports}
     # self._env_push_profiler = cProfile.Profile()
     self._env_push_profiler = utils.Profiler()
 
     # Make sure that the buffer sizes aren't too big.
     # TODO: do this check before env/agent creation
-    for agent in self._agents.values():
+    agents_to_check = self._agents.values() if self._fused_agent is None else [self._fused_agent]
+    for agent in agents_to_check:
       # We get one environment state (the initial one) for free.
       slack = 1 + agent.delay
 
@@ -129,9 +157,84 @@ class RolloutWorker:
     # take a multi_step just as its output queue runs out.
     self.env_runahead = min(
         agent.delay - (agent.batch_steps - 1)
-        for agent in self._agents.values())
+        for agent in (self._agents.values() if self._fused_agent is None else [self._fused_agent])
+    )
     for _ in range(self.env_runahead):
       self._push_actions()
+
+  def _init_fused_agents(
+      self,
+      agent_kwargs: tp.Mapping[Port, dict],
+      dolphin_kwargs: dict,
+      num_envs: int,
+      use_gpu: bool,
+  ):
+    """Build a single DelayedAgent for all ports stacked in batch dimension."""
+    ports = tuple(sorted(agent_kwargs))
+    first = agent_kwargs[ports[0]]
+
+    for port in ports[1:]:
+      other = agent_kwargs[port]
+      if other.get('state') is not first.get('state'):
+        raise ValueError('fuse_ports_inference requires all ports share the same state object.')
+      for key in ('compile', 'jit_compile', 'batch_steps', 'async_inference', 'fake'):
+        if other.get(key) != first.get(key):
+          raise ValueError(f'fuse_ports_inference requires identical agent kwarg {key} across ports.')
+
+    if first.get('async_inference'):
+      raise ValueError('fuse_ports_inference is not supported with async_inference yet.')
+
+    # Build the concatenated name list (port-major order).
+    names: list[str] = []
+    for port in ports:
+      port_names = agent_kwargs[port].get('name')
+      if port_names is None:
+        raise ValueError('Expected per-port name list for fused inference.')
+      if len(port_names) != num_envs:
+        raise ValueError(f'Expected name list length {num_envs}, got {len(port_names)} for port {port}.')
+      names.extend(port_names)
+
+    fused_kwargs = dict(first)
+    fused_kwargs['name'] = names
+
+    self._fused_agent = eval_lib.build_delayed_agent(
+        console_delay=dolphin_kwargs['online_delay'],
+        batch_size=num_envs * len(ports),
+        run_on_cpu=not use_gpu,
+        **fused_kwargs,
+    )
+
+  def _split_outputs(self, outputs: SampleOutputs) -> dict[Port, SampleOutputs]:
+    """Split a [P*B] SampleOutputs into a dict of [B] SampleOutputs per port."""
+    if self._fused_agent is None:
+      raise RuntimeError('_split_outputs called without fused agent.')
+    B = self._num_envs
+    per_port: dict[Port, SampleOutputs] = {}
+    for idx, port in enumerate(self._ports):
+      sl = slice(idx * B, (idx + 1) * B)
+      per_port[port] = utils.map_single_structure(lambda x: x[sl], outputs)
+    return per_port
+
+  def _pack_states(self, states: dict[Port, Game]) -> Game:
+    """Pack per-port [B] states into one [P*B] state."""
+    B = self._num_envs
+    del B
+    return utils.map_nt(
+        lambda *xs: np.concatenate(xs, axis=0),
+        *[states[port] for port in self._ports],
+    )
+
+  def _pack_needs_reset(self, needs_reset: np.ndarray) -> np.ndarray:
+    return np.concatenate([needs_reset] * len(self._ports), axis=0)
+
+  def _split_controllers(self, controllers_all) -> dict[Port, tp.Any]:
+    """Split a [P*B] controller structure into per-port [B] controllers."""
+    B = self._num_envs
+    per_port = {}
+    for idx, port in enumerate(self._ports):
+      sl = slice(idx * B, (idx + 1) * B)
+      per_port[port] = utils.map_single_structure(lambda x: x[sl], controllers_all)
+    return per_port
 
   def _build_env(self):
     if self._use_ray_envs:
@@ -139,7 +242,7 @@ class RolloutWorker:
           self._num_envs, self._dolphin_kwargs, **self._env_kwargs)
     elif self._use_fake_envs:
       self._env = env_lib.FakeBatchedEnvironment(
-          self._num_envs, players=list(self._agents))
+          self._num_envs, players=list(self._agents) if self._agents else list(self._ports))
     else:
       if not self._async_envs:
         env_class = env_lib.BatchedEnvironment
@@ -164,49 +267,77 @@ class RolloutWorker:
     # delayed actions from the previous rollout.
     assert len(self._prev_agent_outputs) == 1 + self.env_runahead
     for agent_outputs in list(self._prev_agent_outputs)[1:]:
-      decoded_actions = {
-          port: self._agents[port].embed_controller.decode(output.controller_state)
-          for port, output in agent_outputs.items()
-      }
+      if self._fused_agent is None:
+        decoded_actions = {
+            port: self._agents[port].embed_controller.decode(output.controller_state)
+            for port, output in agent_outputs.items()
+        }
+      else:
+        decoded_actions = {
+            port: self._fused_agent.embed_controller.decode(output.controller_state)
+            for port, output in agent_outputs.items()
+        }
       with self._env_push_profiler:
         self._env.push(decoded_actions)
 
 
   def _push_actions(self):
     """Pop actions from the agents and push them to the environment."""
-    outputs: dict[Port, SampleOutputs] = {}
-    for port, agent in self._agents.items():
-      with self._agent_profilers[port]:
-        outputs[port] = agent.pop()
-    self._prev_agent_outputs.append(outputs)
+    if self._fused_agent is None:
+      outputs: dict[Port, SampleOutputs] = {}
+      for port, agent in self._agents.items():
+        with self._agent_profilers[port]:
+          outputs[port] = agent.pop()
+      self._prev_agent_outputs.append(outputs)
 
-    decoded_actions = {
-        port: self._agents[port].embed_controller.decode(action.controller_state)
-        for port, action in outputs.items()
-    }
+      decoded_actions = {
+          port: self._agents[port].embed_controller.decode(action.controller_state)
+          for port, action in outputs.items()
+      }
+    else:
+      with self._agent_profilers[self._ports[0]]:
+        combined = self._fused_agent.pop()
+      outputs = self._split_outputs(combined)
+      self._prev_agent_outputs.append(outputs)
+
+      decoded_all = self._fused_agent.embed_controller.decode(combined.controller_state)
+      decoded_actions = self._split_controllers(decoded_all)
+
     with self._env_push_profiler:
       self._env.push(decoded_actions)
 
   def rollout(self, num_steps: int) -> tuple[tp.Mapping[Port, Trajectory], Timings]:
     # This ensures that the agent can process all of the states it will be fed.
-    for agent in self._agents.values():
+    agents_to_check = self._agents.values() if self._fused_agent is None else [self._fused_agent]
+    for agent in agents_to_check:
       if num_steps % agent.batch_steps != 0:
         raise ValueError('Agent batch steps must divide rollout length.')
 
     # Buffers for per-frame data.
     gamestates: dict[Port, list[Game]] = {
-        port: [] for port in self._agents
+        port: [] for port in self._ports
     }
     sample_outputs: dict[Port, list[SampleOutputs]] = {
-        port: [] for port in self._agents
+        port: [] for port in self._ports
     }
     is_resetting: list[bool] = []
 
     # Record each agent's initial state at the beginning of the rollout.
-    initial_states = {
-        port: agent.hidden_state
-        for port, agent in self._agents.items()
-    }
+    if self._fused_agent is None:
+      initial_states = {
+          port: agent.hidden_state
+          for port, agent in self._agents.items()
+      }
+    else:
+      B = self._num_envs
+      fused_initial = self._fused_agent.hidden_state
+      initial_states = {
+          port: utils.map_single_structure(
+              lambda x, sl=slice(i * B, (i + 1) * B): x[sl],
+              fused_initial,
+          )
+          for i, port in enumerate(self._ports)
+      }
 
     step_profiler = utils.Profiler()
 
@@ -229,10 +360,15 @@ class RolloutWorker:
       record_state(output, self._prev_agent_outputs.popleft())
 
       # Asynchronously push the gamestates to the agents.
-      for port, agent in self._agents.items():
-        game = output.gamestates[port]
-        # The agent is responsible for calling from_state on the game.
-        agent.push(game, output.needs_reset)
+      if self._fused_agent is None:
+        for port, agent in self._agents.items():
+          game = output.gamestates[port]
+          # The agent is responsible for calling from_state on the game.
+          agent.push(game, output.needs_reset)
+      else:
+        packed_game = self._pack_states(output.gamestates)
+        packed_reset = self._pack_needs_reset(output.needs_reset)
+        self._fused_agent.push(packed_game, packed_reset)
 
       # Feed the actions from the agents into the environment.
       self._push_actions()
@@ -245,29 +381,44 @@ class RolloutWorker:
     assert len(self._prev_agent_outputs) == 1 + self.env_runahead
     remaining_actions = list(self._prev_agent_outputs)[1:]
     delayed_actions: dict[Port, list[SampleOutputs]] = {}
-    for port, agent in self._agents.items():
-      delayed_actions[port] = [actions[port] for actions in remaining_actions]
-      num_left = agent.delay - self.env_runahead
-      delayed_actions[port].extend(agent.peek_n(num_left))
+    if self._fused_agent is None:
+      for port, agent in self._agents.items():
+        delayed_actions[port] = [actions[port] for actions in remaining_actions]
+        num_left = agent.delay - self.env_runahead
+        delayed_actions[port].extend(agent.peek_n(num_left))
 
-      # Note: the above call to peek_n forces the agent to process all
-      # of the `num_steps` states that it's been fed. This ensures that the
-      # agent's hidden state is the correct one on the next rollout.
-      if isinstance(agent, eval_lib.AsyncDelayedAgent):
-        # Assert that the agent has in fact processed all of the states.
-        assert agent._state_queue.empty()
+        # Note: the above call to peek_n forces the agent to process all
+        # of the `num_steps` states that it's been fed. This ensures that the
+        # agent's hidden state is the correct one on the next rollout.
+        if isinstance(agent, eval_lib.AsyncDelayedAgent):
+          # Assert that the agent has in fact processed all of the states.
+          assert agent._state_queue.empty()
+    else:
+      for port in self._ports:
+        delayed_actions[port] = [actions[port] for actions in remaining_actions]
+      num_left = self._fused_agent.delay - self.env_runahead
+      peeked = self._fused_agent.peek_n(num_left)
+      for combined in peeked:
+        split = self._split_outputs(combined)
+        for port in self._ports:
+          delayed_actions[port].append(split[port])
 
     # Now batch everything up into time-major Trajectories.
     trajectories = {}
     is_resetting = np.array(is_resetting)
-    for port, agent in self._agents.items():
+    for i, port in enumerate(self._ports):
+      agent = self._agents[port] if self._fused_agent is None else self._fused_agent
+      name_code = agent.name_code
+      if self._fused_agent is not None:
+        B = self._num_envs
+        name_code = name_code[i * B:(i + 1) * B]
       states=utils.batch_nest_nt(gamestates[port])
       trajectories[port] = Trajectory(
           # TODO: Let the learner call from_state on game
           states=agent._policy.embed_game.from_state(states),
           name=np.full(
               [num_steps + 1, self._num_envs],
-              agent.name_code,
+              name_code,
               dtype=embed.NAME_DTYPE),
           actions=utils.batch_nest_nt(sample_outputs[port]),
           rewards=reward.compute_rewards(states, self._damage_ratio),
@@ -282,11 +433,11 @@ class RolloutWorker:
         'env_pop': step_profiler.mean_time(),
         'env_push': self._env_push_profiler.mean_time(),
         'agent_pop': {
-            port: profiler.mean_time()
+            port: (profiler.mean_time() if profiler.num_calls else 0.0)
             for port, profiler in self._agent_profilers.items()},
         'agent_step': {
-            port: agent.step_profiler.mean_time()
-            for port, agent in self._agents.items()
+            port: (self._agents[port].step_profiler.mean_time() if self._fused_agent is None else self._fused_agent.step_profiler.mean_time())
+            for port in self._ports
         },
     }
 
@@ -302,6 +453,16 @@ class RolloutWorker:
   def update_variables(
       self, updates: tp.Mapping[Port, Params],
   ):
+    if self._fused_agent is not None:
+      # In fused mode, all ports share the same policy instance.
+      if not updates:
+        return
+      any_values = next(iter(updates.values()))
+      policy = self._fused_agent._policy
+      for var, val in zip(policy.variables, any_values):
+        var.assign(val)
+      return
+
     for port, values in updates.items():
       policy = self._agents[port]._policy
       for var, val in zip(policy.variables, values):
@@ -317,12 +478,18 @@ class RolloutWorker:
 
   def start(self):
     # TODO: don't allow starting more than once, or running without starting.
-    for agent in self._agents.values():
-      agent.start()
+    if self._fused_agent is not None:
+      self._fused_agent.start()
+    else:
+      for agent in self._agents.values():
+        agent.start()
 
   def stop(self):
-    for agent in self._agents.values():
-      agent.stop()
+    if self._fused_agent is not None:
+      self._fused_agent.stop()
+    else:
+      for agent in self._agents.values():
+        agent.stop()
     self._env.stop()
 
 class RolloutMetrics(tp.NamedTuple):
