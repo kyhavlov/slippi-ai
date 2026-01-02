@@ -79,12 +79,14 @@ class BasicAgent:
       jit_compile: bool = False,
       run_on_cpu: bool = False,
       multi_step_size: int = 1,
+      assume_game_is_from_state: bool = False,
   ):
     self._policy = policy
     self._embed_controller = policy.controller_embedding
     self._batch_size = batch_size
     self.set_name_code(name_code)
     self._multi_step_size = int(multi_step_size) if multi_step_size else 1
+    self._assume_game_is_from_state = bool(assume_game_is_from_state)
 
     # The controller_head may discretize certain components of the action.
     # Agents only work with the discretized action space; you will need
@@ -225,16 +227,28 @@ class BasicAgent:
       needs_reset: np.ndarray
   ) -> SampleOutputs:
     """Doesn't take into account delay."""
+    if not self._assume_game_is_from_state:
+      game = self._policy.embed_game.from_state(game)
     state_action = embed.StateAction(
-        state=self._policy.embed_game.from_state(game),
+        state=game,
         action=self._prev_controller,
         name=self._name_code,
     )
 
     # Keep hidden state and _prev_controller on device.
     sample_outputs: SampleOutputs
-    sample_outputs, self.hidden_state = self._sample(
-        state_action, self.hidden_state, needs_reset)
+    try:
+      sample_outputs, self.hidden_state = self._sample(
+          state_action, self.hidden_state, needs_reset)
+    except Exception:
+      if not self._assume_game_is_from_state:
+        raise
+      # Inputs weren't in the expected dtype/shape structure; fall back to
+      # embed_game.from_state for compatibility.
+      state_action = state_action._replace(
+          state=self._policy.embed_game.from_state(game))
+      sample_outputs, self.hidden_state = self._sample(
+          state_action, self.hidden_state, needs_reset)
     self._prev_controller = sample_outputs.controller_state
 
     return utils.map_single_structure(lambda t: t.numpy(), sample_outputs)
@@ -243,15 +257,27 @@ class BasicAgent:
       self,
       states: list[tuple[embed.Game, np.ndarray]],
   ) -> list[SampleOutputs]:
-    states = [
-        (self._policy.embed_game.from_state(game), needs_reset)
-        for game, needs_reset in states
-    ]
+    if not self._assume_game_is_from_state:
+      states = [
+          (self._policy.embed_game.from_state(game), needs_reset)
+          for game, needs_reset in states
+      ]
 
     # Keep hidden state and _prev_controller on device.
     sample_outputs: list[SampleOutputs]
-    sample_outputs, self.hidden_state = self._multi_sample(
-        states, self._prev_controller, self.hidden_state)
+    try:
+      sample_outputs, self.hidden_state = self._multi_sample(
+          states, self._prev_controller, self.hidden_state)
+    except Exception:
+      if not self._assume_game_is_from_state:
+        raise
+      # Fall back to embed_game.from_state for compatibility.
+      cast_states = [
+          (self._policy.embed_game.from_state(game), needs_reset)
+          for game, needs_reset in states
+      ]
+      sample_outputs, self.hidden_state = self._multi_sample(
+          cast_states, self._prev_controller, self.hidden_state)
     self._prev_controller = sample_outputs[-1].controller_state
 
     return utils.map_single_structure(lambda t: t.numpy(), sample_outputs)
@@ -510,6 +536,7 @@ class AsyncDelayedAgent:
   def step(self, game: embed.Game, needs_reset: np.ndarray) -> SampleOutputs:
     self.push(game, needs_reset)
     return self._output_delay_queue.get()
+
 
 def load_state(path: Optional[str] = None, tag: Optional[str] = None) -> dict:
   if path:

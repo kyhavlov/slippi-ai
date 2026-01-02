@@ -192,7 +192,82 @@ class ArraySpec:
 PackingSpec = tp.Optional[ArraySpec]
 Signature = tp.Any
 
-def packing_fns(signature: Signature):
+@dataclasses.dataclass(frozen=True)
+class PackingPlan:
+  signature: Signature
+  flat_signature: list[PackingSpec]
+  flat_slices: list[tp.Union[int, tuple[int, int]]]
+  dtypes: list[np.dtype]
+  packed_sizes: dict[np.dtype, int]
+
+  def pack(self, *args):
+    flat_inputs = utils.flatten_up_to(self.signature, args)
+    flattened_args = {dtype: [] for dtype in self.dtypes}
+    skipped = []
+
+    for array, spec in zip(flat_inputs, self.flat_signature):
+      if spec is None:
+        skipped.append(array)
+        continue
+
+      assert isinstance(array, np.ndarray)
+      assert array.dtype == spec.dtype
+      assert array.shape == spec.shape
+      flattened_args[spec.dtype].append(np.reshape(array, [-1]))
+
+    packed = []
+    for dtype in self.dtypes:
+      packed.append(np.concatenate(flattened_args[dtype], axis=0))
+
+    return packed, skipped
+
+  def pack_into(self, packed_args: tp.Sequence[np.ndarray], skipped: list, *args):
+    if len(packed_args) != len(self.dtypes):
+      raise ValueError(f'expected {len(self.dtypes)} packed arrays, got {len(packed_args)}')
+
+    dtype_to_array = {
+        dtype: array
+        for dtype, array in zip(self.dtypes, packed_args)
+    }
+    # Reset skipped list in-place.
+    skipped.clear()
+
+    flat_inputs = utils.flatten_up_to(self.signature, args)
+    for array, spec, slice_or_idx in zip(flat_inputs, self.flat_signature, self.flat_slices):
+      if spec is None:
+        skipped.append(array)
+        continue
+
+      assert isinstance(slice_or_idx, tuple)
+      start, end = slice_or_idx
+      out = dtype_to_array[spec.dtype]
+      out[start:end] = np.reshape(array, [-1])
+
+  def unpack(self, packed_args, skipped):
+    dtype_to_array = {
+        dtype: array
+        for dtype, array in zip(self.dtypes, packed_args)
+    }
+    flat_arrays = []
+    for spec, slice_or_idx in zip(self.flat_signature, self.flat_slices):
+      if spec is None:
+        assert isinstance(slice_or_idx, int)
+        flat_arrays.append(skipped[slice_or_idx])
+        continue
+
+      start, end = slice_or_idx
+      array = dtype_to_array[spec.dtype]
+      subarray = array[start:end]
+      if isinstance(array, tf.Tensor):
+        reshaped = tf.reshape(subarray, spec.shape)
+      else:
+        reshaped = np.reshape(subarray, spec.shape)
+      flat_arrays.append(reshaped)
+
+    return tree.unflatten_as(self.signature, flat_arrays)
+
+
+def packing_plan(signature: Signature) -> PackingPlan:
   flat_signature: list[PackingSpec] = tree.flatten(signature)
 
   flat_slices: list[tp.Union[int, tuple[int, int]]] = []
@@ -213,51 +288,18 @@ def packing_fns(signature: Signature):
 
   dtypes = list(packed_sizes.keys())
 
-  def pack_args(*args):
-    flattened_args = {dtype: [] for dtype in dtypes}
-    skipped = []
+  return PackingPlan(
+      signature=signature,
+      flat_signature=flat_signature,
+      flat_slices=flat_slices,
+      dtypes=dtypes,
+      packed_sizes=dict(packed_sizes),
+  )
 
-    flat_inputs = utils.flatten_up_to(signature, args)
-    for array, spec in zip(flat_inputs, flat_signature):
-      if spec is None:
-        skipped.append(array)
-        continue
 
-      assert isinstance(array, np.ndarray)
-      assert array.dtype == spec.dtype
-      assert array.shape == spec.shape
-      flattened_args[spec.dtype].append(np.reshape(array, [-1]))
-
-    packed = []
-    for dtype in dtypes:
-      packed.append(np.concatenate(flattened_args[dtype], axis=0))
-
-    return packed, skipped
-
-  def unpack_args(packed_args, skipped):
-    dtype_to_array = {
-        dtype: array
-        for dtype, array in zip(dtypes, packed_args)
-    }
-    flat_arrays = []
-    for spec, slice_or_idx in zip(flat_signature, flat_slices):
-      if spec is None:
-        assert isinstance(slice_or_idx, int)
-        flat_arrays.append(skipped[slice_or_idx])
-        continue
-
-      start, end = slice_or_idx
-      array = dtype_to_array[spec.dtype]
-      subarray = array[start:end]
-      if isinstance(array, tf.Tensor):
-        reshaped = tf.reshape(subarray, spec.shape)
-      else:
-        reshaped = np.reshape(subarray, spec.shape)
-      flat_arrays.append(reshaped)
-
-    return tree.unflatten_as(signature, flat_arrays)
-
-  return pack_args, unpack_args
+def packing_fns(signature: Signature):
+  plan = packing_plan(signature)
+  return plan.pack, plan.unpack
 
 
 P = tp.ParamSpec('P')
