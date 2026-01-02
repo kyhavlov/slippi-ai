@@ -23,6 +23,7 @@ from slippi_ai import data
 from slippi_db.parse_libmelee import get_game
 from slippi_ai import match_reporting
 from slippi_ai.rl.character_scheduler import AssignmentStatus, Assignment
+from slippi_ai.shm_numpy import ShmArraySpec, ShmNumpyBuffer
 import signal
 
 Port = int
@@ -610,6 +611,153 @@ def _run_env(
 class EnvError(Exception):
   pass
 
+def _is_namedtuple(x: tp.Any) -> bool:
+  return isinstance(x, tuple) and hasattr(x, "_fields")
+
+def _flatten_like(template: tp.Any, value: tp.Any, out: list) -> None:
+  """Flatten `value` in a deterministic order guided by `template`."""
+  if isinstance(template, collections.abc.Mapping):
+    # Deterministic ordering for mappings (e.g. gamestates dict by port).
+    for k in sorted(template.keys()):
+      _flatten_like(template[k], value[k], out)
+    return
+  if _is_namedtuple(template):
+    for field in template._fields:
+      _flatten_like(getattr(template, field), getattr(value, field), out)
+    return
+  if isinstance(template, (list, tuple)) and not _is_namedtuple(template):
+    for t_child, v_child in zip(template, value):
+      _flatten_like(t_child, v_child, out)
+    return
+
+  out.append(np.asarray(value))
+
+def _flatten_keys(template: tp.Any, prefix: str, out: list[str]) -> None:
+  """Generate stable shm keys matching _flatten_like order."""
+  if isinstance(template, collections.abc.Mapping):
+    for k in sorted(template.keys()):
+      _flatten_keys(template[k], f"{prefix}{k}.", out)
+    return
+  if _is_namedtuple(template):
+    for field in template._fields:
+      _flatten_keys(getattr(template, field), f"{prefix}{field}.", out)
+    return
+  if isinstance(template, (list, tuple)) and not _is_namedtuple(template):
+    for i, child in enumerate(template):
+      _flatten_keys(child, f"{prefix}{i}.", out)
+    return
+
+  out.append(prefix[:-1] if prefix.endswith(".") else prefix)
+
+def _unflatten_like(template: tp.Any, it: tp.Iterator[np.ndarray]) -> tp.Any:
+  """Inverse of _flatten_like using `template` as the structure."""
+  if isinstance(template, collections.abc.Mapping):
+    return {k: _unflatten_like(template[k], it) for k in sorted(template.keys())}
+  if _is_namedtuple(template):
+    values = [_unflatten_like(getattr(template, field), it) for field in template._fields]
+    return type(template)(*values)
+  if isinstance(template, list):
+    return [_unflatten_like(child, it) for child in template]
+  if isinstance(template, tuple) and not _is_namedtuple(template):
+    return tuple(_unflatten_like(child, it) for child in template)
+  return next(it)
+
+
+def _run_env_shm(
+    build_env_kwargs: dict,
+    conn: Connection,
+    *,
+    batch_time: bool = False,
+):
+  """Run an env worker that streams outputs via shared memory.
+
+  Protocol:
+  - Send ('BOOTSTRAP', initial_output) once (pickled) so the parent can build
+    the shm layout.
+  - Receive ('SETUP_SHM', shm_name, specs) once.
+  - Thereafter, on each controller input, write outputs to shm and send
+    sequence ids (int or list[int] if batch_time=True).
+  """
+  send = conn.send
+
+  env = None
+  shm: ShmNumpyBuffer | None = None
+  try:
+    env = build_environment(**build_env_kwargs)
+    initial_state = env.current_state()
+    if batch_time:
+      initial_state = [initial_state]
+    send(("BOOTSTRAP", initial_state))
+
+    msg = conn.recv()
+    if msg is None:
+      send(None)
+      return
+    tag, shm_name, specs = msg
+    if tag != "SETUP_SHM":
+      raise EnvError(f"Expected SETUP_SHM, got {tag!r}")
+
+    shm = ShmNumpyBuffer.attach(shm_name, specs)
+    seq_arr = shm.array("_seq")
+    data_arrays = [shm.array(spec.key) for spec in specs if spec.key != "_seq"]
+    depth = int(seq_arr.shape[0])
+
+    # Use the bootstrap output as the template for fast deterministic flattening.
+    template = initial_state[0] if isinstance(initial_state, list) else initial_state
+
+    def write_output(output: EnvOutput, seq: int) -> None:
+      slot = seq % depth
+      seq_arr[slot] = seq
+      flat_vals: list[np.ndarray] = []
+      _flatten_like(template, output, flat_vals)
+      if len(flat_vals) != len(data_arrays):
+        raise EnvError(f"flattened {len(flat_vals)} leaves, expected {len(data_arrays)}")
+      for arr, val in zip(data_arrays, flat_vals):
+        # arr has shape (depth, ...) so arr[slot] matches val.shape.
+        arr[slot][...] = val
+
+    env_step = env.multi_step if batch_time else env.step
+    seq = 0
+
+    while True:
+      controllers = conn.recv()
+      if controllers is None:
+        send(None)
+        return
+
+      outputs = env_step(controllers)
+      if batch_time:
+        assert isinstance(outputs, list)
+        seqs = []
+        for out in outputs:
+          write_output(out, seq)
+          seqs.append(seq)
+          seq += 1
+        send(seqs)
+      else:
+        assert not isinstance(outputs, list)
+        write_output(outputs, seq)
+        send(seq)
+        seq += 1
+
+  except KeyboardInterrupt:
+    return
+  except BrokenPipeError:
+    return
+  except Exception:
+    logging.exception("Exception in _run_env_shm")
+    try:
+      send(EnvError(traceback.format_exc()))
+      send(None)
+    except Exception:
+      pass
+  finally:
+    if shm is not None:
+      shm.close()
+    if env:
+      env.stop()
+
+
 class AsyncEnvMP:
   """An asynchronous environment using multiprocessing."""
 
@@ -770,6 +918,229 @@ class AsyncEnvMP:
         continue
       return state
 
+
+class AsyncEnvShmMP:
+  """Async env worker using shared memory for outputs (minimizes pickling)."""
+
+  def __init__(
+      self,
+      dolphin_kwargs: dict,
+      num_envs: int = 0,
+      slippi_ports: Optional[list[int]] = None,
+      num_retries: int = 2,
+      batch_time: bool = False,
+      agent_names: list[tuple[str, str]] = [],
+      env_ids: Optional[list[int]] = None,
+      scheduler=None,
+      shm_depth: int = 0,
+      **env_kwargs,
+  ):
+    if shm_depth <= 0:
+      raise ValueError("shm_depth must be > 0 for AsyncEnvShmMP")
+
+    context = mp.get_context("forkserver")
+    self._parent_conn, child_conn = context.Pipe()
+    self._recv = self._parent_conn.recv
+
+    builder_kwargs = dict(
+        num_envs=num_envs,
+        dolphin_kwargs=dolphin_kwargs,
+        slippi_ports=slippi_ports,
+        num_retries=num_retries,
+        agent_names=agent_names,
+        env_ids=env_ids,
+        scheduler=scheduler,
+        **env_kwargs,
+    )
+    self._builder_kwargs = builder_kwargs
+    self._batch_time = batch_time
+    self._context = context
+    self._process_base_name = f"_run_env_shm({slippi_ports})"
+    self._restart_count = 0
+    self._shm_depth = int(shm_depth)
+
+    self._process = context.Process(
+        name=self._process_base_name,
+        target=_run_env_shm,
+        args=(builder_kwargs, child_conn),
+        kwargs=dict(batch_time=batch_time),
+    )
+    self._process.start()
+    self._process_name = self._process.name
+
+    # One-time bootstrap to learn the output structure and allocate shm.
+    bootstrap = self._recv()
+    if not isinstance(bootstrap, tuple) or len(bootstrap) != 2 or bootstrap[0] != "BOOTSTRAP":
+      raise EnvError(f"Expected BOOTSTRAP, got {type(bootstrap).__name__}: {bootstrap!r}")
+    initial_state = bootstrap[1]
+    self._initial_reset_state = initial_state
+
+    template = initial_state[0] if isinstance(initial_state, list) else initial_state
+    flat_keys: list[str] = []
+    _flatten_keys(template, "", flat_keys)
+    flat_template_vals: list[np.ndarray] = []
+    _flatten_like(template, template, flat_template_vals)
+    if len(flat_keys) != len(flat_template_vals):
+      raise EnvError(f"key/value mismatch: {len(flat_keys)} keys vs {len(flat_template_vals)} vals")
+
+    depth = int(shm_depth)
+    specs: list[ShmArraySpec] = [ShmArraySpec(key="_seq", dtype=np.dtype("int64"), shape=(depth,))]
+    for key, arr in zip(flat_keys, flat_template_vals):
+      specs.append(ShmArraySpec(key=key, dtype=arr.dtype, shape=(depth,) + tuple(arr.shape)))
+
+    self._shm_specs = specs
+    self._shm = ShmNumpyBuffer.create(self._shm_specs)
+    self._seq_arr = self._shm.array("_seq")
+    self._data_arrays = [self._shm.array(key) for key in flat_keys]
+    self._template = template
+    self._flat_keys = flat_keys
+
+    # Tell the child to attach and start streaming.
+    self._parent_conn.send(("SETUP_SHM", self._shm.name, self._shm_specs))
+
+    # Performance instrumentation
+    self._send_profiler = utils.Profiler()
+    self._recv_profiler = utils.Profiler()
+
+  def stop(self):
+    self.begin_stop()
+    self.ensure_stopped(unlink_shm=True)
+
+  def begin_stop(self):
+    if self._process is not None:
+      try:
+        self._parent_conn.send(None)
+      except BrokenPipeError:
+        pass
+
+  def ensure_stopped(self, *, unlink_shm: bool = True):
+    if self._process is None:
+      return
+
+    while self._process.is_alive():
+      try:
+        if self._parent_conn.poll(1) and self._parent_conn.recv() is None:
+          break
+      except (ConnectionResetError, EOFError):
+        break
+
+    self._process.join()
+    self._process.close()
+    self._process = None
+
+    if unlink_shm and getattr(self, "_shm", None) is not None:
+      self._shm.close()
+      self._shm.unlink()
+      self._shm = None
+      self._seq_arr = None
+      self._data_arrays = None
+
+  def send(self, controllers: tp.Union[Controllers, list[Controllers]]):
+    try:
+      with self._send_profiler:
+        self._parent_conn.send(controllers)
+    except BrokenPipeError:
+      raise EnvError("run_env_shm process died")
+
+  def _read_seq(self):
+    while True:
+      try:
+        with self._recv_profiler:
+          msg = self._recv()
+      except ConnectionResetError:
+        logging.warning("Env chunk %s disconnected; restarting.", self._process.name)
+        self._restart_env()
+        return None
+
+      if isinstance(msg, Exception):
+        logging.warning("Env chunk %s raised %s; restarting.", self._process.name, type(msg).__name__)
+        self._restart_env()
+        return None
+
+      if msg is None:
+        logging.warning("Env chunk %s sent sentinel None; restarting.", self._process.name)
+        self._restart_env()
+        return None
+
+      return msg
+
+  def recv(self) -> EnvOutput:
+    # Serve the bootstrap initial state first (pickled once).
+    if self._initial_reset_state is not None:
+      state = self._initial_reset_state
+      self._initial_reset_state = None
+      if self._batch_time:
+        if isinstance(state, list):
+          return state
+        return [state]
+      if isinstance(state, list):
+        assert len(state) == 1
+        return state[0]
+      return state
+
+    msg = self._read_seq()
+    if msg is None:
+      # Restart path returns the new initial state via _initial_reset_state.
+      return self.recv()
+
+    if self._batch_time:
+      seqs = msg if isinstance(msg, list) else [msg]
+      outputs = []
+      for seq_item in seqs:
+        seq = int(seq_item)
+        slot = seq % int(self._seq_arr.shape[0])
+        if int(self._seq_arr[slot]) != seq:
+          raise EnvError(
+              f"shm slot overwrite detected (slot={slot} seq={seq} got={int(self._seq_arr[slot])})")
+        values = [arr[slot] for arr in self._data_arrays]
+        output = _unflatten_like(self._template, iter(values))
+        assert isinstance(output, EnvOutput)
+        outputs.append(output)
+      return outputs
+
+    if isinstance(msg, list):
+      raise EnvError("AsyncEnvShmMP.recv called in batch_time=False mode but got a batch")
+    seq = int(msg)
+    slot = seq % int(self._seq_arr.shape[0])
+    if int(self._seq_arr[slot]) != seq:
+      raise EnvError(
+          f"shm slot overwrite detected (slot={slot} seq={seq} got={int(self._seq_arr[slot])})")
+    values = [arr[slot] for arr in self._data_arrays]
+    output = _unflatten_like(self._template, iter(values))
+    assert isinstance(output, EnvOutput)
+    return output
+
+  def _consume_initial_state(self) -> EnvOutput:
+    # For compatibility with AsyncEnvMP restart logic.
+    return self.recv()
+
+  def _restart_env(self):
+    process_name = self._process_base_name
+    self.begin_stop()
+    self.ensure_stopped(unlink_shm=False)
+    context = self._context
+    self._parent_conn, child_conn = context.Pipe()
+    self._recv = self._parent_conn.recv
+    self._restart_count += 1
+    restart_suffix = f"#{self._restart_count}" if self._restart_count else ""
+    self._process = context.Process(
+        name=f"{process_name}{restart_suffix}",
+        target=_run_env_shm,
+        args=(self._builder_kwargs, child_conn),
+        kwargs=dict(batch_time=self._batch_time),
+    )
+    self._process.start()
+    self._process_name = self._process.name
+
+    # Consume bootstrap from the new process and reuse existing shm layout.
+    bootstrap = self._recv()
+    if not isinstance(bootstrap, tuple) or len(bootstrap) != 2 or bootstrap[0] != "BOOTSTRAP":
+      raise EnvError(f"Expected BOOTSTRAP after restart, got {bootstrap!r}")
+    self._initial_reset_state = bootstrap[1]
+    if getattr(self, "_shm", None) is None:
+      raise EnvError("shm buffer missing on restart")
+    self._parent_conn.send(("SETUP_SHM", self._shm.name, self._shm_specs))
+
 class AsyncBatchedEnvironmentMP:
   """A set of asynchronous environments with batched input/output."""
 
@@ -783,6 +1154,8 @@ class AsyncBatchedEnvironmentMP:
       swap_ports: bool = True,
       enable_singles: bool = False, # Enable singles mode for half the envs
       include_controller_state: bool = True,
+      use_shared_memory: bool = False,
+      shm_depth: int = 0,
       agent_names: list[tuple[str, str]] = [],
       env_ids: Optional[list[int]] = None,
       scheduler = None,
@@ -804,6 +1177,10 @@ class AsyncBatchedEnvironmentMP:
     env_ids = env_ids or list(range(num_envs))
 
     self._envs: list[AsyncEnvMP] = []
+    if use_shared_memory and shm_depth <= 0:
+      raise ValueError("use_shared_memory=True requires shm_depth > 0")
+
+    env_cls = AsyncEnvShmMP if use_shared_memory else AsyncEnvMP
     slippi_ports = utils.find_open_udp_ports(num_envs + num_envs // 2)
     print("slippi ports: ", slippi_ports)
     print("agent names: ", agent_names)
@@ -815,7 +1192,7 @@ class AsyncBatchedEnvironmentMP:
       env_agent_names = agent_names[i * inner_batch_size:(i + 1) * inner_batch_size]
       env_chunk_ids = env_ids[i * inner_batch_size:(i + 1) * inner_batch_size]
 
-      env = AsyncEnvMP(
+      env = env_cls(
           dolphin_kwargs=dolphin_kwargs,
           num_envs=inner_batch_size,
           batch_time=(num_steps > 0),
@@ -827,6 +1204,7 @@ class AsyncBatchedEnvironmentMP:
           agent_names=env_agent_names,
           env_ids=env_chunk_ids,
           scheduler=scheduler,
+          **({"shm_depth": shm_depth} if use_shared_memory else {}),
       )
       self._envs.append(env)
 

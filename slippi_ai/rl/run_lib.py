@@ -63,6 +63,8 @@ class ActorConfig:
   use_fake_envs: bool = False
   enable_singles: bool = False
   fuse_ports_inference: bool = False
+  env_output_shm: bool = False
+  env_output_shm_depth: int = 0
 
 @dataclasses.dataclass
 class AgentConfig:
@@ -71,6 +73,7 @@ class AgentConfig:
   tag: tp.Optional[str] = None
   compile: bool = True
   jit_compile: bool = False
+  assume_game_is_from_state: bool = False
   name: list[str] = field(lambda: [nametags.DEFAULT_NAME])
   batch_steps: int = 0
   async_inference: bool = False
@@ -90,6 +93,7 @@ class AgentConfig:
     kwargs = dict(
         compile=self.compile,
         jit_compile=self.jit_compile,
+        assume_game_is_from_state=self.assume_game_is_from_state,
         batch_steps=self.batch_steps,
         async_inference=self.async_inference,
     )
@@ -499,6 +503,17 @@ def run(config: Config):
         inner_batch_size=config.actor.inner_batch_size,
         enable_singles=config.actor.enable_singles,
     )
+    if config.actor.env_output_shm:
+      if config.actor.ray_envs:
+        raise ValueError('env_output_shm is not supported with ray_envs=True')
+      depth = int(config.actor.env_output_shm_depth)
+      if depth <= 0:
+        # Default large enough to avoid shm ring wrap within a rollout.
+        depth = int(config.actor.rollout_length) + 2
+      env_kwargs.update(
+          use_shared_memory=True,
+          shm_depth=depth,
+      )
 
   build_actor = lambda: evaluators.RolloutWorker(
       agent_kwargs=agent_kwargs,

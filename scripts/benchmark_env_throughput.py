@@ -26,6 +26,8 @@ flags.DEFINE_boolean('infinite_time', True, 'Infinite time / no stocks.')
 flags.DEFINE_integer('console_timeout', 30, 'Seconds before console timeout.')
 flags.DEFINE_integer('log_level', 0, 'Dolphin log level (0 to disable).')
 flags.DEFINE_boolean('include_controller_state', True, 'Include controller state in observations.')
+flags.DEFINE_boolean('use_shm_outputs', False, 'Use shared memory for env outputs (AsyncBatchedEnvironmentMP).')
+flags.DEFINE_integer('shm_depth', 0, 'Shared-memory ring depth (0 uses a conservative default).')
 
 
 def _neutral_controllers(batch_size: int):
@@ -83,6 +85,8 @@ def main(_):
       scheduler=None,
       enable_singles=False,
       include_controller_state=bool(FLAGS.include_controller_state),
+      use_shared_memory=bool(FLAGS.use_shm_outputs),
+      shm_depth=(int(FLAGS.shm_depth) if int(FLAGS.shm_depth) > 0 else 64),
   )
 
   controllers = _neutral_controllers(num_envs)
