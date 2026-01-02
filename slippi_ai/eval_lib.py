@@ -41,7 +41,9 @@ class FakeAgent:
       self,
       policy: policies.Policy,
       batch_size: int,
+      multi_step_size: int = 1,
   ):
+    del multi_step_size
     self._sample_outputs = dummy_sample_outputs(
         policy.controller_embedding, [batch_size])
     self.hidden_state = policy.initial_state(batch_size)
@@ -76,11 +78,13 @@ class BasicAgent:
       compile: bool = True,
       jit_compile: bool = False,
       run_on_cpu: bool = False,
+      multi_step_size: int = 1,
   ):
     self._policy = policy
     self._embed_controller = policy.controller_embedding
     self._batch_size = batch_size
     self.set_name_code(name_code)
+    self._multi_step_size = int(multi_step_size) if multi_step_size else 1
 
     # The controller_head may discretize certain components of the action.
     # Agents only work with the discretized action space; you will need
@@ -132,7 +136,18 @@ class BasicAgent:
 
     if compile:
       compile_fn = tf.function(jit_compile=jit_compile, autograph=False)
-      multi_sample = compile_fn(multi_sample)
+      if self._multi_step_size > 1:
+        # Pack multi-step inputs to avoid converting thousands of small numpy
+        # arrays into tf.Tensors at the Python boundary (especially painful
+        # when items are enabled).
+        multi_sample = tf_utils.packed_compile(
+            multi_sample,
+            self.multi_sample_signature(self._multi_step_size),
+            jit_compile=jit_compile,
+            autograph=False,
+        )
+      else:
+        multi_sample = compile_fn(multi_sample)
 
       # Packing significantly speeds up single-step inference, particularly
       # when items are enabled (lots of small input arrays).
@@ -170,6 +185,26 @@ class BasicAgent:
     )
 
     return (dummy_state_action, prev_state, needs_reset)
+
+  def multi_sample_signature(self, num_steps: int) -> tf_utils.Signature:
+    dummy_game = self._policy.embed_game.dummy([self._batch_size])
+    dummy_game = utils.map_nt(
+        lambda x: tf_utils.ArraySpec(
+            shape=x.shape,
+            dtype=x.dtype,
+        ),
+        dummy_game,
+    )
+    needs_reset = tf_utils.ArraySpec(
+        shape=(self._batch_size,),
+        dtype=np.dtype('bool'),
+    )
+    states = [(dummy_game, needs_reset)] * int(num_steps)
+
+    # Don't pack prev_action / initial_state as they are already Tensors.
+    prev_action = None
+    initial_state = None
+    return (states, prev_action, initial_state)
 
   def set_name_code(self, name_code: tp.Union[int, tp.Sequence[int]]):
     if isinstance(name_code, int):
@@ -262,6 +297,7 @@ class DelayedAgent:
     self._agent = build_basic_agent(
         policy=policy,
         batch_size=batch_size,
+        multi_step_size=self.batch_steps,
         **agent_kwargs)
     self.warmup = self._agent.warmup
     self._policy = policy
@@ -352,6 +388,7 @@ def _run_agent_mp(
   agent = build_basic_agent(
       policy=policy,
       batch_size=batch_size,
+      multi_step_size=(batch_steps or 1),
       **agent_kwargs
   )
 
