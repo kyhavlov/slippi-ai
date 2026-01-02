@@ -96,6 +96,13 @@ class BasicAgent:
       return policy.sample(
           state_action, prev_state, needs_reset, **sample_kwargs)
 
+    # IMPORTANT: multi_sample runs inside a tf.function, so its inputs are
+    # tf.Tensors. tf_utils.packed_compile expects numpy arrays on the Python
+    # side, so we must call an *unpacked* sample implementation from within
+    # multi_sample. (A fuller optimization would pack multi_sample's *own*
+    # inputs at the outer boundary; see note below.)
+    sample_tf = sample
+
     def multi_sample(
         states: list[tuple[embed.Game, tf.Tensor]],  # time-indexed
         prev_action: embed.Action,  # only for first step
@@ -109,7 +116,7 @@ class BasicAgent:
             action=prev_action,
             name=self._name_code,
         )
-        next_action, hidden_state = sample(
+        next_action, hidden_state = sample_tf(
             state_action, hidden_state, needs_reset)
         actions.append(next_action)
         prev_action = next_action.controller_state
@@ -120,17 +127,49 @@ class BasicAgent:
       if jit_compile and tf.config.list_physical_devices('GPU'):
         raise UserWarning("jit compilation may ignore run_on_cpu")
       sample = tf_utils.run_on_cpu(sample)
+      sample_tf = sample
       multi_sample = tf_utils.run_on_cpu(multi_sample)
 
     if compile:
       compile_fn = tf.function(jit_compile=jit_compile, autograph=False)
-      sample = compile_fn(sample)
       multi_sample = compile_fn(multi_sample)
+
+      # Packing significantly speeds up single-step inference, particularly
+      # when items are enabled (lots of small input arrays).
+      sample = tf_utils.packed_compile(
+          sample,
+          self.sample_signature(),
+          jit_compile=jit_compile,
+          autograph=False,
+      )
+      # Note: we intentionally do NOT pack multi_sample yet. A full fix would
+      # pack the *multi_sample inputs* (including the time-indexed states list)
+      # and pass name_code as an explicit input to avoid baking it into the
+      # traced graph.
 
     self._sample = sample
     self._multi_sample = multi_sample
 
     self.hidden_state = self._policy.initial_state(batch_size)
+
+  def sample_signature(self) -> tf_utils.Signature:
+    dummy_state_action = self._policy.embed_state_action.dummy([self._batch_size])
+    dummy_state_action = utils.map_nt(
+        lambda x: tf_utils.ArraySpec(
+            shape=x.shape,
+            dtype=x.dtype,
+        ), dummy_state_action)
+
+    # Don't pack action and prev_state as they are already Tensors.
+    dummy_state_action = dummy_state_action._replace(action=None)
+    prev_state = None
+
+    needs_reset = tf_utils.ArraySpec(
+        shape=(self._batch_size,),
+        dtype=np.dtype('bool'),
+    )
+
+    return (dummy_state_action, prev_state, needs_reset)
 
   def set_name_code(self, name_code: tp.Union[int, tp.Sequence[int]]):
     if isinstance(name_code, int):
