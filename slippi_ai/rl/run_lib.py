@@ -506,10 +506,12 @@ def run(config: Config):
     if config.actor.env_output_shm:
       if config.actor.ray_envs:
         raise ValueError('env_output_shm is not supported with ray_envs=True')
-      depth = int(config.actor.env_output_shm_depth)
-      if depth <= 0:
-        # Default large enough to avoid shm ring wrap within a rollout.
-        depth = int(config.actor.rollout_length) + 2
+      min_depth = int(config.actor.rollout_length) + 2
+      depth = int(config.actor.env_output_shm_depth) or min_depth
+      if depth < min_depth:
+        raise ValueError(
+            f'env_output_shm_depth={depth} is too small; '
+            f'must be >= rollout_length+2 ({min_depth}) to avoid shm ring wrap during rollouts')
       env_kwargs.update(
           use_shared_memory=True,
           shm_depth=depth,
