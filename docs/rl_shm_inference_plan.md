@@ -85,7 +85,8 @@ Follow-up plan:
 
 1. In env subprocesses, generate **already-embedded** `Game` inputs and write
    **packed-by-dtype** vectors into shm (so the TF boundary sees only a few big
-   tensors, even with items).
+   tensors, even with items). Include `name_code` in the packed inputs so it
+   can be randomized per-game/per-env later without retracing the policy.
 2. Use `PackingPlan.pack_into(...)` to fill preallocated shm-backed arrays
    without per-step allocations.
 3. Keep inference+learner in the main process (single GPU), and keep actions on

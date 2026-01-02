@@ -113,6 +113,7 @@ class BasicAgent:
         states: list[tuple[embed.Game, tf.Tensor]],  # time-indexed
         prev_action: embed.Action,  # only for first step
         initial_state: policies.RecurrentState,
+        name_code: tf.Tensor,  # [B]
     ) -> Tuple[list[SampleOutputs], policies.RecurrentState]:
       actions: list[SampleOutputs] = []
       hidden_state = initial_state
@@ -120,7 +121,7 @@ class BasicAgent:
         state_action = embed.StateAction(
             state=game,
             action=prev_action,
-            name=self._name_code,
+            name=name_code,
         )
         next_action, hidden_state = sample_tf(
             state_action, hidden_state, needs_reset)
@@ -159,10 +160,6 @@ class BasicAgent:
           jit_compile=jit_compile,
           autograph=False,
       )
-      # Note: we intentionally do NOT pack multi_sample yet. A full fix would
-      # pack the *multi_sample inputs* (including the time-indexed states list)
-      # and pass name_code as an explicit input to avoid baking it into the
-      # traced graph.
 
     self._sample = sample
     self._multi_sample = multi_sample
@@ -206,7 +203,11 @@ class BasicAgent:
     # Don't pack prev_action / initial_state as they are already Tensors.
     prev_action = None
     initial_state = None
-    return (states, prev_action, initial_state)
+    name_code = tf_utils.ArraySpec(
+        shape=(self._batch_size,),
+        dtype=np.dtype(embed.NAME_DTYPE),
+    )
+    return (states, prev_action, initial_state, name_code)
 
   def set_name_code(self, name_code: tp.Union[int, tp.Sequence[int]]):
     if isinstance(name_code, int):
@@ -267,7 +268,7 @@ class BasicAgent:
     sample_outputs: list[SampleOutputs]
     try:
       sample_outputs, self.hidden_state = self._multi_sample(
-          states, self._prev_controller, self.hidden_state)
+          states, self._prev_controller, self.hidden_state, self._name_code)
     except Exception:
       if not self._assume_game_is_from_state:
         raise
@@ -277,7 +278,7 @@ class BasicAgent:
           for game, needs_reset in states
       ]
       sample_outputs, self.hidden_state = self._multi_sample(
-          cast_states, self._prev_controller, self.hidden_state)
+          cast_states, self._prev_controller, self.hidden_state, self._name_code)
     self._prev_controller = sample_outputs[-1].controller_state
 
     return utils.map_single_structure(lambda t: t.numpy(), sample_outputs)
