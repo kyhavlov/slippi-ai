@@ -43,6 +43,11 @@ SINGLES_PORT_MAPPINGS: Mapping[int, list[int]] = {
     4: (2, 1),
 }
 
+SINGLES_VIEWPOINTS: Mapping[int, tuple[int, int]] = {
+    1: (1, 2),
+    2: (2, 1),
+}
+
 def is_initial_frame(gamestate: GameState) -> bool:
   return gamestate.frame == -123
 
@@ -81,13 +86,14 @@ class Environment:
       scheduler = None,
   ):
     players: dict[Port, dolphin.Player] = dolphin_kwargs['players']
-    if len(players) != 4:
-      raise ValueError('Environment requires exactly 4 players.')
+    if len(players) not in (2, 4):
+      raise ValueError('Environment requires either 2 (singles) or 4 (doubles) players.')
 
     print("Creating environment on", socket.gethostname(), "with slippi_port:", dolphin_kwargs.get('slippi_port'))
     self._agent_names = agent_names
     print("agent_names in base env: ", self._agent_names)
     self._enable_singles = enable_singles
+    self._is_singles = len(players) == 2
     self._include_controller_state = include_controller_state
     self._env_port = dolphin_kwargs.get('slippi_port')
     self._env_id = env_id
@@ -96,6 +102,9 @@ class Environment:
     self._prefetched_assignment: Optional[Assignment] = None
     self._logical_ports = sorted(players.keys())
     self._players = players
+
+    if enable_singles and not self._is_singles:
+      raise ValueError('enable_singles=True requires dolphin_kwargs.players to have exactly 2 ports.')
 
     if self._scheduler is not None:
       if self._env_id is None:
@@ -123,53 +132,36 @@ class Environment:
       self.test_freeze = True
       print("test_freeze: ", self.test_freeze)'''
 
-    if not enable_singles:
-      self._dolphin1_kwargs = dict(dolphin_kwargs, 
-                                  players=actual_players,
-                                  desired_teams={1: 0, 2: 1, 3: 1, 4: 0})
-      self._dolphin = dolphin.Dolphin(**self._dolphin1_kwargs)
-    else:
-      slippi_port2 = dolphin_kwargs.get('slippi_port2')
-      dolphin_kwargs.pop('slippi_port2', None)  # remove slippi_port2 from dolphin_kwargs
-
-      self._dolphin1_kwargs = dict(dolphin_kwargs, players={1: players[1], 2: players[2]})
-      self._dolphin = dolphin.Dolphin(**self._dolphin1_kwargs)
-      dolphin_kwargs.update(slippi_port=slippi_port2)
-      self._dolphin2_kwargs = dict(dolphin_kwargs, players={1: players[3], 2: players[4]})
-      self._dolphin2 = dolphin.Dolphin(**self._dolphin2_kwargs)
+    dolphin_args = dict(dolphin_kwargs, players=actual_players)
+    if not self._is_singles:
+      dolphin_args['desired_teams'] = {1: 0, 2: 1, 3: 1, 4: 0}
+    dolphin_args.pop('slippi_port2', None)
+    self._dolphin_kwargs = dolphin_args
+    self._dolphin = dolphin.Dolphin(**self._dolphin_kwargs)
 
     self._dead_frame = {port: 0 for port in ports}
 
     self._prev_state: Optional[GameState] = None
-    self._prev_state2: Optional[GameState] = None
 
     self._ensure_assignment()
 
   def stop(self):
     self.abort_active_assignment(request_next=False)
     self._dolphin.stop()
-    if self._enable_singles:
-      self._dolphin2.stop()
 
   def start(self):
-    self._dolphin = dolphin.Dolphin(**self._dolphin1_kwargs)
-    if self._enable_singles:
-      self._dolphin2 = dolphin.Dolphin(**self._dolphin2_kwargs)
+    self._dolphin = dolphin.Dolphin(**self._dolphin_kwargs)
 
   def current_state(self) -> EnvOutput:
     if self._prev_state is None:
       self._prev_state = self._dolphin.step()
 
-    if self._prev_state2 is None and self._enable_singles:
-      self._prev_state2 = self._dolphin2.step()
-
-    needs_reset = is_initial_frame(self._prev_state) or \
-        (self._enable_singles and is_initial_frame(self._prev_state2))
+    needs_reset = is_initial_frame(self._prev_state)
 
     games = {}
     
     # return one game per port in DOUBLES_PORT_MAPPINGS
-    if not self._enable_singles:
+    if not self._is_singles:
       for port, ports in DOUBLES_PORT_MAPPINGS.items():
         games[port] = get_game(
             self._prev_state,
@@ -177,13 +169,10 @@ class Environment:
             include_controller_state=self._include_controller_state,
         )
     else:
-      for port, ports in SINGLES_PORT_MAPPINGS.items():
-        actual_port = self.port_to_actual[port]
-        singles_opponent_port = 2 if port < 3 else 3
+      for port, ports in SINGLES_VIEWPOINTS.items():
         games[port] = get_game(
-            self._prev_state if actual_port <= 2 else self._prev_state2,
+            self._prev_state,
             ports,
-            singles_opponent_port,
             include_controller_state=self._include_controller_state,
         )
 
@@ -211,34 +200,30 @@ class Environment:
           if isinstance(player, dolphin.ScheduledAI) and getattr(player, '_next_character', None) is None:
             player.set_next_character(self._active_assignment.characters[idx])
 
-    if not self._enable_singles:
+    if not self._is_singles:
       for port, controller in controllers.items():
         actual_port = self.port_to_actual[port]
         send_controller(self._dolphin.controllers[actual_port], controller)
     else:
       for port, controller in controllers.items():
         actual_port = self.port_to_actual[port]
-        if actual_port <= 2:
-          send_controller(self._dolphin.controllers[actual_port], controller)
-        else:
-          send_controller(self._dolphin2.controllers[actual_port-2], controller)
+        send_controller(self._dolphin.controllers[actual_port], controller)
 
     game_was_over = False if self._prev_state is None else match_reporting.match_is_over(self._prev_state)
 
     # TODO: compute reward?
     self._prev_state = self._dolphin.step()
-    if self._enable_singles:
-      self._prev_state2 = self._dolphin2.step()
 
     if self._prev_state.frame == 1:
       self._current_characters = [player.character for player in self._prev_state.players.values()]
       
     if not game_was_over and match_reporting.match_is_over(self._prev_state):
       self._finalize_assignment(AssignmentStatus.COMPLETE)
-      match_reporting.submit_match(self._prev_state, self._agent_names, self._current_characters)
+      if not self._is_singles:
+        match_reporting.submit_match(self._prev_state, self._agent_names, self._current_characters)
 
     # stock stealing hack
-    if not self._enable_singles:
+    if not self._is_singles:
       for port, controller in controllers.items():
         player_port = port
         teammate_port = DOUBLES_PORT_MAPPINGS[port][1]
@@ -451,8 +436,6 @@ class BatchedEnvironment:
       if base_players:
         dolphin_kwargs_i['players'] = _clone_players(base_players)
       dolphin_kwargs_i.update(slippi_port=slippi_ports[i])
-      if enable_singles:
-        dolphin_kwargs_i.update(slippi_port2=slippi_ports[i*2 + 1])
       env = SafeEnvironment(
           dolphin_kwargs_i,
           num_retries=num_retries,
@@ -1181,7 +1164,7 @@ class AsyncBatchedEnvironmentMP:
       raise ValueError("use_shared_memory=True requires shm_depth > 0")
 
     env_cls = AsyncEnvShmMP if use_shared_memory else AsyncEnvMP
-    slippi_ports = utils.find_open_udp_ports(num_envs + num_envs // 2)
+    slippi_ports = utils.find_open_udp_ports(num_envs)
     print("slippi ports: ", slippi_ports)
     print("agent names: ", agent_names)
 
@@ -1199,7 +1182,7 @@ class AsyncBatchedEnvironmentMP:
           slippi_ports=env_ports,
           num_retries=num_retries,
           swap_ports=swap_ports,
-          enable_singles=enable_singles and i % 2 == 0,
+          enable_singles=enable_singles,
           include_controller_state=include_controller_state,
           agent_names=env_agent_names,
           env_ids=env_chunk_ids,
@@ -1383,6 +1366,7 @@ class FakeBatchedEnvironment:
     game = utils.map_nt(
         lambda t: np.full([num_envs], 0, dtype=t), reified_game)
     game.stage[:] = Stage.FINAL_DESTINATION.value  # make the stage valid
+    game.is_teams[:] = bool(len(players) == 4)
     self._dummy_output = EnvOutput(
         gamestates={p: game for p in players},
         needs_reset=np.full([num_envs], False),

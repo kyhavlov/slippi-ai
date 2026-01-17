@@ -61,6 +61,8 @@ class ActorConfig:
   inner_batch_size: int = 1
   gpu_inference: bool = True
   use_fake_envs: bool = False
+  singles_fraction: float = 0.0
+  # Deprecated: historically enabled singles on half of envs.
   enable_singles: bool = False
   fuse_ports_inference: bool = False
   env_output_shm: bool = False
@@ -213,6 +215,7 @@ class LearnerManager:
       learner: learner_lib.Learner,
       config: Config,
       build_actor: tp.Callable[[], evaluators.RolloutWorker],
+      effective_batch_size: int,
       port: int = 1,
       enemy_port: int = 2,
   ):
@@ -225,10 +228,9 @@ class LearnerManager:
     self._num_ppo_batches = config.learner.ppo.num_batches
     self._burnin_steps_after_reset = config.runtime.burnin_steps_after_reset
 
-    batch_size = config.actor.num_envs
-    if config.opponent.should_train():
-      batch_size *= 4
-    self._hidden_state = learner.initial_state(batch_size)
+    if effective_batch_size <= 0:
+      raise ValueError('effective_batch_size must be > 0.')
+    self._hidden_state = learner.initial_state(effective_batch_size)
 
     self.update_profiler = utils.Profiler(burnin=0)
     self.learner_profiler = utils.Profiler()
@@ -250,13 +252,7 @@ class LearnerManager:
         self.unroll()
 
   def _rollout(self) -> tuple[evaluators.Trajectory, dict]:
-    trajectories, timings = self.actor.rollout(self._unroll_length)
-
-    ports = [1, 2, 3, 4]
-    trajectories = [trajectories[p] for p in ports]
-    trajectory = evaluators.Trajectory.batch(trajectories)
-
-    return trajectory, timings
+    return self.actor.rollout(self._unroll_length)
 
   def unroll(self):
     trajectory, _ = self._rollout()
@@ -266,7 +262,7 @@ class LearnerManager:
   def step(self, step: int, ppo_steps: int = None) -> tuple[list[evaluators.Trajectory], dict]:
     with self.update_profiler:
       variables = {}
-      for port in [1, 2, 3, 4]:
+      for port in self.actor.ports:
         variables[port] = self._learner.policy_variables()
       #variables[self._enemy_port] = self._learner.policy_variables()
       self.actor.update_variables(variables)
@@ -287,6 +283,90 @@ class LearnerManager:
           trajectories, self._hidden_state, num_epochs=ppo_steps)
 
     return trajectories, dict(learner=metrics, actor=actor_metrics)
+
+
+class TrajectoryRolloutWorker:
+
+  def __init__(self, worker: evaluators.RolloutWorker, ports: tuple[int, ...], *, label: str):
+    self._worker = worker
+    self._ports = tuple(ports)
+    self._label = str(label)
+
+  @property
+  def label(self) -> str:
+    return self._label
+
+  @property
+  def ports(self) -> tuple[int, ...]:
+    return self._ports
+
+  def start(self):
+    return self._worker.start()
+
+  def reset_env(self):
+    return self._worker.reset_env()
+
+  def update_variables(self, updates: tp.Mapping[int, tp.Sequence[np.ndarray]]):
+    return self._worker.update_variables(updates)
+
+  def rollout(self, num_steps: int) -> tuple[evaluators.Trajectory, dict]:
+    trajectories, timings = self._worker.rollout(num_steps)
+    stacked = evaluators.Trajectory.batch([trajectories[p] for p in self._ports])
+    return stacked, timings
+
+  def stop(self):
+    return self._worker.stop()
+
+
+class MixedTrajectoryRolloutWorker:
+
+  def __init__(self, workers: tp.Sequence[TrajectoryRolloutWorker]):
+    if not workers:
+      raise ValueError('MixedTrajectoryRolloutWorker requires at least one worker.')
+    self._workers = list(workers)
+    ports: list[int] = []
+    for worker in self._workers:
+      ports.extend(worker.ports)
+    self._ports = tuple(dict.fromkeys(ports))
+
+  @property
+  def ports(self) -> tuple[int, ...]:
+    return self._ports
+
+  def start(self):
+    for worker in self._workers:
+      worker.start()
+
+  def reset_env(self):
+    for worker in self._workers:
+      worker.reset_env()
+
+  def update_variables(self, updates: tp.Mapping[int, tp.Sequence[np.ndarray]]):
+    for worker in self._workers:
+      local_updates = {p: updates[p] for p in worker.ports}
+      worker.update_variables(local_updates)
+
+  def rollout(self, num_steps: int) -> tuple[evaluators.Trajectory, dict]:
+    trajectories: list[evaluators.Trajectory] = []
+    timing_by_mode: dict[str, tp.Any] = {}
+    unexpected_reset_by_mode: dict[str, tp.Any] = {}
+    for worker in self._workers:
+      traj, metrics = worker.rollout(num_steps)
+      trajectories.append(traj)
+      if isinstance(metrics, dict):
+        if 'timing' in metrics:
+          timing_by_mode[worker.label] = metrics['timing']
+        if 'unexpected_reset' in metrics:
+          unexpected_reset_by_mode[worker.label] = metrics['unexpected_reset']
+    combined = evaluators.Trajectory.batch(trajectories)
+    combined_metrics: dict[str, tp.Any] = {'timing': timing_by_mode}
+    if unexpected_reset_by_mode:
+      combined_metrics['unexpected_reset'] = unexpected_reset_by_mode
+    return combined, combined_metrics
+
+  def stop(self):
+    for worker in self._workers:
+      worker.stop()
 
 class Logger:
 
@@ -434,58 +514,13 @@ def run(config: Config):
 
   allowlist = scheduler_lib.parse_name_allowlist(config.agent.name_allowlist)
   normalized_names = scheduler_lib.normalize_name_list(config.agent.name)
-  layout = scheduler_lib.allocate_name_slots(
-      normalized_names,
-      allowlist,
-      config.actor.num_envs,
-      config.agent.name_layout_seed,
-  )
-  slot_specs = scheduler_lib.build_slot_specs(layout, config.actor.num_envs)
-  env_name_layout = [
-      tuple(layout[i * 4:(i + 1) * 4])
-      for i in range(config.actor.num_envs)
-  ]
-  port_name_batches: dict[int, list[str]] = {port: [] for port in range(1, 5)}
-  for names in env_name_layout:
-    for idx, name in enumerate(names):
-      port_name_batches[idx + 1].append(name)
-
-  scheduler_manager = None
-  scheduler_proxy = None
-  if not config.actor.use_fake_envs:
-    scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
-        allowlist=allowlist,
-        slot_specs=slot_specs,
-        rng_seed=config.agent.scheduler_seed,
-        char_weight=config.agent.scheduler_char_weight,
-        matchup_weight=config.agent.scheduler_matchup_weight,
-        team_weight=config.agent.scheduler_team_weight,
-        char_name_weight=config.agent.scheduler_char_name_weight,
-        max_candidates=config.agent.scheduler_max_candidates,
-        max_slot_options=config.agent.scheduler_max_slot_options,
-        max_outstanding_per_env=2,
-    )
-
-  # set ports 1-4 to scheduled AI
-  dolphin_kwargs = dict(
-      players={port: dolphin_lib.ScheduledAI() for port in range(1, 5)},
-      **config.dolphin.to_kwargs(),
-  )
 
   main_agent_kwargs = config.agent.get_kwargs()
   main_agent_kwargs['state'] = rl_state
   #main_agent_kwargs['fake'] = True
-  batch_size = config.actor.num_envs
 
   if config.opponent.type is not OpponentType.SELF:
     raise NotImplementedError('Only self-play is currently supported.')
-
-  agent_kwargs: tp.Mapping[int, dict] = {}
-  for i in range(1, 5):
-    agent_kwargs[i] = dict(
-        name=port_name_batches[i],
-        **main_agent_kwargs.copy(),
-    )
 
   include_controller_state = bool(
       rl_state.get('config', {})
@@ -493,15 +528,14 @@ def run(config: Config):
       .get('player', {})
       .get('with_controller', False)
   )
-  env_kwargs = dict(
+  env_kwargs_base = dict(
       swap_ports=False,
       include_controller_state=include_controller_state,
   )
   if config.actor.async_envs:
-    env_kwargs.update(
+    env_kwargs_base.update(
         num_steps=config.actor.num_env_steps,
         inner_batch_size=config.actor.inner_batch_size,
-        enable_singles=config.actor.enable_singles,
     )
     if config.actor.env_output_shm:
       if config.actor.ray_envs:
@@ -512,24 +546,169 @@ def run(config: Config):
         raise ValueError(
             f'env_output_shm_depth={depth} is too small; '
             f'must be >= rollout_length+2 ({min_depth}) to avoid shm ring wrap during rollouts')
-      env_kwargs.update(
+      env_kwargs_base.update(
           use_shared_memory=True,
           shm_depth=depth,
       )
 
-  build_actor = lambda: evaluators.RolloutWorker(
-      agent_kwargs=agent_kwargs,
-      dolphin_kwargs=dolphin_kwargs,
-      env_kwargs=env_kwargs,
-      num_envs=config.actor.num_envs,
-      use_ray_envs=config.actor.ray_envs,
-      async_envs=config.actor.async_envs,
-      use_gpu=config.actor.gpu_inference,
-      use_fake_envs=config.actor.use_fake_envs,
-      fuse_ports_inference=config.actor.fuse_ports_inference,
-      agent_names=env_name_layout,
-      scheduler=scheduler_proxy,
-      # Rewards are overridden in the learner.
+  singles_fraction = float(config.actor.singles_fraction)
+  if singles_fraction == 0.0 and config.actor.enable_singles:
+    logging.warning('--config.actor.enable_singles is deprecated; using singles_fraction=0.5')
+    singles_fraction = 0.5
+
+  if not (0.0 <= singles_fraction <= 1.0):
+    raise ValueError('--config.actor.singles_fraction must be in [0, 1].')
+
+  num_envs_total = int(config.actor.num_envs)
+  num_envs_singles = int(round(num_envs_total * singles_fraction))
+  num_envs_singles = max(0, min(num_envs_singles, num_envs_total))
+  num_envs_doubles = num_envs_total - num_envs_singles
+
+  if num_envs_total <= 0:
+    raise ValueError('--config.actor.num_envs must be > 0.')
+
+  rollout_workers: list[TrajectoryRolloutWorker] = []
+  scheduler_managers: list[tp.Any] = []
+
+  env_name_layout = []
+
+  if num_envs_doubles:
+    layout = scheduler_lib.allocate_name_slots(
+        normalized_names,
+        allowlist,
+        num_envs_doubles,
+        config.agent.name_layout_seed,
+        slots_per_env=4,
+    )
+    slot_specs = scheduler_lib.build_slot_specs(
+        layout,
+        num_envs_doubles,
+        slots_per_env=4,
+    )
+    env_name_layout_doubles = [
+        tuple(layout[i * 4:(i + 1) * 4])
+        for i in range(num_envs_doubles)
+    ]
+    env_name_layout.extend(env_name_layout_doubles)
+
+    port_name_batches: dict[int, list[str]] = {port: [] for port in range(1, 5)}
+    for names in env_name_layout_doubles:
+      for idx, name in enumerate(names):
+        port_name_batches[idx + 1].append(name)
+
+    scheduler_proxy = None
+    if not config.actor.use_fake_envs:
+      scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
+          allowlist=allowlist,
+          slot_specs=slot_specs,
+          slots_per_env=4,
+          rng_seed=config.agent.scheduler_seed,
+          char_weight=config.agent.scheduler_char_weight,
+          matchup_weight=config.agent.scheduler_matchup_weight,
+          team_weight=config.agent.scheduler_team_weight,
+          char_name_weight=config.agent.scheduler_char_name_weight,
+          max_candidates=config.agent.scheduler_max_candidates,
+          max_slot_options=config.agent.scheduler_max_slot_options,
+          max_outstanding_per_env=2,
+      )
+      scheduler_managers.append(scheduler_manager)
+
+    dolphin_kwargs = dict(
+        players={port: dolphin_lib.ScheduledAI() for port in range(1, 5)},
+        **config.dolphin.to_kwargs(),
+    )
+    agent_kwargs: tp.Mapping[int, dict] = {
+        port: dict(name=port_name_batches[port], **main_agent_kwargs.copy())
+        for port in range(1, 5)
+    }
+    worker = evaluators.RolloutWorker(
+        agent_kwargs=agent_kwargs,
+        dolphin_kwargs=dolphin_kwargs,
+        env_kwargs=env_kwargs_base,
+        num_envs=num_envs_doubles,
+        use_ray_envs=config.actor.ray_envs,
+        async_envs=config.actor.async_envs,
+        use_gpu=config.actor.gpu_inference,
+        use_fake_envs=config.actor.use_fake_envs,
+        fuse_ports_inference=config.actor.fuse_ports_inference,
+        agent_names=env_name_layout_doubles,
+        scheduler=scheduler_proxy,
+    )
+    rollout_workers.append(TrajectoryRolloutWorker(worker, ports=(1, 2, 3, 4), label='doubles'))
+
+  if num_envs_singles:
+    layout = scheduler_lib.allocate_name_slots(
+        normalized_names,
+        allowlist,
+        num_envs_singles,
+        config.agent.name_layout_seed + 1,
+        slots_per_env=2,
+    )
+    slot_specs = scheduler_lib.build_slot_specs(
+        layout,
+        num_envs_singles,
+        slots_per_env=2,
+    )
+    env_name_layout_singles = [
+        tuple(layout[i * 2:(i + 1) * 2])
+        for i in range(num_envs_singles)
+    ]
+    env_name_layout.extend(env_name_layout_singles)
+
+    port_name_batches: dict[int, list[str]] = {port: [] for port in (1, 2)}
+    for names in env_name_layout_singles:
+      for idx, name in enumerate(names):
+        port_name_batches[idx + 1].append(name)
+
+    scheduler_proxy = None
+    if not config.actor.use_fake_envs:
+      scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
+          allowlist=allowlist,
+          slot_specs=slot_specs,
+          slots_per_env=2,
+          rng_seed=config.agent.scheduler_seed + 1,
+          char_weight=config.agent.scheduler_char_weight,
+          matchup_weight=config.agent.scheduler_matchup_weight,
+          team_weight=0.0,
+          char_name_weight=config.agent.scheduler_char_name_weight,
+          max_candidates=config.agent.scheduler_max_candidates,
+          max_slot_options=config.agent.scheduler_max_slot_options,
+          max_outstanding_per_env=2,
+      )
+      scheduler_managers.append(scheduler_manager)
+
+    dolphin_kwargs = dict(
+        players={port: dolphin_lib.ScheduledAI() for port in (1, 2)},
+        **config.dolphin.to_kwargs(),
+    )
+    agent_kwargs: tp.Mapping[int, dict] = {
+        port: dict(name=port_name_batches[port], **main_agent_kwargs.copy())
+        for port in (1, 2)
+    }
+    worker = evaluators.RolloutWorker(
+        agent_kwargs=agent_kwargs,
+        dolphin_kwargs=dolphin_kwargs,
+        env_kwargs=dict(env_kwargs_base, enable_singles=True),
+        num_envs=num_envs_singles,
+        use_ray_envs=config.actor.ray_envs,
+        async_envs=config.actor.async_envs,
+        use_gpu=config.actor.gpu_inference,
+        use_fake_envs=config.actor.use_fake_envs,
+        fuse_ports_inference=config.actor.fuse_ports_inference,
+        agent_names=env_name_layout_singles,
+        scheduler=scheduler_proxy,
+    )
+    rollout_workers.append(TrajectoryRolloutWorker(worker, ports=(1, 2), label='singles'))
+
+  if not rollout_workers:
+    raise ValueError('No rollout workers were constructed; check singles_fraction and num_envs.')
+
+  effective_batch_size = 4 * num_envs_doubles + 2 * num_envs_singles
+
+  build_actor = lambda: (
+      rollout_workers[0]
+      if len(rollout_workers) == 1
+      else MixedTrajectoryRolloutWorker(rollout_workers)
   )
 
   learner_manager = LearnerManager(
@@ -538,6 +717,7 @@ def run(config: Config):
       #port=PORT,
       #enemy_port=ENEMY_PORT,
       build_actor=build_actor,
+      effective_batch_size=effective_batch_size,
   )
 
   step_profiler = utils.Profiler()
@@ -662,7 +842,7 @@ def run(config: Config):
 
     # TODO: we shouldn't take the mean over these timings
     step_time = step_profiler.mean_time()
-    steps_per_rollout = config.actor.num_envs * config.actor.rollout_length * 4
+    steps_per_rollout = effective_batch_size * config.actor.rollout_length
     fps = len(trajectories) * steps_per_rollout / step_time
     mps = fps / (60 * 60)  # in-game minutes per second
 
@@ -675,10 +855,22 @@ def run(config: Config):
         mps=mps,
     )
     actor_timing = metrics['actor'].pop('timing')
-    for key in ['env_pop', 'env_push']:
-      timings[key] = actor_timing[key]
-    for key in ['agent_pop', 'agent_step']:
-      timings[key] = actor_timing[key][PORT]
+    if isinstance(actor_timing, dict) and 'env_pop' in actor_timing:
+      for key in ['env_pop', 'env_push']:
+        timings[key] = actor_timing[key]
+      for key in ['agent_pop', 'agent_step']:
+        timings[key] = actor_timing[key][PORT]
+    else:
+      # Mixed mode: expose per-mode timings and a simple mean over ports.
+      for mode, timing in (actor_timing or {}).items():
+        timings[f'{mode}/env_pop'] = timing.get('env_pop', 0.0)
+        timings[f'{mode}/env_push'] = timing.get('env_push', 0.0)
+        for key in ['agent_pop', 'agent_step']:
+          per_port = timing.get(key, {})
+          if isinstance(per_port, dict) and per_port:
+            timings[f'{mode}/{key}_mean'] = float(np.mean(list(per_port.values())))
+          else:
+            timings[f'{mode}/{key}_mean'] = 0.0
 
     # Stack to shape [T, P, B] where P is the number of trajectories
     states: Game = utils.map_nt(
@@ -687,6 +879,23 @@ def run(config: Config):
 
     #p0_stats = reward.player_stats(states.p0, states.p1, states.stage)
     p0_stats = reward.team_stats([states.p0, states.p1], [states.p2, states.p3], states.stage)
+
+    # Mix diagnostics.
+    mode = np.asarray(states.is_teams[0], dtype=np.float32)  # [P, B]
+    mix = dict(
+        singles_fraction=float(1.0 - mode.mean()),
+        doubles_fraction=float(mode.mean()),
+        effective_batch_size=int(effective_batch_size),
+    )
+
+    rewards = np.stack([t.rewards for t in trajectories], axis=1)  # [T, P, B]
+    mode_t = np.asarray(states.is_teams[1:], dtype=bool)  # [T, P, B]
+    doubles_rewards = rewards[mode_t]
+    singles_rewards = rewards[~mode_t]
+    mix_reward = dict(
+        mean_doubles=float(doubles_rewards.mean()) if doubles_rewards.size else 0.0,
+        mean_singles=float(singles_rewards.mean()) if singles_rewards.size else 0.0,
+    )
 
     '''if config.opponent.type is OpponentType.SELF:
       # The second half of the batch just has the players reversed.
@@ -703,6 +912,8 @@ def run(config: Config):
     metrics.update(
         timings=timings,
         p0=p0_stats,
+        mix=mix,
+        mix_reward=mix_reward,
     )
 
     return metrics
@@ -837,5 +1048,5 @@ def run(config: Config):
 
   finally:
     learner_manager.actor.stop()
-    if scheduler_manager is not None:
-      scheduler_manager.shutdown()
+    for manager in scheduler_managers:
+      manager.shutdown()

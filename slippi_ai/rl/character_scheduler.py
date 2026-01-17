@@ -33,7 +33,7 @@ class AssignmentStatus(enum.Enum):
 class SlotSpec:
   """Identifies a single (env, port, name) slot."""
   env_id: int
-  port_index: int  # 0-3 ordering to match GameState players
+  port_index: int  # 0..slots_per_env-1 ordering to match GameState players
   name: str
 
 
@@ -41,13 +41,15 @@ class SlotSpec:
 class Assignment:
   assignment_id: str
   env_id: int
-  characters: Tuple[Character, Character, Character, Character]
-  names: Tuple[str, str, str, str]
+  characters: Tuple[Character, ...]
+  names: Tuple[str, ...]
 
 
 # In doubles we treat ports 0 & 3 as one team vs ports 1 & 2.
-_TEAM_PORTS: tuple[tuple[int, int], ...] = ((0, 3), (1, 2))
-_TEAMMATE_PORT: dict[int, int] = {a: b for pair in _TEAM_PORTS for a, b in (pair, (pair[1], pair[0]))}
+DEFAULT_TEAM_PORTS: tuple[tuple[int, int], ...] = ((0, 3), (1, 2))
+
+def _build_teammate_map(team_ports: Sequence[tuple[int, int]]) -> dict[int, int]:
+  return {a: b for pair in team_ports for a, b in (pair, (pair[1], pair[0]))}
 
 
 def _normalize_character_key(raw: str) -> Optional[Character]:
@@ -138,6 +140,8 @@ def allocate_name_slots(
     allowlist: Mapping[Character, set[str]],
     num_envs: int,
     layout_seed: int,
+    *,
+    slots_per_env: int = 4,
 ) -> list[str]:
   normalized_to_display: dict[str, str] = {}
   for normalized, display in names:
@@ -150,7 +154,9 @@ def allocate_name_slots(
         'Names referenced by the allowlist are missing from the provided list: '
         + ', '.join(sorted(missing)))
 
-  total_slots = num_envs * 4
+  if slots_per_env <= 0:
+    raise ValueError('slots_per_env must be > 0.')
+  total_slots = num_envs * slots_per_env
   weights: dict[str, float] = {name: 0.0 for name in referenced_names}
   for allowed_names in allowlist.values():
     if not allowed_names:
@@ -158,6 +164,29 @@ def allocate_name_slots(
     share = 1.0 / len(allowed_names)
     for name in allowed_names:
       weights[name] += share
+
+  # If there are more distinct names than slots, select a weighted subset so
+  # small smoke runs (e.g. few envs) can still schedule valid layouts.
+  if len(weights) > total_slots:
+    rng = random.Random(layout_seed)
+    pool = list(weights.keys())
+    pool_weights = [weights[name] for name in pool]
+    chosen: list[str] = []
+    for _ in range(total_slots):
+      total_weight = float(sum(pool_weights))
+      if total_weight <= 0:
+        idx = rng.randrange(len(pool))
+      else:
+        r = rng.random() * total_weight
+        acc = 0.0
+        idx = 0
+        for idx, w in enumerate(pool_weights):
+          acc += float(w)
+          if acc >= r:
+            break
+      chosen.append(pool.pop(idx))
+      pool_weights.pop(idx)
+    weights = {name: weights[name] for name in chosen}
 
   total_weight = sum(weights.values())
   if total_weight == 0:
@@ -212,23 +241,37 @@ def allocate_name_slots(
   return slots
 
 
-def build_slot_specs(layout: Sequence[str], num_envs: int) -> list['SlotSpec']:
-  if len(layout) != num_envs * 4:
-    raise ValueError('Layout length must be exactly num_envs * 4.')
+def build_slot_specs(
+    layout: Sequence[str],
+    num_envs: int,
+    *,
+    slots_per_env: int = 4,
+) -> list['SlotSpec']:
+  if slots_per_env <= 0:
+    raise ValueError('slots_per_env must be > 0.')
+  if len(layout) != num_envs * slots_per_env:
+    raise ValueError('Layout length must be exactly num_envs * slots_per_env.')
   specs: list[SlotSpec] = []
   for idx, name in enumerate(layout):
-    env_id = idx // 4
-    port_index = idx % 4
+    env_id = idx // slots_per_env
+    port_index = idx % slots_per_env
     specs.append(SlotSpec(env_id=env_id, port_index=port_index, name=name))
   return specs
 
 
-def _canonical_matchup(characters: Sequence[Character]) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-  teams = tuple(
-      _canonical_team(characters[a], characters[b])
-      for (a, b) in _TEAM_PORTS
-  )
-  return tuple(sorted(teams))
+def _canonical_matchup(
+    characters: Sequence[Character],
+    team_ports: Sequence[tuple[int, int]],
+) -> Tuple[Tuple[int, ...], ...]:
+  if team_ports:
+    teams = tuple(
+        _canonical_team(characters[a], characters[b])
+        for (a, b) in team_ports
+    )
+    return tuple(sorted(teams))
+
+  values = sorted(char.value for char in characters)
+  return (tuple(values),)
 
 
 def _canonical_team(char_a: Character, char_b: Character) -> Tuple[int, int]:
@@ -258,6 +301,8 @@ class CharacterScheduler:
       allowlist: Mapping[Character, set[str]],
       slot_specs: Sequence[SlotSpec],
       *,
+      slots_per_env: int = 4,
+      team_ports: Sequence[tuple[int, int]] | None = None,
       char_weight: float = 1.0,
       matchup_weight: float = 1.0,
       team_weight: float = 1.0,
@@ -269,6 +314,20 @@ class CharacterScheduler:
   ):
     if not slot_specs:
       raise ValueError('CharacterScheduler requires at least one slot.')
+    if slots_per_env <= 0:
+      raise ValueError('slots_per_env must be > 0.')
+    if team_ports is None:
+      team_ports = DEFAULT_TEAM_PORTS if slots_per_env == 4 else ()
+    team_ports = tuple(tuple(p) for p in team_ports)
+    for a, b in team_ports:
+      if a == b:
+        raise ValueError('team_ports pairs must reference distinct ports.')
+      if a < 0 or b < 0 or a >= slots_per_env or b >= slots_per_env:
+        raise ValueError('team_ports indices must be within slots_per_env.')
+
+    self._slots_per_env = int(slots_per_env)
+    self._team_ports = team_ports
+    self._teammate_port = _build_teammate_map(team_ports)
     self._char_weight = char_weight
     self._matchup_weight = matchup_weight
     self._team_weight = team_weight
@@ -320,12 +379,13 @@ class CharacterScheduler:
         raise ValueError(
             f'Character {char.name} is allowed in the config but no slot uses an allowed name.')
 
-    self._env_slots: Dict[int, Tuple[SlotSpec, SlotSpec, SlotSpec, SlotSpec]] = {}
+    self._env_slots: Dict[int, Tuple[SlotSpec, ...]] = {}
     for env_id in {spec.env_id for spec in slot_specs}:
-      env_slots = [self._slot_specs[(env_id, port)] for port in range(4)]
-      if len(env_slots) != 4:
-        raise ValueError(f'Env {env_id} missing slot definitions; expected 4.')
-      self._env_slots[env_id] = tuple(env_slots)  # type: ignore[arg-type]
+      env_slots = [self._slot_specs[(env_id, port)] for port in range(self._slots_per_env)]
+      if len(env_slots) != self._slots_per_env:
+        raise ValueError(
+            f'Env {env_id} missing slot definitions; expected {self._slots_per_env}.')
+      self._env_slots[env_id] = tuple(env_slots)
 
     self._char_completed: collections.Counter[Character] = collections.Counter()
     self._char_pending: collections.Counter[Character] = collections.Counter()
@@ -494,9 +554,9 @@ class CharacterScheduler:
     slots = self._env_slots[assignment.env_id]
     for char in assignment.characters:
       self._char_pending[char] += 1
-    matchup = _canonical_matchup(assignment.characters)
+    matchup = _canonical_matchup(assignment.characters, self._team_ports)
     self._matchup_pending[matchup] += 1
-    for idx_a, idx_b in _TEAM_PORTS:
+    for idx_a, idx_b in self._team_ports:
       team = _canonical_team(assignment.characters[idx_a], assignment.characters[idx_b])
       self._team_pending[team] += 1
     for char, slot in zip(assignment.characters, slots):
@@ -510,11 +570,11 @@ class CharacterScheduler:
       self._char_pending[char] -= 1
       if self._char_pending[char] <= 0:
         del self._char_pending[char]
-    matchup = _canonical_matchup(assignment.characters)
+    matchup = _canonical_matchup(assignment.characters, self._team_ports)
     self._matchup_pending[matchup] -= 1
     if self._matchup_pending[matchup] <= 0:
       del self._matchup_pending[matchup]
-    for idx_a, idx_b in _TEAM_PORTS:
+    for idx_a, idx_b in self._team_ports:
       team = _canonical_team(assignment.characters[idx_a], assignment.characters[idx_b])
       self._team_pending[team] -= 1
       if self._team_pending[team] <= 0:
@@ -534,12 +594,12 @@ class CharacterScheduler:
       if self._char_pending[char] <= 0:
         del self._char_pending[char]
       self._char_completed[char] += 1
-    matchup = _canonical_matchup(assignment.characters)
+    matchup = _canonical_matchup(assignment.characters, self._team_ports)
     self._matchup_pending[matchup] -= 1
     if self._matchup_pending[matchup] <= 0:
       del self._matchup_pending[matchup]
     self._matchup_completed[matchup] += 1
-    for idx_a, idx_b in _TEAM_PORTS:
+    for idx_a, idx_b in self._team_ports:
       team = _canonical_team(assignment.characters[idx_a], assignment.characters[idx_b])
       self._team_pending[team] -= 1
       if self._team_pending[team] <= 0:
@@ -634,7 +694,7 @@ class CharacterScheduler:
           new_chars = chars + [char]
           new_team_ctr = team_ctr.copy()
           new_score = partial_score + char_diff + name_diff
-          teammate_port = _TEAMMATE_PORT.get(slot.port_index)
+          teammate_port = self._teammate_port.get(slot.port_index)
           if teammate_port is not None and teammate_port < len(new_chars):
             teammate_char = new_chars[teammate_port]
             team_key = _canonical_team(teammate_char, new_chars[slot_index])
@@ -651,7 +711,7 @@ class CharacterScheduler:
       new_beam.sort(key=lambda state: state[4])
       beam = new_beam[:beam_width]
 
-    return [tuple(state[0]) for state in beam if len(state[0]) == 4]
+    return [tuple(state[0]) for state in beam if len(state[0]) == self._slots_per_env]
 
   def _score_combo(self, combo: Tuple[Character, ...], slots: Sequence[SlotSpec], stats: Optional[_ScoringStats] = None) -> float:
     if stats is None:
@@ -665,13 +725,13 @@ class CharacterScheduler:
         projected = existing + i + 1
         score += self._char_weight * (projected - stats.mean_char)
 
-    matchup_key = _canonical_matchup(combo)
+    matchup_key = _canonical_matchup(combo, self._team_ports)
     matchup_existing = stats.matchup_counts.get(matchup_key, 0)
     matchup_variance = stats.matchup_variance or 1.0
     score += self._matchup_weight * ((matchup_existing + 1) - stats.mean_matchup) / math.sqrt(matchup_variance)
 
     team_variance = stats.team_variance or 1.0
-    for idx_a, idx_b in _TEAM_PORTS:
+    for idx_a, idx_b in self._team_ports:
       team = _canonical_team(combo[idx_a], combo[idx_b])
       existing = stats.team_counts.get(team, 0)
       score += self._team_weight * ((existing + 1) - stats.mean_team) / math.sqrt(team_variance)
