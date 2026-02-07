@@ -520,11 +520,16 @@ def train_test_split(
   else:
     raise ValueError("Please provide a metadata file.")
 
+  if len(replays) < 2:
+    raise ValueError(
+        f"Not enough replays to create train/test splits (found {len(replays)}).")
+
   # TODO: stable partition
   rng = random.Random(config.seed)
   rng.shuffle(replays)
-  split_idx = int(len(replays) * config.test_ratio)
-  return replays[split_idx:], replays[:split_idx]
+  num_test = int(len(replays) * config.test_ratio)
+  num_test = max(1, min(num_test, len(replays) - 1))
+  return replays[num_test:], replays[:num_test]
 
 name_to_character = {c.name.lower(): c for c in melee.Character}
 

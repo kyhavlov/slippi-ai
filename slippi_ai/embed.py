@@ -316,7 +316,7 @@ class StructEmbedding(Embedding[NT, NT]):
   #     samples[field] = op.sample(split[field], **kwargs)
   #   return self.builder(samples)
 
-  def dummy(self, shape):
+  def dummy(self, shape: Sequence[int] = ()):
     return self.map(lambda e: e.dummy(shape))
 
   def dummy_embedding(self, shape):
@@ -407,7 +407,7 @@ class MLPWrapper(Embedding[In, Out]):
     embedded = self._embed(inputs)
     return self._mlp(embedded)
 
-  def dummy(self, shape):
+  def dummy(self, shape: Sequence[int] = ()):
     return self._embed.dummy(shape)
 
   def dummy_embedding(self, shape):

@@ -298,6 +298,25 @@ def train(config: Config):
     for key in ['network', 'controller_head']:
       setattr(config, key, restore_config[key])
 
+    restored_value_function = restore_config.get('value_function')
+    if restored_value_function is not None:
+      current_value_function = dataclasses.asdict(config.value_function)
+      if restored_value_function != current_value_function:
+        logging.warning(
+            'Overriding value_function config from checkpoint for restore compatibility.')
+
+      value_function_fields = {field.name for field in dataclasses.fields(ValueFunctionConfig)}
+      restored_value_function = {
+          key: value
+          for key, value in dict(restored_value_function).items()
+          if key in value_function_fields
+      }
+      opponent_pooling = restored_value_function.get('opponent_pooling')
+      if isinstance(opponent_pooling, dict):
+        restored_value_function['opponent_pooling'] = (
+            opponent_pooling_lib.OpponentPoolingConfig(**opponent_pooling))
+      config.value_function = ValueFunctionConfig(**restored_value_function)
+
   policy = saving.policy_from_config(dataclasses.asdict(config))
 
   value_function = None
@@ -500,8 +519,19 @@ def train(config: Config):
 
     # Log losses aggregated by name.
 
-    # Stats have shape [num_eval_steps, unroll_length, batch_size]
-    time_mean = lambda x: np.mean(x, axis=1)
+    # Stats are typically [num_eval_steps, unroll_length, batch_size], but
+    # certain code paths can yield already time-aggregated values.
+    def time_mean(x):
+      x = tf_utils.to_numpy(x)
+      if isinstance(x, np.ndarray):
+        if len(x.shape) == 0:
+          return x.item()
+        if len(x.shape) == 2:
+          return x
+        if len(x.shape) > 2:
+          return np.mean(x, axis=1)
+      return x
+
     loss = time_mean(eval_stats['policy']['loss'])
     assert loss.shape == (runtime.num_eval_steps, config.data.batch_size)
 
