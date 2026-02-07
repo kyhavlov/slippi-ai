@@ -97,6 +97,39 @@ class OpponentPoolingTest(unittest.TestCase):
     np.testing.assert_allclose(y.numpy(), y_swapped.numpy(), atol=1e-6, rtol=1e-6)
     self.assertGreater(len(pool.trainable_variables), 0)
 
+  def test_process_set_invariant_to_swap(self):
+    tf.random.set_seed(0)
+    embed_game = embed.make_game_embedding()
+    embed_state_action = embed.get_state_action_embedding(
+        embed_game=embed_game,
+        embed_action=embed.get_controller_embedding(),
+        num_names=16,
+    )
+    x = tf.random.normal([2, 3, int(embed_state_action.size)])
+
+    p2_slice, p3_slice = _get_p2_p3_slices(embed_game)
+    x_swapped = _swap_p2_p3_flat(
+        x,
+        state_size=int(embed_game.size),
+        p2_slice=p2_slice,
+        p3_slice=p3_slice,
+    )
+
+    pool = opponent_pooling.OpponentPoolingPreprocessor(
+        embed_game=embed_game,
+        config=opponent_pooling.OpponentPoolingConfig(
+            enabled=True,
+            mode="process_set",
+            k=32,
+            include_other=True,
+        ),
+    )
+    y = pool(x)
+    y_swapped = pool(x_swapped)
+
+    np.testing.assert_allclose(y.numpy(), y_swapped.numpy(), atol=1e-6, rtol=1e-6)
+    self.assertGreater(len(pool.trainable_variables), 0)
+
   def test_symmetrized_identity_and_swap_involution(self):
     tf.random.set_seed(0)
     embed_game = embed.make_game_embedding()

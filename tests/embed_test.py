@@ -140,6 +140,13 @@ class GameEmbeddingTest(unittest.TestCase):
 
     self.assertGreater(with_randall.size, default_embedding.size)
 
+  def test_disable_randall_phase_reduces_size(self):
+    default_embedding = embed.make_game_embedding()
+    without_randall_phase = embed.make_game_embedding(with_randall_phase=False)
+
+    self._assert_embeds(without_randall_phase)
+    self.assertLess(without_randall_phase.size, default_embedding.size)
+
   def test_optional_items_increases_size(self):
     default_embedding = embed.make_game_embedding()
     items_embedding = embed.make_game_embedding(
@@ -181,6 +188,8 @@ class ConfigUpgradeTest(unittest.TestCase):
     upgraded = saving.upgrade_config(config)
 
     self.assertEqual(upgraded['version'], saving.VERSION)
+    self.assertIn('with_randall_phase', upgraded['embed'])
+    self.assertTrue(upgraded['embed']['with_randall_phase'])
     self.assertIn('with_randall_xy', upgraded['embed'])
     self.assertFalse(upgraded['embed']['with_randall_xy'])
     self.assertIn('items', upgraded['embed'])

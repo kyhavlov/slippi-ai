@@ -66,6 +66,8 @@ class Learner:
   ):
     policy_initial_states, value_initial_states = initial_states
     del initial_states
+    policy_params = ()
+    value_params = ()
 
     # switch axes to time-major
     tm_frames: Frames = tf.nest.map_structure(
@@ -82,19 +84,26 @@ class Learner:
         policy_grads = tape.gradient(policy_loss, policy_params)
         self.policy_optimizer.apply(policy_grads, policy_params)
 
-    with tf.GradientTape() as tape:
-      # Drop the delayed frames from the value function.
+    has_real_value_network = not isinstance(self.value_function, vf_lib.FakeValueFunction)
+    if train and has_real_value_network:
+      with tf.GradientTape() as tape:
+        # Drop the delayed frames from the value function.
+        delay = self.policy.delay
+        value_frames = tf.nest.map_structure(
+            lambda t: t[:t.shape[0]-delay], tm_frames)
+        value_outputs, value_final_states = self.value_function.loss(
+            value_frames, value_initial_states, self.discount)
+
+        value_params = self.value_function.trainable_variables
+        tf_utils.assert_same_variables(tape.watched_variables(), value_params)
+        value_grads = tape.gradient(value_outputs.loss, value_params)
+        self.value_optimizer.apply(value_grads, value_params)
+    else:
       delay = self.policy.delay
       value_frames = tf.nest.map_structure(
           lambda t: t[:t.shape[0]-delay], tm_frames)
       value_outputs, value_final_states = self.value_function.loss(
           value_frames, value_initial_states, self.discount)
-
-      if train:
-        value_params = self.value_function.trainable_variables
-        tf_utils.assert_same_variables(tape.watched_variables(), value_params)
-        value_grads = tape.gradient(value_outputs.loss, value_params)
-        self.value_optimizer.apply(value_grads, value_params)
 
     if train and self.decay_rate:
       for param in policy_params + value_params:

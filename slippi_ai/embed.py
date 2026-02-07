@@ -584,6 +584,7 @@ _PORTS = (0, 1)
 def make_game_embedding(
     player_config: dict | PlayerConfig | None = None,
     num_players: int = 4,
+    with_randall_phase: bool = True,
     with_randall_xy: bool = False,
     items_config: ItemsConfig = ItemsConfig(),
 ):
@@ -610,11 +611,10 @@ def make_game_embedding(
         ('p2', embed_player),
         ('p3', embed_player),
     ])
-  embedding_fields.extend([
-      ('stage', embed_stage),
-      ('randall_phase', embed_randall_phase),
-      ('is_teams', embed_bool),
-  ])
+  embedding_fields.append(('stage', embed_stage))
+  if with_randall_phase:
+    embedding_fields.append(('randall_phase', embed_randall_phase))
+  embedding_fields.append(('is_teams', embed_bool))
 
   if with_randall_xy:
     embed_xy = FloatEmbedding("randall_xy", scale=xy_scale)
@@ -706,6 +706,7 @@ class EmbedConfig:
   num_players: int = 4
   player: PlayerConfig = utils.field(PlayerConfig)
   controller: ControllerConfig = utils.field(ControllerConfig)
+  with_randall_phase: bool = True
   with_randall_xy: bool = False
   items: ItemsConfig = utils.field(ItemsConfig)
 

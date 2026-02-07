@@ -62,6 +62,7 @@ def upgrade_config(config: dict):
 
   if config['version'] == 3:
     embed_cfg = config['embed']
+    embed_cfg.setdefault('with_randall_phase', True)
     embed_cfg.setdefault('with_randall_xy', False)
     if 'items' not in embed_cfg:
       embed_cfg['items'] = dataclasses.asdict(embed.ItemsConfig())
@@ -87,6 +88,10 @@ def upgrade_config(config: dict):
 
     config['version'] = 5
     logging.warning('Upgraded config version 4 -> 5')
+
+  embed_cfg = config.get('embed')
+  if isinstance(embed_cfg, dict):
+    embed_cfg.setdefault('with_randall_phase', True)
 
   assert config['version'] == VERSION
   return config
@@ -125,6 +130,7 @@ def policy_from_config(config: dict) -> policies.Policy:
       embed_game=embed.make_game_embedding(
           player_config=config['embed']['player'],
           num_players=config['embed'].get('num_players', 4),
+          with_randall_phase=config['embed'].get('with_randall_phase', True),
           with_randall_xy=config['embed'].get('with_randall_xy', False),
           items_config=dataclass_from_dict(
               embed.ItemsConfig, config['embed'].get('items', {}))),
