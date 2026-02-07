@@ -10,6 +10,9 @@ from slippi_ai.flag_utils import dataclass_from_dict
 from slippi_ai.rl_lib import discounted_returns
 from slippi_ai.networks import RecurrentState
 
+def _mean_nest(x, y):
+  return tf.nest.map_structure(lambda a, b: 0.5 * (a + b), x, y)
+
 class ValueOutputs(tp.NamedTuple):
   returns: tf.Tensor  # [T, B]
   advantages: tf.Tensor  # [T, B]
@@ -71,17 +74,38 @@ class ValueFunction(snt.Module):
     """
     rewards = frames.reward
 
-    all_inputs = self._opponent_pooling(self.embed_state_action(frames.state_action))
+    embedded_inputs = self.embed_state_action(frames.state_action)
+    if self._opponent_pooling.is_symmetrized():
+      all_inputs = embedded_inputs
+      swapped_all_inputs = self._opponent_pooling.swap_opponents(embedded_inputs)
+    else:
+      all_inputs = self._opponent_pooling(embedded_inputs)
+      swapped_all_inputs = None
+
     inputs, last_input = all_inputs[:-1], all_inputs[-1]
-    outputs, final_state = self.network.unroll(
+    outputs, branch_final_state = self.network.unroll(
         inputs, frames.is_resetting[:-1], initial_state)
+    swapped_last_input = None
+    swapped_branch_final_state = None
+    final_state = branch_final_state
+    if swapped_all_inputs is not None:
+      swapped_inputs, swapped_last_input = swapped_all_inputs[:-1], swapped_all_inputs[-1]
+      swapped_outputs, swapped_branch_final_state = self.network.unroll(
+          swapped_inputs, frames.is_resetting[:-1], initial_state)
+      outputs = _mean_nest(outputs, swapped_outputs)
+      final_state = _mean_nest(branch_final_state, swapped_branch_final_state)
 
     # Includes "overlap" frame.
     # unroll_length = state_action.state.stage.shape[0] - delay
 
     values = tf.squeeze(self.value_head(outputs), -1)
     last_output, _ = self.network.step_with_reset(
-        last_input, frames.is_resetting[-1], final_state)
+        last_input, frames.is_resetting[-1], branch_final_state)
+    if swapped_last_input is not None:
+      assert swapped_branch_final_state is not None
+      swapped_last_output, _ = self.network.step_with_reset(
+          swapped_last_input, frames.is_resetting[-1], swapped_branch_final_state)
+      last_output = _mean_nest(last_output, swapped_last_output)
     last_value = tf.squeeze(self.value_head(last_output), -1)
     discounts = tf.fill(tf.shape(rewards), tf.cast(discount, tf.float32))
 

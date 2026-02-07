@@ -15,6 +15,8 @@ class OpponentPoolingConfig:
   """
 
   enabled: bool = False
+  mode: str = "summary"
+  # Used by summary mode only.
   k: int = 128
   include_other: bool = True
 
@@ -37,9 +39,14 @@ class OpponentPoolingPreprocessor(snt.Module):
     super().__init__(name=name)
     self._embed_game = embed_game
     self._config = config
+    self._mode = str(config.mode).lower()
+    if self._mode not in ("summary", "symmetrized"):
+      raise ValueError(
+          f"Unsupported opponent pooling mode: {config.mode}. "
+          f"Expected one of ['summary', 'symmetrized'].")
 
     if config.enabled:
-      if config.k <= 0:
+      if self._mode == "summary" and config.k <= 0:
         raise ValueError(f"OpponentPoolingConfig.k must be > 0, got {config.k}")
       self._p0_slice, self._p1_slice, self._p2_slice, self._p3_slice = self._player_slices()
     else:
@@ -48,10 +55,14 @@ class OpponentPoolingPreprocessor(snt.Module):
       self._p2_slice = None
       self._p3_slice = None
 
-    # Shared opponent encoder f.
-    self._opp_enc = snt.nets.MLP([config.k], activate_final=True, name="opp_enc")
-    # Query network g.
-    self._query = snt.nets.MLP([config.k], activate_final=True, name="query")
+    self._opp_enc: snt.nets.MLP | None = None
+    self._query: snt.nets.MLP | None = None
+
+    if self._mode == "summary":
+      # Shared opponent encoder f.
+      self._opp_enc = snt.nets.MLP([config.k], activate_final=True, name="opp_enc")
+      # Query network g.
+      self._query = snt.nets.MLP([config.k], activate_final=True, name="query")
 
   def _player_slices(self) -> tuple[slice, slice, slice, slice]:
     offset = 0
@@ -66,14 +77,43 @@ class OpponentPoolingPreprocessor(snt.Module):
       raise ValueError(f"embed_game is missing fields: {missing}")
     return slices["p0"], slices["p1"], slices["p2"], slices["p3"]
 
+  def is_symmetrized(self) -> bool:
+    return self._config.enabled and self._mode == "symmetrized"
+
+  def swap_opponents(self, inputs: tf.Tensor) -> tf.Tensor:
+    if not self._config.enabled:
+      return inputs
+
+    assert self._p2_slice is not None
+    assert self._p3_slice is not None
+
+    state_size = int(self._embed_game.size)
+    state = inputs[..., :state_size]
+    tail = inputs[..., state_size:]
+
+    between = state[..., self._p2_slice.stop:self._p3_slice.start]
+    swapped_state = tf.concat([
+        state[..., :self._p2_slice.start],
+        state[..., self._p3_slice],
+        between,
+        state[..., self._p2_slice],
+        state[..., self._p3_slice.stop:],
+    ], axis=-1)
+    return tf.concat([swapped_state, tail], axis=-1)
+
   def __call__(self, inputs: tf.Tensor) -> tf.Tensor:
     if not self._config.enabled:
+      return inputs
+    if self._mode == "symmetrized":
       return inputs
 
     assert self._p0_slice is not None
     assert self._p1_slice is not None
     assert self._p2_slice is not None
     assert self._p3_slice is not None
+
+    assert self._opp_enc is not None
+    assert self._query is not None
 
     state_size = int(self._embed_game.size)
     state = inputs[..., :state_size]

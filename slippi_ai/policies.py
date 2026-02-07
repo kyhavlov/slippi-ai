@@ -18,6 +18,9 @@ from slippi_ai.value_function import ValueOutputs
 Outputs = tf_utils.Outputs
 RecurrentState = networks.RecurrentState
 
+def _mean_nest(x, y):
+  return tf.nest.map_structure(lambda a, b: 0.5 * (a + b), x, y)
+
 class UnrollOutputs(tp.NamedTuple):
   log_probs: tf.Tensor  # [T, B]
   distances: DistanceOutputs  # Struct of [T, B]
@@ -92,10 +95,24 @@ class Policy(snt.Module):
     self.imitation_loss(dummy_frames, initial_state)
 
   def _value_outputs(
-      self, outputs, last_input, is_resetting, final_state, rewards, discount):
+      self,
+      outputs,
+      last_input,
+      is_resetting,
+      final_state,
+      rewards,
+      discount,
+      swapped_last_input=None,
+      swapped_final_state=None,
+  ):
     values = tf.squeeze(self.value_head(outputs), -1)
     last_output, _ = self.network.step_with_reset(
         last_input, is_resetting, final_state)
+    if swapped_last_input is not None:
+      assert swapped_final_state is not None
+      swapped_last_output, _ = self.network.step_with_reset(
+          swapped_last_input, is_resetting, swapped_final_state)
+      last_output = 0.5 * (last_output + swapped_last_output)
     last_value = tf.squeeze(self.value_head(last_output), -1)
     discounts = tf.fill(tf.shape(rewards), tf.cast(discount, tf.float32))
     value_targets = discounted_returns(
@@ -140,10 +157,27 @@ class Policy(snt.Module):
       value_cost: Weighting of value function loss.
       discount: Per-frame discount factor for returns.
     """
-    all_inputs = self._opponent_pooling(self.embed_state_action(frames.state_action))
+    embedded_inputs = self.embed_state_action(frames.state_action)
+    if self._opponent_pooling.is_symmetrized():
+      all_inputs = embedded_inputs
+      swapped_all_inputs = self._opponent_pooling.swap_opponents(embedded_inputs)
+    else:
+      all_inputs = self._opponent_pooling(embedded_inputs)
+      swapped_all_inputs = None
+
     inputs, last_input = all_inputs[:-1], all_inputs[-1]
-    outputs, final_state = self.network.unroll(
+    outputs, branch_final_state = self.network.unroll(
         inputs, frames.is_resetting[:-1], initial_state)
+
+    swapped_last_input = None
+    swapped_branch_final_state = None
+    final_state = branch_final_state
+    if swapped_all_inputs is not None:
+      swapped_inputs, swapped_last_input = swapped_all_inputs[:-1], swapped_all_inputs[-1]
+      swapped_outputs, swapped_branch_final_state = self.network.unroll(
+          swapped_inputs, frames.is_resetting[:-1], initial_state)
+      outputs = _mean_nest(outputs, swapped_outputs)
+      final_state = _mean_nest(branch_final_state, swapped_branch_final_state)
 
     # Predict next action.
     action = frames.state_action.action
@@ -164,8 +198,15 @@ class Policy(snt.Module):
     )
 
     value_outputs = self._value_outputs(
-        outputs, last_input, frames.is_resetting[-1], final_state,
-        frames.reward, discount)
+        outputs,
+        last_input,
+        frames.is_resetting[-1],
+        branch_final_state,
+        frames.reward,
+        discount,
+        swapped_last_input=swapped_last_input,
+        swapped_final_state=swapped_branch_final_state,
+    )
     metrics['value'] = value_outputs.metrics
 
     return UnrollOutputs(
@@ -231,10 +272,27 @@ class Policy(snt.Module):
       initial_state: RecurrentState,
       discount: float = 0.99,
   ):
-    all_inputs = self._opponent_pooling(self.embed_state_action(frames.state_action))
+    embedded_inputs = self.embed_state_action(frames.state_action)
+    if self._opponent_pooling.is_symmetrized():
+      all_inputs = embedded_inputs
+      swapped_all_inputs = self._opponent_pooling.swap_opponents(embedded_inputs)
+    else:
+      all_inputs = self._opponent_pooling(embedded_inputs)
+      swapped_all_inputs = None
+
     inputs, last_input = all_inputs[:-1], all_inputs[-1]
-    outputs, final_state = self.network.unroll(
+    outputs, branch_final_state = self.network.unroll(
         inputs, frames.is_resetting[:-1], initial_state)
+
+    swapped_last_input = None
+    swapped_branch_final_state = None
+    final_state = branch_final_state
+    if swapped_all_inputs is not None:
+      swapped_inputs, swapped_last_input = swapped_all_inputs[:-1], swapped_all_inputs[-1]
+      swapped_outputs, swapped_branch_final_state = self.network.unroll(
+          swapped_inputs, frames.is_resetting[:-1], initial_state)
+      outputs = _mean_nest(outputs, swapped_outputs)
+      final_state = _mean_nest(branch_final_state, swapped_branch_final_state)
 
     # Predict next action.
     action = frames.state_action.action
@@ -255,8 +313,15 @@ class Policy(snt.Module):
 
     # We're only really doing this to initialize the value_head...
     value_outputs = self._value_outputs(
-        outputs, last_input, frames.is_resetting[-1], final_state,
-        frames.reward, discount)
+        outputs,
+        last_input,
+        frames.is_resetting[-1],
+        branch_final_state,
+        frames.reward,
+        discount,
+        swapped_last_input=swapped_last_input,
+        swapped_final_state=swapped_branch_final_state,
+    )
     metrics['value'] = value_outputs.metrics
 
     return UnrollWithOutputs(
@@ -274,7 +339,13 @@ class Policy(snt.Module):
       is_resetting: tp.Optional[tf.Tensor] = None,
       **kwargs,
   ) -> tp.Tuple[SampleOutputs, RecurrentState]:
-    input = self._opponent_pooling(self.embed_state_action(state_action))
+    embedded_input = self.embed_state_action(state_action)
+    if self._opponent_pooling.is_symmetrized():
+      input = embedded_input
+      swapped_input = self._opponent_pooling.swap_opponents(embedded_input)
+    else:
+      input = self._opponent_pooling(embedded_input)
+      swapped_input = None
 
     if is_resetting is None:
       batch_size = input.shape[0]
@@ -282,6 +353,11 @@ class Policy(snt.Module):
 
     output, final_state = self.network.step_with_reset(
         input, is_resetting, initial_state)
+    if swapped_input is not None:
+      swapped_output, swapped_final_state = self.network.step_with_reset(
+          swapped_input, is_resetting, initial_state)
+      output = _mean_nest(output, swapped_output)
+      final_state = _mean_nest(final_state, swapped_final_state)
 
     prev_action = state_action.action
     next_action = self.controller_head.sample(
