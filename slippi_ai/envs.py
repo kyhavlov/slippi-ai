@@ -154,7 +154,18 @@ class Environment:
 
   def current_state(self) -> EnvOutput:
     if self._prev_state is None:
-      self._prev_state = self._dolphin.step()
+      # Important: during env (re)startup, Dolphin can fail to produce even the
+      # initial gamestate (e.g. CPU starvation, hung dolphin, bad pipe). If we
+      # block forever here, the parent process will hang waiting for the initial
+      # state from the env worker. Use a watchdog and let SafeEnvironment handle
+      # the reset/retry.
+      timeout_s = int(self._dolphin_kwargs.get('console_timeout') or 10)
+      timeout_s = max(timeout_s, 10)
+      state = timeout(self._dolphin.step, timeout_duration=timeout_s, default=None)
+      if state is None:
+        raise TimeoutError(
+            f'current_state timed out for {timeout_s}s, frame: -200, stage: unknown, characters: []')
+      self._prev_state = state
 
     needs_reset = is_initial_frame(self._prev_state)
 
@@ -828,20 +839,28 @@ class AsyncEnvMP:
     try:
       with self._send_profiler:
         self._parent_conn.send(controllers)
-    except BrokenPipeError:
-      # Attempt to retrieve exception from pipe.
-      while True:
-        if not self._parent_conn.poll(1):
-          break
-
-        output = self._parent_conn.recv()
-        if isinstance(output, Exception):
-          raise output
-        elif output is None:
-          break
-
-      # Fall back to raising a generic error message.
-      raise EnvError("run_env process died")
+      return
+    except (BrokenPipeError, ConnectionResetError, EOFError) as e:
+      # Env chunk died between pop() and push(). Restart to match recv() behavior.
+      logging.warning(
+          'Env chunk %s send failed (%s); restarting.',
+          getattr(self, '_process_name', '<unknown>'),
+          type(e).__name__,
+      )
+      try:
+        # Best-effort: drain any pending exception/sentinel.
+        while self._parent_conn.poll(0):
+          msg = self._parent_conn.recv()
+          if isinstance(msg, Exception):
+            logging.warning('Env chunk %s reported exception before send failure: %r', self._process.name, msg)
+            break
+          if msg is None:
+            break
+      except Exception:
+        pass
+      self._restart_env()
+      # Drop this action; the next pop() will see the reset state.
+      return
 
   def recv(self) -> EnvOutput:
     while True:
@@ -1022,8 +1041,15 @@ class AsyncEnvShmMP:
     try:
       with self._send_profiler:
         self._parent_conn.send(controllers)
-    except BrokenPipeError:
-      raise EnvError("run_env_shm process died")
+      return
+    except (BrokenPipeError, ConnectionResetError, EOFError) as e:
+      logging.warning(
+          'Env chunk %s shm send failed (%s); restarting.',
+          getattr(self, '_process_name', '<unknown>'),
+          type(e).__name__,
+      )
+      self._restart_env()
+      return
 
   def _read_seq(self):
     while True:
@@ -1133,6 +1159,7 @@ class AsyncBatchedEnvironmentMP:
       dolphin_kwargs: dict,
       num_steps: int = 0,
       inner_batch_size: int = 1,
+      slippi_ports: Optional[list[int]] = None,
       num_retries: int = 2,
       swap_ports: bool = True,
       enable_singles: bool = False, # Enable singles mode for half the envs
@@ -1164,7 +1191,10 @@ class AsyncBatchedEnvironmentMP:
       raise ValueError("use_shared_memory=True requires shm_depth > 0")
 
     env_cls = AsyncEnvShmMP if use_shared_memory else AsyncEnvMP
-    slippi_ports = utils.find_open_udp_ports(num_envs)
+    if slippi_ports is None:
+      slippi_ports = utils.find_open_udp_ports(num_envs)
+    if len(slippi_ports) != num_envs:
+      raise ValueError(f"slippi_ports must have length num_envs={num_envs}, got {len(slippi_ports)}")
     print("slippi ports: ", slippi_ports)
     print("agent names: ", agent_names)
 

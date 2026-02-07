@@ -567,6 +567,13 @@ def run(config: Config):
   if num_envs_total <= 0:
     raise ValueError('--config.actor.num_envs must be > 0.')
 
+  doubles_slippi_ports: list[int] | None = None
+  singles_slippi_ports: list[int] | None = None
+  if not config.actor.use_fake_envs and not config.actor.ray_envs:
+    all_ports = utils.find_open_udp_ports(num_envs_total)
+    doubles_slippi_ports = all_ports[:num_envs_doubles]
+    singles_slippi_ports = all_ports[num_envs_doubles:]
+
   rollout_workers: list[TrajectoryRolloutWorker] = []
   scheduler_managers: list[tp.Any] = []
 
@@ -621,10 +628,13 @@ def run(config: Config):
         port: dict(name=port_name_batches[port], **main_agent_kwargs.copy())
         for port in range(1, 5)
     }
+    doubles_env_kwargs = dict(env_kwargs_base)
+    if doubles_slippi_ports is not None:
+      doubles_env_kwargs['slippi_ports'] = doubles_slippi_ports
     worker = evaluators.RolloutWorker(
         agent_kwargs=agent_kwargs,
         dolphin_kwargs=dolphin_kwargs,
-        env_kwargs=env_kwargs_base,
+        env_kwargs=doubles_env_kwargs,
         num_envs=num_envs_doubles,
         use_ray_envs=config.actor.ray_envs,
         async_envs=config.actor.async_envs,
@@ -685,10 +695,13 @@ def run(config: Config):
         port: dict(name=port_name_batches[port], **main_agent_kwargs.copy())
         for port in (1, 2)
     }
+    singles_env_kwargs = dict(env_kwargs_base, enable_singles=True)
+    if singles_slippi_ports is not None:
+      singles_env_kwargs['slippi_ports'] = singles_slippi_ports
     worker = evaluators.RolloutWorker(
         agent_kwargs=agent_kwargs,
         dolphin_kwargs=dolphin_kwargs,
-        env_kwargs=dict(env_kwargs_base, enable_singles=True),
+        env_kwargs=singles_env_kwargs,
         num_envs=num_envs_singles,
         use_ray_envs=config.actor.ray_envs,
         async_envs=config.actor.async_envs,
