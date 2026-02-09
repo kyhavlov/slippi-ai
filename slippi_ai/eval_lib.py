@@ -548,10 +548,20 @@ def load_state(path: Optional[str] = None, tag: Optional[str] = None) -> dict:
     raise ValueError('Must specify one of "tag" or "path".')
 
 def get_name_code(state: dict, name: str) -> int:
-  name_map: dict[str, int] = state['name_map']
-  if name not in name_map:
-    raise ValueError(f'Nametag must be one of {name_map.keys()}.')
-  return name_map[name]
+  name_map: dict[str, int] = state.get('name_map', {})
+  if not name_map:
+    # max_names=0 produces an empty name map and a zero-width name embedding.
+    # Any name code is equivalent; use 0 for compatibility.
+    return 0
+
+  if name in name_map:
+    return name_map[name]
+
+  normalized_name = nametags.normalize_name(name)
+  if normalized_name in name_map:
+    return name_map[normalized_name]
+
+  raise ValueError(f'Nametag must be one of {name_map.keys()}.')
 
 def get_name_from_rl_state(state: dict) -> Optional[list[str]]:
   # For RL, we know the name that was used during training.
@@ -595,10 +605,13 @@ def build_delayed_agent(
       name = rl_name[0]
 
   if name is None:
-    # TODO: just pick from the name_map?
-    raise ValueError('Must specify an agent name.')
-
-  if isinstance(name, str):
+    name_map: dict[str, int] = state.get('name_map', {})
+    if not name_map:
+      name_code = 0
+    else:
+      # TODO: just pick from the name_map?
+      raise ValueError('Must specify an agent name.')
+  elif isinstance(name, str):
     name_code = get_name_code(state, name)
   else:
     name_code = [get_name_code(state, n) for n in name]
@@ -660,9 +673,11 @@ class Agent:
     self.name_map: dict[str, int] = state['name_map']
     rl_names = get_name_from_rl_state(state)
     if rl_names is not None:
-      self.name_codes = [self.name_map[n] for n in rl_names]
+      self.name_codes = [get_name_code(state, n) for n in rl_names]
     else:
       self.name_codes = list(set(self.name_map.values()))
+    if not self.name_codes:
+      self.name_codes = [0]
     self.name_index = 0
 
     self._agent = build_delayed_agent(state, batch_size=1, **agent_kwargs)
