@@ -573,7 +573,9 @@ def get_name_from_rl_state(state: dict) -> Optional[list[str]]:
   else:
     return None
 
-  return [name] if isinstance(name, str) else name
+  names = [name] if isinstance(name, str) else list(name)
+  names = [n for n in names if isinstance(n, str) and n.strip()]
+  return names or None
 
 
 def build_delayed_agent(

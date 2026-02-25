@@ -145,6 +145,10 @@ class Environment:
 
     self._ensure_assignment()
 
+  def _frame_timeout_s(self) -> int:
+    timeout_s = int(self._dolphin_kwargs.get('console_timeout') or 10)
+    return max(timeout_s, 10)
+
   def stop(self):
     self.abort_active_assignment(request_next=False)
     self._dolphin.stop()
@@ -159,8 +163,7 @@ class Environment:
       # block forever here, the parent process will hang waiting for the initial
       # state from the env worker. Use a watchdog and let SafeEnvironment handle
       # the reset/retry.
-      timeout_s = int(self._dolphin_kwargs.get('console_timeout') or 10)
-      timeout_s = max(timeout_s, 10)
+      timeout_s = self._frame_timeout_s()
       state = timeout(self._dolphin.step, timeout_duration=timeout_s, default=None)
       if state is None:
         raise TimeoutError(
@@ -255,7 +258,18 @@ class Environment:
     self,
     controllers: Controllers,
   ) -> EnvOutput:
-    state = timeout(self._step, args=(controllers,), timeout_duration=10, default=None)
+    # After a reset/restart, make sure we have an initial state before trying
+    # to advance the environment with actions.
+    if self._prev_state is None:
+      self.current_state()
+
+    timeout_s = self._frame_timeout_s()
+    state = timeout(
+        self._step,
+        args=(controllers,),
+        timeout_duration=timeout_s,
+        default=None,
+    )
 
     # reset env if step timed out
     if state is None:
@@ -266,7 +280,9 @@ class Environment:
         frame = self._prev_state.frame
         stage = self._prev_state.stage
         characters = [player.character for player in self._prev_state.players.values()]
-      raise TimeoutError("step timed out for 10s, frame: " + str(frame) + ", stage: " + str(stage) + ", characters: " + str(characters))
+      raise TimeoutError(
+          "step timed out for " + str(timeout_s) + "s, frame: " + str(frame)
+          + ", stage: " + str(stage) + ", characters: " + str(characters))
 
     return state
 
@@ -423,7 +439,7 @@ class BatchedEnvironment:
       num_envs: int,
       dolphin_kwargs: dict,
       slippi_ports: Optional[list[int]] = None,
-      num_retries: int = 2,
+      num_retries: int = 4,
       agent_names: list[tuple[str, str]] = [],
       swap_ports: bool = True,  # Swap ports on half of the environments.
       enable_singles: bool = False,  # Enable singles mode for half the envs
@@ -520,7 +536,7 @@ def build_environment(
     num_envs: int,  # zero means unbatched env
     dolphin_kwargs: dict,
     slippi_ports: Optional[list[int]] = None,
-    num_retries: int = 2,
+    num_retries: int = 4,
     agent_names: list[tuple[str, str]] = [],
     env_ids: Optional[list[int]] = None,
     scheduler = None,
@@ -760,7 +776,7 @@ class AsyncEnvMP:
       dolphin_kwargs: dict,
       num_envs: int = 0,  # zero means non-batched env
       slippi_ports: Optional[list[int]] = None,
-      num_retries: int = 2,
+      num_retries: int = 4,
       batch_time: bool = False,
       agent_names: list[tuple[str, str]] = [],
       env_ids: Optional[list[int]] = None,
@@ -929,7 +945,7 @@ class AsyncEnvShmMP:
       dolphin_kwargs: dict,
       num_envs: int = 0,
       slippi_ports: Optional[list[int]] = None,
-      num_retries: int = 2,
+      num_retries: int = 4,
       batch_time: bool = False,
       agent_names: list[tuple[str, str]] = [],
       env_ids: Optional[list[int]] = None,
@@ -1160,7 +1176,7 @@ class AsyncBatchedEnvironmentMP:
       num_steps: int = 0,
       inner_batch_size: int = 1,
       slippi_ports: Optional[list[int]] = None,
-      num_retries: int = 2,
+      num_retries: int = 4,
       swap_ports: bool = True,
       enable_singles: bool = False, # Enable singles mode for half the envs
       include_controller_state: bool = True,

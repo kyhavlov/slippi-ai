@@ -112,9 +112,39 @@ def compute_approaching_factor_multi(
     length = player.x.shape[0] - 1
     return np.zeros(length, dtype=np.float32)
 
-  opp_xy = np.mean(
-      [np.stack([opp.x, opp.y], axis=-1) for opp in opponents], axis=0)
-  return _compute_approach_core(player, opp_xy)
+  opponent_x = np.stack(
+      [np.asarray(opponent.x, dtype=np.float32) for opponent in opponents], axis=0)
+  opponent_y = np.stack(
+      [np.asarray(opponent.y, dtype=np.float32) for opponent in opponents], axis=0)
+  opponent_active = np.stack(
+      [np.asarray(opponent.stocks_left) > 0 for opponent in opponents], axis=0)
+
+  active_count = np.sum(opponent_active, axis=0).astype(np.float32)
+  safe_count = np.maximum(active_count, 1.0)
+
+  centroid_x = np.sum(
+      np.where(opponent_active, opponent_x, 0.0), axis=0) / safe_count
+  centroid_y = np.sum(
+      np.where(opponent_active, opponent_y, 0.0), axis=0) / safe_count
+  opp_xy = np.stack([centroid_x, centroid_y], axis=-1)
+
+  approach_factor = _compute_approach_core(player, opp_xy)
+  has_active_opponent = active_count[:-1] > 0
+  approach_factor = np.where(has_active_opponent, approach_factor, 0.0)
+
+  # In doubles, only apply approach shaping when outside the opponent x-range.
+  if len(opponents) >= 2:
+    inf = np.full_like(opponent_x, np.inf, dtype=np.float32)
+    neg_inf = np.full_like(opponent_x, -np.inf, dtype=np.float32)
+    min_x = np.min(np.where(opponent_active, opponent_x, inf), axis=0)
+    max_x = np.max(np.where(opponent_active, opponent_x, neg_inf), axis=0)
+    at_least_two_active = active_count >= 2
+    player_x = np.asarray(player.x, dtype=np.float32)
+    between = np.logical_and(player_x[:-1] >= min_x[:-1], player_x[:-1] <= max_x[:-1])
+    gated = np.logical_and(at_least_two_active[:-1], between)
+    approach_factor = np.where(gated, 0.0, approach_factor)
+
+  return approach_factor.astype(np.float32)
 
 stage_to_edge_x = {
     stage.value: x for stage, x in melee.stages.EDGE_POSITION.items()
@@ -124,6 +154,7 @@ get_edge_x = np.vectorize(lambda x: stage_to_edge_x.get(x, 100))
 # Above this height is considered offstage for the purposes of stalling.
 # The highest top platform is at 54.4 on Battlefield.
 MAX_STALLING_Y = 60
+DEFAULT_STALLING_THRESHOLD = 20
 
 def amount_offstage(player: Player, stage: np.ndarray) -> np.ndarray:
   stage_xs = get_edge_x(stage[0])
@@ -135,8 +166,12 @@ def amount_offstage(player: Player, stage: np.ndarray) -> np.ndarray:
 
   return np.sqrt(np.square(dx) + np.square(dy))
 
-def is_stalling_offstage(player: Player, stage: np.ndarray) -> np.ndarray:
-  return amount_offstage(player, stage) > 20  # arbitrary
+def is_stalling_offstage(
+    player: Player,
+    stage: np.ndarray,
+    threshold: float = DEFAULT_STALLING_THRESHOLD,
+) -> np.ndarray:
+  return amount_offstage(player, stage) > threshold
 
 def is_aerial_shine(player: Player):
   is_fox = player.character == melee.Character.FOX.value
@@ -159,6 +194,7 @@ class RewardConfig:
   ledge_grab_penalty: float = 0
   approaching_factor: float = 0
   stalling_penalty: float = 0  # per second
+  stalling_threshold: float = DEFAULT_STALLING_THRESHOLD
   zelda_penalty: float = 0  # per frame
   team_size_normalization: bool = True
   singles_scale: float | None = None
@@ -233,7 +269,8 @@ def _team_reward(
 
     stalling = _add(
         stalling,
-        is_stalling_offstage(player, stage)[1:].astype(np.float32))
+        is_stalling_offstage(
+            player, stage, config.stalling_threshold)[1:].astype(np.float32))
 
     if config.zelda_penalty:
       zelda = _add(zelda, _zelda_frames(player))
@@ -316,6 +353,7 @@ def compute_rewards(
     ledge_grab_penalty: float = 0,
     approaching_factor: float = 0,
     stalling_penalty: float = 0,
+    stalling_threshold: float = DEFAULT_STALLING_THRESHOLD,
     zelda_penalty: float = 0,
     team_size_normalization: bool = True,
     singles_scale: float | None = None,
@@ -329,6 +367,7 @@ def compute_rewards(
       ledge_grab_penalty=ledge_grab_penalty,
       approaching_factor=approaching_factor,
       stalling_penalty=stalling_penalty,
+      stalling_threshold=stalling_threshold,
       zelda_penalty=zelda_penalty,
       team_size_normalization=team_size_normalization,
       singles_scale=singles_scale,
@@ -353,7 +392,12 @@ def compute_rewards(
 
   return rewards
 
-def player_stats(player: Player, opponent: Player, stage: np.ndarray) -> dict:
+def player_stats(
+    player: Player,
+    opponent: Player,
+    stage: np.ndarray,
+    stalling_threshold: float = DEFAULT_STALLING_THRESHOLD,
+) -> dict:
   FPM = 60 * 60
   return dict(
       deaths=process_deaths(
@@ -361,7 +405,7 @@ def player_stats(player: Player, opponent: Player, stage: np.ndarray) -> dict:
       damages=process_damages(player.percent).mean() * FPM,
       ledge_grabs=get_bad_ledge_grabs(player, opponent).mean() * FPM,
       approaching_factor=compute_approaching_factor(player, opponent).mean(),
-      stalling=is_stalling_offstage(player, stage).mean(),
+      stalling=is_stalling_offstage(player, stage, stalling_threshold).mean(),
   )
 
 def team_stats(team: list[Player], opponents: list[Player], stage: np.ndarray) -> dict:

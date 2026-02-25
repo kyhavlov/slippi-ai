@@ -13,6 +13,7 @@ from collections import defaultdict
 from melee import Character
 
 from slippi_ai import (
+    data as data_lib,
     dolphin as dolphin_lib,
     eval_lib,
     evaluators,
@@ -207,6 +208,30 @@ CHARACTER_WEIGHTINGS = {
       Character.GAMEANDWATCH: 1000,
       Character.BOWSER: 1000,
 }
+
+
+def _teacher_character_pool(pretraining_config: train_lib.Config) -> list[Character]:
+  allowed = pretraining_config.dataset.allowed_characters
+  parsed = data_lib.chars_from_string(allowed)
+  if parsed:
+    return list(parsed)
+  return sorted(CHARACTER_WEIGHTINGS.keys(), key=lambda c: c.value)
+
+
+def _uniform_character_weight_table(
+    pretraining_config: train_lib.Config,
+) -> dict[Character, int]:
+  characters = _teacher_character_pool(pretraining_config)
+  if not characters:
+    raise ValueError('Character pool for no-name-map RL mode is empty.')
+  return {character: 1 for character in characters}
+
+
+def _default_slot_names(configured_names: list[str], slots_per_env: int) -> list[str]:
+  cleaned = [name.strip() for name in configured_names if name.strip()]
+  if not cleaned:
+    cleaned = [nametags.DEFAULT_NAME]
+  return [cleaned[index % len(cleaned)] for index in range(slots_per_env)]
 
 class LearnerManager:
 
@@ -509,11 +534,25 @@ def run(config: Config):
 
   PORT = 1
 
-  if not config.agent.name_allowlist:
-    raise ValueError('--config.agent.name_allowlist must be provided for scheduler-driven runs.')
-
-  allowlist = scheduler_lib.parse_name_allowlist(config.agent.name_allowlist)
-  normalized_names = scheduler_lib.normalize_name_list(config.agent.name)
+  teacher_name_map = teacher_state.get('name_map', {})
+  use_name_scheduler = bool(teacher_name_map)
+  no_name_char_weights: dict[Character, int] | None = None
+  if use_name_scheduler:
+    if not config.agent.name_allowlist:
+      raise ValueError('--config.agent.name_allowlist must be provided for scheduler-driven runs.')
+    allowlist = scheduler_lib.parse_name_allowlist(config.agent.name_allowlist)
+    normalized_names = scheduler_lib.normalize_name_list(config.agent.name)
+  else:
+    allowlist = None
+    normalized_names = []
+    no_name_char_weights = _uniform_character_weight_table(pretraining_config)
+    logging.info(
+        'Teacher name_map is empty; disabling scheduler and sampling characters '
+        'uniformly each game from: %s',
+        ','.join(c.name for c in sorted(no_name_char_weights, key=lambda c: c.value)))
+    if config.agent.name_allowlist:
+      logging.warning(
+          '--config.agent.name_allowlist is ignored when teacher name_map is empty.')
 
   main_agent_kwargs = config.agent.get_kwargs()
   main_agent_kwargs['state'] = rl_state
@@ -580,48 +619,69 @@ def run(config: Config):
   env_name_layout = []
 
   if num_envs_doubles:
-    layout = scheduler_lib.allocate_name_slots(
-        normalized_names,
-        allowlist,
-        num_envs_doubles,
-        config.agent.name_layout_seed,
-        slots_per_env=4,
-    )
-    slot_specs = scheduler_lib.build_slot_specs(
-        layout,
-        num_envs_doubles,
-        slots_per_env=4,
-    )
-    env_name_layout_doubles = [
-        tuple(layout[i * 4:(i + 1) * 4])
-        for i in range(num_envs_doubles)
-    ]
+    scheduler_proxy = None
+    if use_name_scheduler:
+      layout = scheduler_lib.allocate_name_slots(
+          normalized_names,
+          allowlist,
+          num_envs_doubles,
+          config.agent.name_layout_seed,
+          slots_per_env=4,
+      )
+      slot_specs = scheduler_lib.build_slot_specs(
+          layout,
+          num_envs_doubles,
+          slots_per_env=4,
+      )
+      env_name_layout_doubles = [
+          tuple(layout[i * 4:(i + 1) * 4])
+          for i in range(num_envs_doubles)
+      ]
+
+      port_name_batches: dict[int, list[str]] = {port: [] for port in range(1, 5)}
+      for names in env_name_layout_doubles:
+        for idx, name in enumerate(names):
+          port_name_batches[idx + 1].append(name)
+
+      if not config.actor.use_fake_envs:
+        scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
+            allowlist=allowlist,
+            slot_specs=slot_specs,
+            slots_per_env=4,
+            rng_seed=config.agent.scheduler_seed,
+            char_weight=config.agent.scheduler_char_weight,
+            matchup_weight=config.agent.scheduler_matchup_weight,
+            team_weight=config.agent.scheduler_team_weight,
+            char_name_weight=config.agent.scheduler_char_name_weight,
+            max_candidates=config.agent.scheduler_max_candidates,
+            max_slot_options=config.agent.scheduler_max_slot_options,
+            max_outstanding_per_env=2,
+        )
+        scheduler_managers.append(scheduler_manager)
+
+      players = {port: dolphin_lib.ScheduledAI() for port in range(1, 5)}
+    else:
+      if no_name_char_weights is None:
+        raise ValueError('no_name_char_weights must be set when scheduler is disabled.')
+      slot_names = _default_slot_names(config.agent.name, 4)
+      env_name_layout_doubles = [tuple(slot_names)] * num_envs_doubles
+      port_name_batches = {
+          port: [slot_names[port - 1]] * num_envs_doubles
+          for port in range(1, 5)
+      }
+      default_character = next(iter(no_name_char_weights))
+      players = {
+          port: dolphin_lib.AI(
+              character=default_character,
+              character_weight_table=no_name_char_weights,
+          )
+          for port in range(1, 5)
+      }
+
     env_name_layout.extend(env_name_layout_doubles)
 
-    port_name_batches: dict[int, list[str]] = {port: [] for port in range(1, 5)}
-    for names in env_name_layout_doubles:
-      for idx, name in enumerate(names):
-        port_name_batches[idx + 1].append(name)
-
-    scheduler_proxy = None
-    if not config.actor.use_fake_envs:
-      scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
-          allowlist=allowlist,
-          slot_specs=slot_specs,
-          slots_per_env=4,
-          rng_seed=config.agent.scheduler_seed,
-          char_weight=config.agent.scheduler_char_weight,
-          matchup_weight=config.agent.scheduler_matchup_weight,
-          team_weight=config.agent.scheduler_team_weight,
-          char_name_weight=config.agent.scheduler_char_name_weight,
-          max_candidates=config.agent.scheduler_max_candidates,
-          max_slot_options=config.agent.scheduler_max_slot_options,
-          max_outstanding_per_env=2,
-      )
-      scheduler_managers.append(scheduler_manager)
-
     dolphin_kwargs = dict(
-        players={port: dolphin_lib.ScheduledAI() for port in range(1, 5)},
+        players=players,
         **config.dolphin.to_kwargs(),
     )
     agent_kwargs: tp.Mapping[int, dict] = {
@@ -647,48 +707,69 @@ def run(config: Config):
     rollout_workers.append(TrajectoryRolloutWorker(worker, ports=(1, 2, 3, 4), label='doubles'))
 
   if num_envs_singles:
-    layout = scheduler_lib.allocate_name_slots(
-        normalized_names,
-        allowlist,
-        num_envs_singles,
-        config.agent.name_layout_seed + 1,
-        slots_per_env=2,
-    )
-    slot_specs = scheduler_lib.build_slot_specs(
-        layout,
-        num_envs_singles,
-        slots_per_env=2,
-    )
-    env_name_layout_singles = [
-        tuple(layout[i * 2:(i + 1) * 2])
-        for i in range(num_envs_singles)
-    ]
+    scheduler_proxy = None
+    if use_name_scheduler:
+      layout = scheduler_lib.allocate_name_slots(
+          normalized_names,
+          allowlist,
+          num_envs_singles,
+          config.agent.name_layout_seed + 1,
+          slots_per_env=2,
+      )
+      slot_specs = scheduler_lib.build_slot_specs(
+          layout,
+          num_envs_singles,
+          slots_per_env=2,
+      )
+      env_name_layout_singles = [
+          tuple(layout[i * 2:(i + 1) * 2])
+          for i in range(num_envs_singles)
+      ]
+
+      port_name_batches: dict[int, list[str]] = {port: [] for port in (1, 2)}
+      for names in env_name_layout_singles:
+        for idx, name in enumerate(names):
+          port_name_batches[idx + 1].append(name)
+
+      if not config.actor.use_fake_envs:
+        scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
+            allowlist=allowlist,
+            slot_specs=slot_specs,
+            slots_per_env=2,
+            rng_seed=config.agent.scheduler_seed + 1,
+            char_weight=config.agent.scheduler_char_weight,
+            matchup_weight=config.agent.scheduler_matchup_weight,
+            team_weight=0.0,
+            char_name_weight=config.agent.scheduler_char_name_weight,
+            max_candidates=config.agent.scheduler_max_candidates,
+            max_slot_options=config.agent.scheduler_max_slot_options,
+            max_outstanding_per_env=2,
+        )
+        scheduler_managers.append(scheduler_manager)
+
+      players = {port: dolphin_lib.ScheduledAI() for port in (1, 2)}
+    else:
+      if no_name_char_weights is None:
+        raise ValueError('no_name_char_weights must be set when scheduler is disabled.')
+      slot_names = _default_slot_names(config.agent.name, 2)
+      env_name_layout_singles = [tuple(slot_names)] * num_envs_singles
+      port_name_batches = {
+          port: [slot_names[port - 1]] * num_envs_singles
+          for port in (1, 2)
+      }
+      default_character = next(iter(no_name_char_weights))
+      players = {
+          port: dolphin_lib.AI(
+              character=default_character,
+              character_weight_table=no_name_char_weights,
+          )
+          for port in (1, 2)
+      }
+
     env_name_layout.extend(env_name_layout_singles)
 
-    port_name_batches: dict[int, list[str]] = {port: [] for port in (1, 2)}
-    for names in env_name_layout_singles:
-      for idx, name in enumerate(names):
-        port_name_batches[idx + 1].append(name)
-
-    scheduler_proxy = None
-    if not config.actor.use_fake_envs:
-      scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
-          allowlist=allowlist,
-          slot_specs=slot_specs,
-          slots_per_env=2,
-          rng_seed=config.agent.scheduler_seed + 1,
-          char_weight=config.agent.scheduler_char_weight,
-          matchup_weight=config.agent.scheduler_matchup_weight,
-          team_weight=0.0,
-          char_name_weight=config.agent.scheduler_char_name_weight,
-          max_candidates=config.agent.scheduler_max_candidates,
-          max_slot_options=config.agent.scheduler_max_slot_options,
-          max_outstanding_per_env=2,
-      )
-      scheduler_managers.append(scheduler_manager)
-
     dolphin_kwargs = dict(
-        players={port: dolphin_lib.ScheduledAI() for port in (1, 2)},
+        players=players,
         **config.dolphin.to_kwargs(),
     )
     agent_kwargs: tp.Mapping[int, dict] = {

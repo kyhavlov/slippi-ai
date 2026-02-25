@@ -274,6 +274,33 @@ class RewardTest(unittest.TestCase):
     self.assertAlmostEqual(penalized[0], expected, places=6)
     self.assertAlmostEqual(penalized[1], baseline[1], places=6)
 
+  def test_stalling_threshold_controls_penalty(self):
+    length = 3
+    p0 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        y=[0.0, 70.0, 0.0],
+    )
+    p1 = make_placeholder(length)
+    p2 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+    )
+    p3 = make_placeholder(length)
+
+    game = make_game((p0, p1), (p2, p3), is_teams=False)
+
+    default_threshold = reward.compute_rewards(
+        game, stalling_penalty=0.6)
+    lower_threshold = reward.compute_rewards(
+        game, stalling_penalty=0.6, stalling_threshold=5.0)
+
+    self.assertAlmostEqual(default_threshold[0], 0.0, places=6)
+    self.assertAlmostEqual(lower_threshold[0], -0.6 / 60.0, places=6)
+    self.assertLess(lower_threshold[0], default_threshold[0])
+
   def test_approaching_factor_reward(self):
     length = 3
     p0 = make_player(
@@ -299,6 +326,121 @@ class RewardTest(unittest.TestCase):
     self.assertGreater(rewarded[0], baseline[0])
     self.assertGreater(rewarded[1], baseline[1])
     np.testing.assert_allclose(rewarded, baseline + 0.1, rtol=1e-5)
+
+  def test_singles_approach_not_gated_by_placeholder_opponent(self):
+    length = 3
+    p0 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        x=[-10.0, -20.0, -30.0],
+    )
+    p1 = make_placeholder(length)
+    p2 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        x=[-40.0, -40.0, -40.0],
+    )
+    p3 = make_placeholder(length)
+
+    game = make_game((p0, p1), (p2, p3), is_teams=False)
+
+    baseline = reward.compute_rewards(game)
+    rewarded = reward.compute_rewards(game, approaching_factor=0.01)
+
+    self.assertGreater(rewarded[0], baseline[0])
+    self.assertGreater(rewarded[1], baseline[1])
+    np.testing.assert_allclose(rewarded, baseline + 0.1, rtol=1e-5)
+
+  def test_doubles_approaching_factor_gated_when_between_opponents(self):
+    length = 3
+    p0 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        x=[0.0, 10.0, 20.0],
+    )
+    p1 = make_placeholder(length)
+    p2 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        x=[-40.0, -40.0, -40.0],
+    )
+    p3 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        x=[40.0, 40.0, 40.0],
+    )
+
+    game = make_game((p0, p1), (p2, p3), is_teams=True)
+
+    baseline = reward.compute_rewards(game)
+    rewarded = reward.compute_rewards(game, approaching_factor=0.01)
+    np.testing.assert_allclose(rewarded, baseline, rtol=1e-6, atol=1e-6)
+
+  def test_doubles_approaching_factor_applies_when_outside_opponents(self):
+    length = 3
+    p0 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        x=[-30.0, -20.0, -10.0],
+    )
+    p1 = make_placeholder(length)
+    p2 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        x=[0.0, 0.0, 0.0],
+    )
+    p3 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        x=[20.0, 20.0, 20.0],
+    )
+
+    game = make_game((p0, p1), (p2, p3), is_teams=True)
+
+    baseline = reward.compute_rewards(game)
+    rewarded = reward.compute_rewards(game, approaching_factor=0.01)
+
+    self.assertGreater(rewarded[0], baseline[0])
+    self.assertGreater(rewarded[1], baseline[1])
+    np.testing.assert_allclose(rewarded, baseline + 0.1, rtol=1e-5)
+
+  def test_doubles_approaching_factor_stops_gating_after_elimination(self):
+    length = 3
+    p0 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        x=[0.0, -10.0, -20.0],
+    )
+    p1 = make_placeholder(length)
+    p2 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[4, 4, 4],
+        x=[-40.0, -40.0, -40.0],
+    )
+    p3 = make_player(
+        percent=[0, 0, 0],
+        action=[0xE, 0xE, 0xE],
+        stocks_left=[1, 0, 0],
+        x=[40.0, 40.0, 40.0],
+    )
+
+    game = make_game((p0, p1), (p2, p3), is_teams=True)
+
+    baseline = reward.compute_rewards(game)
+    rewarded = reward.compute_rewards(game, approaching_factor=0.01)
+
+    self.assertAlmostEqual(rewarded[0], baseline[0], places=6)
+    self.assertGreater(rewarded[1], baseline[1])
 
   def test_mode_scaling(self):
     length = 3
@@ -484,6 +626,12 @@ class RewardReplayTest(unittest.TestCase):
     self.assertAlmostEqual(team_a, -team_b, places=5)
     self.assertAlmostEqual(team_a, -8.381505966186523, places=5)
     self.assertAlmostEqual(team_b, 8.381505966186523, places=5)
+
+    rewards_with_approach = reward.compute_rewards(
+        game, approaching_factor=0.001)
+    self.assertEqual(rewards_with_approach.shape, rewards.shape)
+    self.assertTrue(np.all(np.isfinite(rewards_with_approach)))
+    self.assertFalse(np.allclose(rewards_with_approach, rewards))
 
 
 if __name__ == '__main__':
