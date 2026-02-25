@@ -1,7 +1,9 @@
 import abc
 import atexit
+import configparser
 import dataclasses
 import logging
+import os
 import random
 from typing import Dict, Mapping, Optional, Iterator
 
@@ -91,6 +93,17 @@ def is_menu_state(gamestate: melee.GameState) -> bool:
 class ConnectFailed(Exception):
   """Raised when we fail to connect to the console."""
 
+
+def _enable_gecko_cheats(console: melee.Console):
+  config_path = os.path.join(console._get_dolphin_home_path(), 'Config', 'Dolphin.ini')
+  config = configparser.ConfigParser()
+  config.read(config_path)
+  if not config.has_section('Core'):
+    config.add_section('Core')
+  config.set('Core', 'EnableCheats', 'True')
+  with open(config_path, 'w') as f:
+    config.write(f)
+
 class Dolphin:
 
   def __init__(
@@ -111,6 +124,7 @@ class Dolphin:
       teams_connect_code: Optional[str] = None,
       desired_teams: Mapping[int, int] = {},
       existing_dolphin: bool = False,
+      starting_stocks: int = 0,
       **console_kwargs,
   ) -> None:
     self._players = players
@@ -148,6 +162,8 @@ class Dolphin:
     # if we have remote players, dont wait for them to select characters
     remote_players = [port for port, player in players.items() if isinstance(player, RemoteAI)]
     self.menu_helper = melee.MenuHelper(is_singles=len(players) == 2, remote_players=remote_players)
+    if starting_stocks and console_kwargs.get('infinite_time', False):
+      raise ValueError('starting_stocks is incompatible with infinite_time=True.')
 
     console = melee.Console(
         path=path,
@@ -159,8 +175,10 @@ class Dolphin:
         copy_home_directory=False,
         setup_gecko_codes=True,
         save_replays=save_replays,
+        slippi_starting_stocks=starting_stocks,
         **console_kwargs,
     )
+    _enable_gecko_cheats(console)
     atexit.register(console.stop)
     self.console = console
 
@@ -328,6 +346,7 @@ class DolphinConfig:
   headless: bool = True  # Headless configuration: exi + ffw, no graphics or audio.
   emulation_speed: float = 1.0  # Set to 0 for unlimited speed. Mainline only.
   infinite_time: bool = True  # Infinite time no stocks.
+  starting_stocks: int = 0  # Set >0 to override starting stocks on supported Ishiiruka builds.
   log_level: int = 3  # WARN; 0 to disable
   log_types: list[str] = dataclasses.field(default_factory=['SLIPPI'].copy)
   dump: DumpConfig = _field(DumpConfig)  # For framedumping.
@@ -368,6 +387,7 @@ DOLPHIN_FLAGS = dict(
         False, 'Headless configuration: exi + ffw, no graphics or audio.'),
     emulation_speed=ff.Float(1.0),
     infinite_time=ff.Boolean(False, 'Infinite time no stocks.'),
+    starting_stocks=ff.Integer(0, 'Set >0 to override starting stocks on supported Ishiiruka builds.'),
     log_level=ff.Integer(3, 'Dolphin log level, defaults to WARN.'),
     log_types=ff.StringList(['SLIPPI'], 'Enabled logging categories.'),
     disable_audio=ff.Boolean(False, 'Disable dolphin audio.'),

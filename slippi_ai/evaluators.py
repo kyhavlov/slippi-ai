@@ -344,7 +344,8 @@ class RolloutWorker:
         env_output: env_lib.EnvOutput,
         prev_agent_outputs: dict[Port, SampleOutputs],
     ):
-      for port, game in env_output.gamestates.items():
+      for port in self._ports:
+        game = env_output.gamestates[port]
         gamestates[port].append(game)
         sample_outputs[port].append(prev_agent_outputs[port])
       is_resetting.append(env_output.needs_reset)

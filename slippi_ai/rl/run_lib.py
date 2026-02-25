@@ -63,6 +63,8 @@ class ActorConfig:
   gpu_inference: bool = True
   use_fake_envs: bool = False
   singles_fraction: float = 0.0
+  twovone_fraction: float = 0.0
+  twovone_starting_stocks: int = 0
   # Deprecated: historically enabled singles on half of envs.
   enable_singles: bool = False
   fuse_ports_inference: bool = False
@@ -232,6 +234,12 @@ def _default_slot_names(configured_names: list[str], slots_per_env: int) -> list
   if not cleaned:
     cleaned = [nametags.DEFAULT_NAME]
   return [cleaned[index % len(cleaned)] for index in range(slots_per_env)]
+
+
+TWOVONE_PORT_LAYOUTS: tuple[tuple[int, int, int], tuple[int, int, int]] = (
+    (1, 2, 3),
+    (1, 3, 4),
+)
 
 class LearnerManager:
 
@@ -594,24 +602,64 @@ def run(config: Config):
   if singles_fraction == 0.0 and config.actor.enable_singles:
     logging.warning('--config.actor.enable_singles is deprecated; using singles_fraction=0.5')
     singles_fraction = 0.5
+  twovone_fraction = float(config.actor.twovone_fraction)
 
   if not (0.0 <= singles_fraction <= 1.0):
     raise ValueError('--config.actor.singles_fraction must be in [0, 1].')
+  if not (0.0 <= twovone_fraction <= 1.0):
+    raise ValueError('--config.actor.twovone_fraction must be in [0, 1].')
+  if singles_fraction + twovone_fraction > 1.0:
+    raise ValueError(
+        '--config.actor.singles_fraction + --config.actor.twovone_fraction '
+        'must be <= 1.')
+  twovone_starting_stocks = int(config.actor.twovone_starting_stocks)
+  if twovone_starting_stocks < 0 or twovone_starting_stocks > 9:
+    raise ValueError('--config.actor.twovone_starting_stocks must be in [0, 9].')
 
   num_envs_total = int(config.actor.num_envs)
-  num_envs_singles = int(round(num_envs_total * singles_fraction))
-  num_envs_singles = max(0, min(num_envs_singles, num_envs_total))
-  num_envs_doubles = num_envs_total - num_envs_singles
-
   if num_envs_total <= 0:
     raise ValueError('--config.actor.num_envs must be > 0.')
 
+  raw_singles = num_envs_total * singles_fraction
+  raw_twovone = num_envs_total * twovone_fraction
+  num_envs_singles = int(round(raw_singles))
+  num_envs_twovone = int(round(raw_twovone))
+  num_envs_singles = max(0, min(num_envs_singles, num_envs_total))
+  num_envs_twovone = max(0, min(num_envs_twovone, num_envs_total))
+  non_doubles = num_envs_singles + num_envs_twovone
+  if non_doubles > num_envs_total:
+    overflow = non_doubles - num_envs_total
+    overround = {
+        'singles': num_envs_singles - raw_singles,
+        'twovone': num_envs_twovone - raw_twovone,
+    }
+    while overflow > 0:
+      if overround['singles'] >= overround['twovone'] and num_envs_singles > 0:
+        num_envs_singles -= 1
+        overround['singles'] -= 1.0
+      elif num_envs_twovone > 0:
+        num_envs_twovone -= 1
+        overround['twovone'] -= 1.0
+      overflow -= 1
+  num_envs_doubles = num_envs_total - num_envs_singles - num_envs_twovone
+
+  num_envs_twovone_a = (num_envs_twovone + 1) // 2
+  num_envs_twovone_b = num_envs_twovone - num_envs_twovone_a
+
   doubles_slippi_ports: list[int] | None = None
   singles_slippi_ports: list[int] | None = None
+  twovone_slippi_ports_a: list[int] | None = None
+  twovone_slippi_ports_b: list[int] | None = None
   if not config.actor.use_fake_envs and not config.actor.ray_envs:
     all_ports = utils.find_open_udp_ports(num_envs_total)
-    doubles_slippi_ports = all_ports[:num_envs_doubles]
-    singles_slippi_ports = all_ports[num_envs_doubles:]
+    cursor = 0
+    doubles_slippi_ports = all_ports[cursor:cursor + num_envs_doubles]
+    cursor += num_envs_doubles
+    singles_slippi_ports = all_ports[cursor:cursor + num_envs_singles]
+    cursor += num_envs_singles
+    twovone_ports = all_ports[cursor:cursor + num_envs_twovone]
+    twovone_slippi_ports_a = twovone_ports[:num_envs_twovone_a]
+    twovone_slippi_ports_b = twovone_ports[num_envs_twovone_a:]
 
   rollout_workers: list[TrajectoryRolloutWorker] = []
   scheduler_managers: list[tp.Any] = []
@@ -706,6 +754,126 @@ def run(config: Config):
     )
     rollout_workers.append(TrajectoryRolloutWorker(worker, ports=(1, 2, 3, 4), label='doubles'))
 
+  def _add_twovone_worker(
+      *,
+      num_envs_twovone_mode: int,
+      active_ports: tuple[int, int, int],
+      slippi_ports: list[int] | None,
+      label: str,
+      seed_offset: int,
+  ):
+    if not num_envs_twovone_mode:
+      return
+    if 1 not in active_ports:
+      raise ValueError(
+          f'2v1 layout must include port 1 (menu start owner), got {active_ports}.')
+
+    scheduler_proxy = None
+    slots_per_env = len(active_ports)
+    if use_name_scheduler:
+      layout = scheduler_lib.allocate_name_slots(
+          normalized_names,
+          allowlist,
+          num_envs_twovone_mode,
+          config.agent.name_layout_seed + seed_offset,
+          slots_per_env=slots_per_env,
+      )
+      slot_specs = scheduler_lib.build_slot_specs(
+          layout,
+          num_envs_twovone_mode,
+          slots_per_env=slots_per_env,
+      )
+      env_name_layout_twovone = [
+          tuple(layout[i * slots_per_env:(i + 1) * slots_per_env])
+          for i in range(num_envs_twovone_mode)
+      ]
+
+      port_name_batches: dict[int, list[str]] = {port: [] for port in active_ports}
+      for names in env_name_layout_twovone:
+        for idx, name in enumerate(names):
+          port = active_ports[idx]
+          port_name_batches[port].append(name)
+
+      if not config.actor.use_fake_envs:
+        scheduler_manager, scheduler_proxy = scheduler_lib.start_scheduler_manager(
+            allowlist=allowlist,
+            slot_specs=slot_specs,
+            slots_per_env=slots_per_env,
+            rng_seed=config.agent.scheduler_seed + seed_offset,
+            char_weight=config.agent.scheduler_char_weight,
+            matchup_weight=config.agent.scheduler_matchup_weight,
+            team_weight=config.agent.scheduler_team_weight,
+            char_name_weight=config.agent.scheduler_char_name_weight,
+            max_candidates=config.agent.scheduler_max_candidates,
+            max_slot_options=config.agent.scheduler_max_slot_options,
+            max_outstanding_per_env=2,
+        )
+        scheduler_managers.append(scheduler_manager)
+
+      players = {port: dolphin_lib.ScheduledAI() for port in active_ports}
+    else:
+      if no_name_char_weights is None:
+        raise ValueError('no_name_char_weights must be set when scheduler is disabled.')
+      slot_names = _default_slot_names(config.agent.name, slots_per_env)
+      env_name_layout_twovone = [tuple(slot_names)] * num_envs_twovone_mode
+      port_name_batches = {
+          port: [slot_names[idx]] * num_envs_twovone_mode
+          for idx, port in enumerate(active_ports)
+      }
+      default_character = next(iter(no_name_char_weights))
+      players = {
+          port: dolphin_lib.AI(
+              character=default_character,
+              character_weight_table=no_name_char_weights,
+          )
+          for port in active_ports
+      }
+
+    env_name_layout.extend(env_name_layout_twovone)
+
+    dolphin_kwargs = dict(
+        players=players,
+        **config.dolphin.to_kwargs(),
+    )
+    if twovone_starting_stocks:
+      dolphin_kwargs['starting_stocks'] = twovone_starting_stocks
+    agent_kwargs: tp.Mapping[int, dict] = {
+        port: dict(name=port_name_batches[port], **main_agent_kwargs.copy())
+        for port in active_ports
+    }
+    twovone_env_kwargs = dict(env_kwargs_base)
+    if slippi_ports is not None:
+      twovone_env_kwargs['slippi_ports'] = slippi_ports
+    worker = evaluators.RolloutWorker(
+        agent_kwargs=agent_kwargs,
+        dolphin_kwargs=dolphin_kwargs,
+        env_kwargs=twovone_env_kwargs,
+        num_envs=num_envs_twovone_mode,
+        use_ray_envs=config.actor.ray_envs,
+        async_envs=config.actor.async_envs,
+        use_gpu=config.actor.gpu_inference,
+        use_fake_envs=config.actor.use_fake_envs,
+        fuse_ports_inference=config.actor.fuse_ports_inference,
+        agent_names=env_name_layout_twovone,
+        scheduler=scheduler_proxy,
+    )
+    rollout_workers.append(TrajectoryRolloutWorker(worker, ports=active_ports, label=label))
+
+  _add_twovone_worker(
+      num_envs_twovone_mode=num_envs_twovone_a,
+      active_ports=TWOVONE_PORT_LAYOUTS[0],
+      slippi_ports=twovone_slippi_ports_a,
+      label='twovone_a',
+      seed_offset=2,
+  )
+  _add_twovone_worker(
+      num_envs_twovone_mode=num_envs_twovone_b,
+      active_ports=TWOVONE_PORT_LAYOUTS[1],
+      slippi_ports=twovone_slippi_ports_b,
+      label='twovone_b',
+      seed_offset=3,
+  )
+
   if num_envs_singles:
     scheduler_proxy = None
     if use_name_scheduler:
@@ -795,9 +963,15 @@ def run(config: Config):
     rollout_workers.append(TrajectoryRolloutWorker(worker, ports=(1, 2), label='singles'))
 
   if not rollout_workers:
-    raise ValueError('No rollout workers were constructed; check singles_fraction and num_envs.')
+    raise ValueError(
+        'No rollout workers were constructed; check singles_fraction, '
+        'twovone_fraction, and num_envs.')
 
-  effective_batch_size = 4 * num_envs_doubles + 2 * num_envs_singles
+  effective_batch_size = (
+      4 * num_envs_doubles
+      + 3 * num_envs_twovone
+      + 2 * num_envs_singles
+  )
 
   build_actor = lambda: (
       rollout_workers[0]
@@ -979,6 +1153,10 @@ def run(config: Config):
     mix = dict(
         singles_fraction=float(1.0 - mode.mean()),
         doubles_fraction=float(mode.mean()),
+        envs_total=int(num_envs_total),
+        envs_doubles=int(num_envs_doubles),
+        envs_twovone=int(num_envs_twovone),
+        envs_singles=int(num_envs_singles),
         effective_batch_size=int(effective_batch_size),
     )
 

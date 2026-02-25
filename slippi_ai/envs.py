@@ -77,7 +77,7 @@ class Environment:
   def __init__(
       self,
       dolphin_kwargs: dict,
-      agent_names: tuple[str, str] = [],
+      agent_names: tuple[str, ...] = (),
       swap_ports: bool = False,
       check_controller_outputs: bool = False,
       enable_singles: bool = False,
@@ -86,8 +86,8 @@ class Environment:
       scheduler = None,
   ):
     players: dict[Port, dolphin.Player] = dolphin_kwargs['players']
-    if len(players) not in (2, 4):
-      raise ValueError('Environment requires either 2 (singles) or 4 (doubles) players.')
+    if len(players) not in (2, 3, 4):
+      raise ValueError('Environment requires 2 (singles), 3 (2v1), or 4 (doubles) players.')
 
     print("Creating environment on", socket.gethostname(), "with slippi_port:", dolphin_kwargs.get('slippi_port'))
     self._agent_names = agent_names
@@ -134,7 +134,9 @@ class Environment:
 
     dolphin_args = dict(dolphin_kwargs, players=actual_players)
     if not self._is_singles:
-      dolphin_args['desired_teams'] = {1: 0, 2: 1, 3: 1, 4: 0}
+      canonical_teams = {1: 0, 2: 1, 3: 1, 4: 0}
+      dolphin_args['desired_teams'] = {
+          port: canonical_teams[port] for port in actual_players}
     dolphin_args.pop('slippi_port2', None)
     self._dolphin_kwargs = dolphin_args
     self._dolphin = dolphin.Dolphin(**self._dolphin_kwargs)
@@ -234,7 +236,8 @@ class Environment:
     if not game_was_over and match_reporting.match_is_over(self._prev_state):
       self._finalize_assignment(AssignmentStatus.COMPLETE)
       if not self._is_singles:
-        match_reporting.submit_match(self._prev_state, self._agent_names, self._current_characters)
+        if len(self._agent_names) == 4 and len(self._current_characters) == 4:
+          match_reporting.submit_match(self._prev_state, self._agent_names, self._current_characters)
 
     # stock stealing hack
     if not self._is_singles:
@@ -1412,7 +1415,7 @@ class FakeBatchedEnvironment:
     game = utils.map_nt(
         lambda t: np.full([num_envs], 0, dtype=t), reified_game)
     game.stage[:] = Stage.FINAL_DESTINATION.value  # make the stage valid
-    game.is_teams[:] = bool(len(players) == 4)
+    game.is_teams[:] = bool(len(players) != 2)
     self._dummy_output = EnvOutput(
         gamestates={p: game for p in players},
         needs_reset=np.full([num_envs], False),
