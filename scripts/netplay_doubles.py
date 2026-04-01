@@ -74,21 +74,26 @@ def run_agent(agent: eval_lib.Agent,
               connect_code: str):
   gamestate = dolphin.step()
 
-  code_to_port = {
-      player.connectCode: port for port, player in gamestate.players.items()
-  }
+  def set_player_ports(gamestate):
+    code_to_port = {
+        player.connectCode: port for port, player in gamestate.players.items()
+    }
 
-  actual_port = code_to_port[connect_code]
-  teammate_port = 1
-  for port, player in gamestate.players.items():
-    if port == actual_port:
-      continue
-    if player.team_id == gamestate.players[actual_port].team_id:
-      teammate_port = port
-      break
-  agent.players = (int(actual_port), int(teammate_port))
-  agent.players += tuple(p for p in (1, 2, 3, 4) if p not in agent.players)
-  agent.teammate_port = teammate_port
+    actual_port = code_to_port[connect_code]
+    teammate_port = 1
+    for port, player in gamestate.players.items():
+      if port == actual_port:
+        continue
+      if player.team_id == gamestate.players[actual_port].team_id:
+        teammate_port = port
+        break
+
+    agent.players = (int(actual_port), int(teammate_port))
+    agent.players += tuple(p for p in (1, 2, 3, 4) if p not in agent.players)
+    agent.teammate_port = teammate_port
+    return actual_port
+
+  actual_port = set_player_ports(gamestate)
 
   # Main loop
   agent.start()
@@ -98,6 +103,7 @@ def run_agent(agent: eval_lib.Agent,
 
     while True:
       if gamestate.frame == -123:
+        actual_port = set_player_ports(gamestate)
         action_queue = collections.deque(
             [None] * (1 + dolphin.console.online_delay))
         print("starting game with ports: ", agent.players)
