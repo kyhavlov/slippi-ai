@@ -161,6 +161,7 @@ class RuntimeConfig:
   max_runtime: int = 1 * 60 * 60  # maximum runtime in seconds
   log_interval: int = 10  # seconds between logging
   save_interval: int = 300  # seconds between saving to disk
+  save_every_n_steps: int = 0  # save named checkpoints every N steps; 0 disables
 
   eval_every_n: int = 100  # number of training steps between evaluations
   num_eval_steps: int = 10  # number of batches per evaluation
@@ -416,35 +417,39 @@ def train(config: Config):
       lambda var, val: var.assign(val),
       tf_state, state)
 
-  def save():
-    # Local Save
+  def _build_combined_state():
     tf_state = get_tf_state()
 
     # easier to always bundle the config with the state
-    combined_state = dict(
+    return dict(
         state=tf_state,
         config=dataclasses.asdict(config),
         name_map=name_map,
     )
+
+  def save(path: str = pickle_path):
+    combined_state = _build_combined_state()
     pickled_state = pickle.dumps(combined_state)
 
-    logging.info('saving state to %s', pickle_path)
-    with open(pickle_path, 'wb') as f:
+    logging.info('saving state to %s', path)
+    with open(path, 'wb') as f:
       f.write(pickled_state)
 
-    if save_to_s3:
+    if save_to_s3 and path == pickle_path:
       logging.info('saving state to S3: %s', s3_keys.combined)
       s3_store.put(s3_keys.combined, pickled_state)
 
   maybe_save = utils.Periodically(save, runtime.save_interval)
 
   if restored:
+    logging.info('restoring model weights and training state')
     set_tf_state(combined_state['state'])
-    train_loss = _get_loss(train_manager.step()[0])
-    logging.info('loss post-restore: %f', train_loss)
+    restore_eval_loss = _get_loss(test_manager.step()[0])
+    logging.info('eval loss post-restore: %f', restore_eval_loss)
 
   FRAMES_PER_MINUTE = 60 * 60
   FRAMES_PER_STEP = config.data.batch_size * config.data.unroll_length
+  last_step_checkpoint = 0
 
   step_tracker = utils.Tracker(step.numpy())
   epoch_tracker = utils.Tracker(train_stats['epoch'])
@@ -597,6 +602,8 @@ def train(config: Config):
 
   start_time = time.time()
 
+  maybe_eval()
+
   while time.time() - start_time < runtime.max_runtime:
     train_stats, _ = train_manager.step()
     step.assign_add(1)
@@ -604,3 +611,12 @@ def train(config: Config):
     maybe_eval()
 
     maybe_save()
+
+    total_steps = int(step.numpy())
+    if (runtime.save_every_n_steps > 0
+        and total_steps > 0
+        and total_steps % runtime.save_every_n_steps == 0
+        and total_steps != last_step_checkpoint):
+      step_pickle_path = os.path.join(expt_dir, f'step_{total_steps}.pkl')
+      save(step_pickle_path)
+      last_step_checkpoint = total_steps
