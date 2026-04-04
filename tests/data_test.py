@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import pathlib
 import shutil
@@ -274,6 +276,7 @@ class DataTest(unittest.TestCase):
           meta_path=str(meta_path),
           allowed_characters='all',
           allowed_opponents='all',
+          swap=False,
       )
 
       replays = data.replays_from_meta(cfg)
@@ -333,6 +336,7 @@ class DataTest(unittest.TestCase):
           meta_path=str(meta_path),
           allowed_characters='all',
           allowed_opponents='all',
+          swap=False,
       )
 
       replays = data.replays_from_meta(cfg)
@@ -346,6 +350,60 @@ class DataTest(unittest.TestCase):
       expected_opponents = tuple(i for i in range(4)
                                  if i not in (info.main_player_index, info.teammate_index))
       self.assertEqual(info.opponent_order, expected_opponents)
+
+  def test_replays_from_meta_respects_allowed_main_player_indices(self):
+    players_meta = [
+        dict(port=0, character=1, type=0, name_tag='',
+             netplay=dict(name='Enzyme', code='ENZYME#0', suid=''), team=0),
+        dict(port=1, character=22, type=0, name_tag='',
+             netplay=dict(name='Tempo', code='TEMP#0', suid=''), team=0),
+        dict(port=2, character=9, type=0, name_tag='',
+             netplay=dict(name='OpponentA', code='OPPA#1', suid=''), team=1),
+        dict(port=3, character=18, type=0, name_tag='',
+             netplay=dict(name='OpponentB', code='OPPB#1', suid=''), team=1),
+    ]
+    meta_row = dict(
+        name='doubles_filtered.slp',
+        slp_md5='facefeed',
+        slp_size=0,
+        lastFrame=100,
+        slippi_version=[3, 14, 0],
+        num_players=4,
+        players=players_meta,
+        stage=2,
+        timer=480,
+        is_teams=True,
+        winner=0,
+        valid=True,
+        is_training=True,
+        not_training_reason='',
+        pq_size=0,
+        raw='ignored.zip',
+        compression='zlib',
+        allowed_main_player_indices=[1],
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+      data_dir = pathlib.Path(tmp) / 'games'
+      data_dir.mkdir()
+      (data_dir / meta_row['slp_md5']).touch()
+
+      meta_path = pathlib.Path(tmp) / 'meta.json'
+      meta_path.write_text(json.dumps([meta_row]))
+
+      cfg = data.DatasetConfig(
+          data_dir=str(data_dir),
+          meta_path=str(meta_path),
+          allowed_characters='all',
+          allowed_opponents='all',
+          swap=False,
+      )
+
+      replays = data.replays_from_meta(cfg)
+
+    self.assertEqual(len(replays), 1)
+    self.assertEqual(replays[0].main_player_index, 1)
+    self.assertEqual(replays[0].main_player_name, 'TEMP#0')
 
   def test_replays_from_meta_prefers_hashed_layout(self):
     md5 = 'abcdef0123456789abcdef0123456789'
@@ -464,6 +522,97 @@ class DataTest(unittest.TestCase):
         expected_opponents = tuple(i for i in range(4)
                                    if i not in (info.main_player_index, info.teammate_index))
         self.assertEqual(info.opponent_order, expected_opponents)
+
+  def test_build_meta_allowed_players_file_annotates_and_summarizes(self):
+    kept_row = dict(
+        name='kept.slp',
+        slp_md5='facefeed',
+        slp_size=0,
+        lastFrame=100,
+        slippi_version=[3, 14, 0],
+        num_players=4,
+        players=[
+            dict(port=0, character=1, type=0, name_tag='',
+                 netplay=dict(name='Enzyme', code='ENZYME#0', suid=''), team=0),
+            dict(port=1, character=22, type=0, name_tag='',
+                 netplay=dict(name='Tempo', code='TEMP#0', suid=''), team=0),
+            dict(port=2, character=9, type=0, name_tag='',
+                 netplay=dict(name='OpponentA', code='OPPA#1', suid=''), team=1),
+            dict(port=3, character=18, type=0, name_tag='',
+                 netplay=dict(name='OpponentB', code='OPPB#1', suid=''), team=1),
+        ],
+        stage=2,
+        timer=480,
+        is_teams=True,
+        winner=0,
+        valid=True,
+        is_training=True,
+        not_training_reason='',
+        pq_size=0,
+        raw='ignored.zip',
+        compression='zlib',
+    )
+    dropped_row = dict(
+        kept_row,
+        name='dropped.slp',
+        slp_md5='deadc0de',
+        players=[
+            dict(port=0, character=3, type=0, name_tag='',
+                 netplay=dict(name='Someone', code='SOME#1', suid=''), team=0),
+            dict(port=1, character=4, type=0, name_tag='',
+                 netplay=dict(name='Else', code='ELSE#1', suid=''), team=0),
+            dict(port=2, character=9, type=0, name_tag='',
+                 netplay=dict(name='OpponentA', code='OPPA#1', suid=''), team=1),
+            dict(port=3, character=18, type=0, name_tag='',
+                 netplay=dict(name='OpponentB', code='OPPB#1', suid=''), team=1),
+        ],
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+      root = pathlib.Path(tmp)
+      parsed_dir = root / 'Parsed'
+      parsed_dir.mkdir()
+
+      for md5 in (kept_row['slp_md5'], dropped_row['slp_md5']):
+        hashed_dir = parsed_dir / md5[:file_layout.PARQUET_PREFIX_LEN]
+        hashed_dir.mkdir(parents=True, exist_ok=True)
+        (hashed_dir / md5).touch()
+
+      with open(root / 'parsed.pkl', 'wb') as f:
+        import pickle
+        pickle.dump([kept_row, dropped_row], f)
+
+      whitelist_path = root / 'players.txt'
+      whitelist_path.write_text('ENZYME#0\nTempo\nMissingPlayer\n')
+
+      stdout = io.StringIO()
+      with contextlib.redirect_stdout(stdout):
+        rows = make_local_dataset.build_meta(
+            root,
+            doubles_only=True,
+            winner_only=False,
+            make_tar=False,
+            allowed_players_file=str(whitelist_path),
+            quiet=False,
+        )
+
+      self.assertEqual(len(rows), 1)
+      self.assertEqual(rows[0]['allowed_main_player_indices'], [0, 1])
+
+      with open(root / 'meta.json') as f:
+        meta_rows = json.load(f)
+      self.assertEqual(len(meta_rows), 1)
+      self.assertEqual(meta_rows[0]['allowed_main_player_indices'], [0, 1])
+
+      output = stdout.getvalue()
+      self.assertIn('Selected player replay counts:', output)
+      self.assertIn('Enzyme: 1', output)
+      self.assertIn('Tempo: 1', output)
+      self.assertIn('MissingPlayer: 0', output)
+      self.assertNotIn('OpponentA', output)
+      self.assertNotIn('OpponentB', output)
+      self.assertNotIn('Someone', output)
+      self.assertNotIn('Else', output)
 
   def test_train_test_split_is_deterministic(self):
     cfg = data.DatasetConfig(

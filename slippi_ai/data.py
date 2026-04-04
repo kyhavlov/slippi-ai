@@ -380,6 +380,11 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
   for row in meta_rows:
     replay_meta = ReplayMeta.from_metadata(row)
     replay_path = file_layout.resolve_parquet_path(config.data_dir, replay_meta.slp_md5)
+    allowed_main_player_indices = row.get('allowed_main_player_indices')
+    if allowed_main_player_indices is not None:
+      allowed_main_player_indices = {
+          int(i) for i in allowed_main_player_indices
+      }
 
     # for singles games, generate two replays (one for each player). 
     # each replay will have the self player as p0 and the opponent randomized
@@ -390,6 +395,10 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
       # Promote each player to the p0 slot while keeping teammate empty (p1) and
       # the opponent in the remaining visible slot after swapping.
       for player_index, player in enumerate(players):
+        if (allowed_main_player_indices is not None and
+            player_index not in allowed_main_player_indices):
+          continue
+
         opponent = players[1 - player_index]
 
         if player.character not in allowed_characters:
@@ -450,6 +459,10 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
 
     # append a replay for each player index
     for player_index in range(4):
+      if (allowed_main_player_indices is not None and
+          player_index not in allowed_main_player_indices):
+        continue
+
       players = [replay_meta.p0, replay_meta.p1, replay_meta.p2, replay_meta.p3]
 
       if players[player_index].character not in allowed_characters:

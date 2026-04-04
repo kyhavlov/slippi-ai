@@ -28,6 +28,12 @@ MAKE_TAR = flags.DEFINE_boolean('tar', False, 'Create dataset tar archive')
 DOUBLES_ONLY = flags.DEFINE_boolean(
   'doubles_only', True, 'only use doubles games')
 
+ALLOWED_PLAYERS_FILE = flags.DEFINE_string(
+    'allowed_players_file',
+    None,
+    'Optional path to a newline-separated whitelist of allowed players.',
+)
+
 
 _EXCLUDED_CHARACTERS = {
     Character.WIREFRAME_MALE,
@@ -53,6 +59,46 @@ def _normalize_allowed_players(
   return normalised
 
 
+def _load_allowed_players_file(
+    path: Optional[str],
+) -> Optional[Dict[str, Optional[set[Character]]]]:
+  if not path:
+    return None
+
+  allowed_players: Dict[str, Optional[set[Character]]] = {}
+  with open(path) as f:
+    for raw_line in f:
+      line = raw_line.strip()
+      if not line or line.startswith('#'):
+        continue
+      allowed_players[nametags.normalize_name(line)] = None
+  return allowed_players
+
+
+def _matching_allowed_player_indices(
+    row: dict,
+    *,
+    allowed_players: Optional[Dict[str, Optional[set[Character]]]],
+) -> list[int]:
+  if allowed_players is None:
+    return list(range(len(row['players'])))
+
+  matching_indices: list[int] = []
+  raw = row.get('raw')
+  for i, player in enumerate(row['players']):
+    code = nametags.name_from_metadata(player, raw=raw)
+    name = nametags.normalize_name(code)
+    if name not in allowed_players:
+      continue
+
+    allowed_chars = allowed_players[name]
+    character = Character(player['character'])
+    if allowed_chars is None or character in allowed_chars:
+      matching_indices.append(i)
+
+  return matching_indices
+
+
 def is_valid_replay(
     row: dict,
     *,
@@ -72,18 +118,37 @@ def is_valid_replay(
   if allowed_players is None:
     return True
 
-  for player in row['players']:
-    code = nametags.name_from_metadata(player)
-    name = nametags.normalize_name(code)
-    if name in allowed_players:
-      allowed_chars = allowed_players[name]
-      character = Character(player['character'])
-      if allowed_chars is None or character in allowed_chars:
-        return True
-
-  return False
+  return bool(_matching_allowed_player_indices(
+      row,
+      allowed_players=allowed_players,
+  ))
 
 def _summarize(rows: list[dict]) -> None:
+  _summarize_rows(rows, only_allowed_main_players=False)
+
+
+def _iter_summary_players(
+    row: dict,
+    *,
+    only_allowed_main_players: bool,
+):
+  players = row['players']
+  if only_allowed_main_players:
+    indices = row.get('allowed_main_player_indices')
+    if indices is None:
+      indices = range(len(players))
+    for i in indices:
+      yield players[int(i)]
+  else:
+    for player in players:
+      yield player
+
+
+def _summarize_rows(
+    rows: list[dict],
+    *,
+    only_allowed_main_players: bool,
+) -> None:
   player_character_counts = collections.Counter()
   character_counts = collections.Counter()
   trajectory_count = 0
@@ -92,8 +157,12 @@ def _summarize(rows: list[dict]) -> None:
     if len(row['players']) != 4:
       continue
 
-    for player in row['players']:
-      code = nametags.name_from_metadata(player)
+    raw = row.get('raw')
+    for player in _iter_summary_players(
+        row,
+        only_allowed_main_players=only_allowed_main_players,
+    ):
+      code = nametags.name_from_metadata(player, raw=raw)
       name = nametags.normalize_name(code)
 
       trajectory_count += 1
@@ -111,6 +180,14 @@ def _summarize(rows: list[dict]) -> None:
 
 
 def _summarize_singles(rows: list[dict]) -> None:
+  _summarize_singles_rows(rows, only_allowed_main_players=False)
+
+
+def _summarize_singles_rows(
+    rows: list[dict],
+    *,
+    only_allowed_main_players: bool,
+) -> None:
   singles_player_character_counts = collections.Counter()
   singles_character_counts = collections.Counter()
   trajectory_count = 0
@@ -119,8 +196,12 @@ def _summarize_singles(rows: list[dict]) -> None:
     if row.get('is_teams'):
       continue
 
-    for player in row['players']:
-      code = nametags.name_from_metadata(player)
+    raw = row.get('raw')
+    for player in _iter_summary_players(
+        row,
+        only_allowed_main_players=only_allowed_main_players,
+    ):
+      code = nametags.name_from_metadata(player, raw=raw)
       name = nametags.normalize_name(code)
       singles_player_character_counts[(name, Character(player['character']))] += 1
       singles_character_counts[Character(player['character'])] += 1
@@ -136,12 +217,39 @@ def _summarize_singles(rows: list[dict]) -> None:
     print(f"{name} ({character}): {count}")
 
 
+def _summarize_selected_players(
+    rows: list[dict],
+    *,
+    allowed_players: Dict[str, Optional[set[Character]]],
+) -> None:
+  replay_counts = collections.Counter({
+      name: 0 for name in sorted(allowed_players)
+  })
+
+  for row in rows:
+    allowed_indices = row.get('allowed_main_player_indices')
+    if allowed_indices is None:
+      continue
+    raw = row.get('raw')
+    for i in allowed_indices:
+      player = row['players'][i]
+      code = nametags.name_from_metadata(player, raw=raw)
+      name = nametags.normalize_name(code)
+      replay_counts[name] += 1
+
+  print("")
+  print("Selected player replay counts:")
+  for name, count in replay_counts.items():
+    print(f"{name}: {count}")
+
+
 def build_meta(
     root: str | os.PathLike[str],
     *,
     doubles_only: Optional[bool] = None,
     winner_only: Optional[bool] = None,
     make_tar: Optional[bool] = None,
+    allowed_players_file: Optional[str] = None,
     allowed_players: Optional[Dict[str, Optional[Iterable[Character]]]] = None,
     quiet: bool = False,
 ) -> list[dict]:
@@ -154,19 +262,36 @@ def build_meta(
   winner_only = WINNER_ONLY.value if winner_only is None else winner_only
   make_tar = MAKE_TAR.value if make_tar is None else make_tar
 
+  if allowed_players_file is None:
+    allowed_players_file = ALLOWED_PLAYERS_FILE.value
+
+  file_allowed_players = _load_allowed_players_file(allowed_players_file)
   allowed_players = _normalize_allowed_players(allowed_players)
-  if allowed_players is None and hasattr(nametags, 'ALLOWED_PLAYERS'):
+  if file_allowed_players is not None:
+    allowed_players = file_allowed_players
+  elif allowed_players is None and hasattr(nametags, 'ALLOWED_PLAYERS'):
     allowed_players = _normalize_allowed_players(nametags.ALLOWED_PLAYERS)
 
   total_rows = len(rows)
-  rows = [
-      row for row in rows
-      if is_valid_replay(
+  filtered_rows: list[dict] = []
+  for row in rows:
+    if not is_valid_replay(
+        row,
+        doubles_only=doubles_only,
+        allowed_players=allowed_players,
+    ):
+      continue
+
+    row = dict(row)
+    if allowed_players is None:
+      row.pop('allowed_main_player_indices', None)
+    else:
+      row['allowed_main_player_indices'] = _matching_allowed_player_indices(
           row,
-          doubles_only=doubles_only,
           allowed_players=allowed_players,
       )
-  ]
+    filtered_rows.append(row)
+  rows = filtered_rows
 
   if not quiet:
     print(f"Found {total_rows} replays.")
@@ -183,9 +308,15 @@ def build_meta(
     print(f"Doubles games: {doubles_games}, Singles games: {singles_games}")
 
   if not quiet:
-    _summarize(rows)
-    if not doubles_only:
-      _summarize_singles(rows)
+    if allowed_players is not None:
+      _summarize_rows(rows, only_allowed_main_players=True)
+      if not doubles_only:
+        _summarize_singles_rows(rows, only_allowed_main_players=True)
+      _summarize_selected_players(rows, allowed_players=allowed_players)
+    else:
+      _summarize(rows)
+      if not doubles_only:
+        _summarize_singles(rows)
 
   tar = None
   if make_tar:
