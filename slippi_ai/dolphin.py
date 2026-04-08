@@ -13,6 +13,8 @@ import portpicker
 import melee
 from melee.console import get_dolphin_version, DumpConfig, DolphinBuild
 
+from slippi_ai import instant_match as instant_match_lib
+
 class Player(abc.ABC):
 
   @abc.abstractmethod
@@ -125,10 +127,14 @@ class Dolphin:
       desired_teams: Mapping[int, int] = {},
       existing_dolphin: bool = False,
       starting_stocks: int = 0,
+      instant_match: bool = False,
+      instant_match_character_pool: Optional[list[str]] = None,
+      instant_match_stage_pool: Optional[list[str]] = None,
       **console_kwargs,
   ) -> None:
     self._players = players
     self._stage = stage
+    self._instant_match_config: Optional[instant_match_lib.InstantMatchConfig] = None
 
     platform = None
     version = get_dolphin_version(path)
@@ -164,7 +170,18 @@ class Dolphin:
     self.menu_helper = melee.MenuHelper(is_singles=len(players) == 2, remote_players=remote_players)
     if starting_stocks and console_kwargs.get('infinite_time', False):
       raise ValueError('starting_stocks is incompatible with infinite_time=True.')
+    if instant_match:
+      if existing_dolphin:
+        raise ValueError('instant_match requires launching a fresh Dolphin instance.')
+      self._instant_match_config = instant_match_lib.resolve_config(
+          players=players,
+          stage=stage,
+          character_pool=instant_match_character_pool,
+          stage_pool=instant_match_stage_pool,
+          starting_stocks=starting_stocks,
+      )
 
+    console_starting_stocks = starting_stocks
     console = melee.Console(
         path=path,
         online_delay=online_delay,
@@ -175,10 +192,18 @@ class Dolphin:
         copy_home_directory=False,
         setup_gecko_codes=True,
         save_replays=save_replays,
-        slippi_starting_stocks=starting_stocks,
+        slippi_starting_stocks=console_starting_stocks,
         **console_kwargs,
     )
     _enable_gecko_cheats(console)
+    if self._instant_match_config is not None:
+      instant_match_lib.inject_gecko_codes(console, self._instant_match_config)
+      logging.info(
+          'Enabled instant_match with chars=%s stages=%s stocks=%d',
+          [c.name for c in self._instant_match_config.character_pool],
+          [s.name for s in self._instant_match_config.stage_pool],
+          self._instant_match_config.starting_stocks,
+      )
     atexit.register(console.stop)
     self.console = console
 
@@ -189,7 +214,6 @@ class Dolphin:
     self._teams_connect_code = teams_connect_code
     self._desired_teams = desired_teams
     self._prev_menu_state = False
-
     for port, player in players.items():
       controller = melee.Controller(
           console, port, player.controller_type())
@@ -243,10 +267,19 @@ class Dolphin:
         if isinstance(player, AI):
           self.menu_helper.done_selecting_character[port] = False
 
+      if self._instant_match_config is not None:
+        self._stage = self._instant_match_config.choose_initial_stage()
+
       new_characters = []
       for i, (controller, player) in enumerate(self._menuing_controllers):
         if isinstance(player, AI):
-          player.shuffle_character()
+          if (self._instant_match_config is not None and
+              self._instant_match_config.character_pool):
+            player.character = self._instant_match_config.choose_initial_character()
+            if isinstance(player, ScheduledAI):
+              player._next_character = None
+          else:
+            player.shuffle_character()
           new_characters.append(player.character)
       logging.debug(
           "Shuffled characters for next game on port %s: %s",
@@ -314,9 +347,10 @@ class Dolphin:
       yield gamestate
 
   def stop(self):
-    for controller in self.controllers.values():
+    for controller in getattr(self, 'controllers', {}).values():
       controller.disconnect()
-    self.console.stop()
+    if hasattr(self, 'console'):
+      self.console.stop()
 
   def __del__(self):
     self.stop()
@@ -347,6 +381,9 @@ class DolphinConfig:
   emulation_speed: float = 1.0  # Set to 0 for unlimited speed. Mainline only.
   infinite_time: bool = True  # Infinite time no stocks.
   starting_stocks: int = 0  # Set >0 to override starting stocks on supported Ishiiruka builds.
+  instant_match: bool = False  # Reload local VS instantly and randomize future matches via Gecko.
+  instant_match_character_pool: list[str] = dataclasses.field(default_factory=list)
+  instant_match_stage_pool: list[str] = dataclasses.field(default_factory=list)
   log_level: int = 3  # WARN; 0 to disable
   log_types: list[str] = dataclasses.field(default_factory=['SLIPPI'].copy)
   dump: DumpConfig = _field(DumpConfig)  # For framedumping.
@@ -388,6 +425,11 @@ DOLPHIN_FLAGS = dict(
     emulation_speed=ff.Float(1.0),
     infinite_time=ff.Boolean(False, 'Infinite time no stocks.'),
     starting_stocks=ff.Integer(0, 'Set >0 to override starting stocks on supported Ishiiruka builds.'),
+    instant_match=ff.Boolean(False, 'Instantly reload local VS matches and randomize rematches via Gecko.'),
+    instant_match_character_pool=ff.StringList(
+        [], 'Character pool for instant_match, e.g. fox,falco,marth,sheik.'),
+    instant_match_stage_pool=ff.StringList(
+        [], 'Stage pool for instant_match, e.g. battlefield,final_destination,yoshis_story.'),
     log_level=ff.Integer(3, 'Dolphin log level, defaults to WARN.'),
     log_types=ff.StringList(['SLIPPI'], 'Enabled logging categories.'),
     disable_audio=ff.Boolean(False, 'Disable dolphin audio.'),

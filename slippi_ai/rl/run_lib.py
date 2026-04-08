@@ -1204,6 +1204,10 @@ def run(config: Config):
         ['{k}: {v:.3f}'.format(k=k, v=v) for k, v in timings.items()])
     logging.info(timing_str)
 
+    unexpected_reset = metrics.get('unexpected_reset')
+    if unexpected_reset is not None:
+      logging.info(f'unexpected_reset: {unexpected_reset}')
+
     ko_diff = metrics.get('ko_diff')
     if ko_diff is not None:
       logging.info(f'KO_diff_per_minute: {ko_diff:.3f}')
