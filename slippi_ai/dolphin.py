@@ -121,6 +121,7 @@ class Dolphin:
       save_replays=False,  # Override default in Console
       env_vars: Optional[dict] = None,
       headless: bool = False,
+      custom_headless: bool = False,
       render: Optional[bool] = None,  # Render even when running headless.
       connect_code: Optional[str] = None,
       teams_connect_code: Optional[str] = None,
@@ -142,7 +143,7 @@ class Dolphin:
     if render is None:
       render = not headless
 
-    if not render:
+    if not render and not custom_headless:
       console_kwargs.update(gfx_backend='Null')
 
     if headless:
@@ -158,6 +159,10 @@ class Dolphin:
             use_exi_inputs=True,
             enable_ffw=True,
         )
+      elif custom_headless:
+        logging.info(
+            'Allowing custom headless Dolphin build: %s (%s)',
+            path, version)
       elif not version.mainline:
         raise ValueError(
             'Headless requires mainline dolphin or a custom dolphin build. '
@@ -378,6 +383,7 @@ class DolphinConfig:
   gfx_backend: str = ''  # Graphics backend to use.
   disable_audio: bool = False  # Disable dolphin audio.
   headless: bool = True  # Headless configuration: exi + ffw, no graphics or audio.
+  custom_headless: bool = False  # Allow non-mainline custom Ishiiruka headless builds.
   emulation_speed: float = 1.0  # Set to 0 for unlimited speed. Mainline only.
   infinite_time: bool = True  # Infinite time no stocks.
   starting_stocks: int = 0  # Set >0 to override starting stocks on supported Ishiiruka builds.
@@ -422,6 +428,8 @@ DOLPHIN_FLAGS = dict(
     replay_dir=ff.String(None, 'Directory to save replays to.'),
     headless=ff.Boolean(
         False, 'Headless configuration: exi + ffw, no graphics or audio.'),
+    custom_headless=ff.Boolean(
+        False, 'Allow non-mainline custom Ishiiruka headless builds.'),
     emulation_speed=ff.Float(1.0),
     infinite_time=ff.Boolean(False, 'Infinite time no stocks.'),
     starting_stocks=ff.Integer(0, 'Set >0 to override starting stocks on supported Ishiiruka builds.'),
