@@ -5,9 +5,8 @@ import datetime
 import json
 import logging
 import os
-import time
+import queue
 import threading
-import collections
 from typing import Optional, Dict, List, Tuple, Any
 
 from absl import app, flags
@@ -15,13 +14,14 @@ import fancyflags as ff
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+import numpy as np
 import portpicker
 import ray
 
-from slippi_ai import train_lib
-from slippi_ai import flag_utils, eval_lib, types, utils
+from slippi_ai import flag_utils, eval_lib, utils
 from slippi_ai import dolphin as dolphin_lib
-from slippi_db.parse_libmelee import get_controller
+from slippi_ai.controller_lib import send_controller
+from slippi_db.parse_libmelee import get_game
 from melee.enums import Character
 import melee
 
@@ -51,7 +51,7 @@ MODELS_PATH = flags.DEFINE_string('models', 'discordbot/models', 'Path to models
 # Serves as the default agent people play against
 agent_flags = eval_lib.AGENT_FLAGS.copy()
 agent_flags.update(
-    async_inference=ff.Boolean(True),
+    async_inference=ff.Boolean(False),
     jit_compile=ff.Boolean(False),
 )
 AGENT = ff.DEFINE_dict('agent', **agent_flags)
@@ -62,202 +62,387 @@ MENU_TIMEOUT = flags.DEFINE_float(
 MAX_SESSIONS = flags.DEFINE_integer(
     'max_sessions', 4, 'Maximum number of concurrent sessions')
 
-class AgentInstance:
-    """Manages a single agent instance with its own Dolphin."""
+@dataclasses.dataclass
+class BotSpec:
+    """Configuration for one local bot inside a Discord session."""
+
+    logical_port: int
+    team_color: int
+    character: Optional[Character]
+    user_json_path: Optional[str] = None
+
+class DoublesSession:
+    """Session actor that owns all local bots and one fused inference worker."""
 
     def __init__(
         self,
         dolphin_config: dolphin_lib.DolphinConfig,
         agent_kwargs: dict,
-        team_color: int,  # 0=red, 1=blue, 2=green
-        character: Character = None,  # Add character parameter
-        extra_dolphin_kwargs: dict = {},
+        connect_code: str,
+        bot_specs: List[BotSpec],
     ):
         eval_lib.disable_gpus()
         self.dolphin_config = dolphin_config
+        self.agent_kwargs = agent_kwargs
+        self.connect_code = connect_code
+        self.bot_specs = list(bot_specs)
+
         self.stop_requested = threading.Event()
-        self.team_color = team_color
-        
-        # Extract playstyle from agent_kwargs
-        self.playstyle = agent_kwargs.get('name')
-
-        with open(dolphin_config.user_json_path) as f:
-            user_json = json.load(f)
-            self.bot_code = user_json['connectCode']
-
-        # Log the dolphin config to debug
-        logging.info(f"AgentInstance init with config: headless={dolphin_config.headless}, render={dolphin_config.render}, teams_connect_code={dolphin_config.teams_connect_code}, team_color={team_color}")
-        logging.info(f"Using playstyle: {self.playstyle}")
-
-        dolphin_kwargs = dolphin_config.to_kwargs()
-        # Make sure these values are explicitly set in the kwargs
-        dolphin_kwargs['headless'] = dolphin_config.headless
-        dolphin_kwargs['render'] = dolphin_config.render
-        # Ensure teams_connect_code is passed to Dolphin
-        if hasattr(dolphin_config, 'teams_connect_code') and dolphin_config.teams_connect_code:
-            dolphin_kwargs['teams_connect_code'] = dolphin_config.teams_connect_code
-            
-        dolphin_kwargs.update(extra_dolphin_kwargs)
-
-        # Log the final dolphin kwargs
-        logging.info(f"Final dolphin kwargs: {dolphin_kwargs}")
-
-        player = dolphin_lib.AI()
-        
-        # Set the character if provided
-        if character is not None:
-            player.character = character
-            logging.info(f"Setting character to {character.name}")
-        
-        dolphin = dolphin_lib.Dolphin(
-            players={1: player},
-            desired_teams={1: team_color},
-            **dolphin_kwargs,
-        )
-
-        # Set initial opponent port to None, will be determined during gameplay
-        # Check if the Dolphin object has controllers attribute, otherwise try alternate approach
-        controller = dolphin.controllers[1]
-
-        logging.info("agent kwargs: %s", agent_kwargs)
-        print("agent kwargs: %s", agent_kwargs)
-
-        agent = eval_lib.build_agent(
-            console_delay=15,
-            controller=controller,
-            opponent_port=None,
-            run_on_cpu=True,
-            **agent_kwargs,
-        )
-
-        eval_lib.update_character(player, agent.config)
-
+        self._lock = threading.RLock()
+        self._dolphins_lock = threading.RLock()
+        self._thread: Optional[threading.Thread] = None
+        self._reader_threads: Dict[int, threading.Thread] = {}
         self._num_menu_frames = 0
-        self._thread = None
-        self._dolphin = dolphin
-        self._agent = agent
-        self._player = player
+        self._last_error: Optional[str] = None
 
-    def start(self):
-        """Start the agent thread."""
-        def run_agent(agent: eval_lib.Agent, 
-                      dolphin: dolphin_lib.Dolphin):
-            def set_player_ports(gamestate: melee.GameState):
-                code_to_port = {
-                    player.connectCode: port for port, player in gamestate.players.items()
-                }
-
-                print("code_to_port: ", code_to_port)
-                my_port = code_to_port[self.bot_code]
-                teammate_port = 1
-                for port, player in gamestate.players.items():
-                    if port == my_port:
-                        continue
-                    if player.team_id == gamestate.players[my_port].team_id:
-                        teammate_port = port
-                        break
-                agent.players = (int(my_port), int(teammate_port))
-                agent.players += tuple(p for p in (1, 2, 3, 4) if p not in agent.players)
-                agent.teammate_port = teammate_port
-
-            self._num_menu_frames = 0
-
-            # Don't block in the menu so that we can stop if asked to.
-            gamestates = dolphin.iter_gamestates(skip_menu_frames=False)
-
-            # This gets us through the menus and into the first frame of the actual game
-            for gamestate in gamestates:
-                if self.stop_requested.is_set():
-                    dolphin.stop()
-                    return
-
-                if not dolphin_lib.is_menu_state(gamestate):
-                    self._num_menu_frames = 0
-                    break
-
-                self._num_menu_frames += 1
-
-            set_player_ports(gamestate)
-
-            # Main loop
-            agent.start()
-
-            try:
-                while not self.stop_requested.is_set():
-                    gamestate = next(gamestates)
-                    if gamestate.frame == -123:
-                        set_player_ports(gamestate)
-                        print("starting game with ports: ", agent.players, "teammate port: ", agent.teammate_port)
-
-                    if not dolphin_lib.is_menu_state(gamestate):
-                        agent.step(gamestate)
-                        self._num_menu_frames = 0
-                    else:
-                        self._num_menu_frames += 1
-
-            finally:
-                agent.stop()
-                dolphin.stop()
+        self._state: Optional[dict] = None
+        self._agent = None
+        self._dolphins: Dict[int, dolphin_lib.Dolphin] = {}
+        self._players: Dict[int, dolphin_lib.AI] = {}
+        self._controllers: Dict[int, melee.Controller] = {}
+        self._stopped_dolphins: set[int] = set()
+        self._bot_codes: Dict[int, str] = {}
+        self._player_orders: Dict[int, Tuple[int, ...]] = {}
+        self._teammate_ports: Dict[int, int] = {}
+        self._dead_frames: Dict[int, int] = {spec.logical_port: 0 for spec in self.bot_specs}
+        self._pressed_start: Dict[int, bool] = {spec.logical_port: False for spec in self.bot_specs}
         
-        self._thread = threading.Thread(target=run_agent, args=(self._agent, self._dolphin))
-        self._thread.start()
-
     def num_menu_frames(self) -> int:
         return self._num_menu_frames
 
     def status(self) -> dict:
         return {
-            'num_menu_frames': self._num_menu_frames,
             'is_alive': self._thread.is_alive() if self._thread else False,
-        }
-
-    def stop(self):
-        if self._thread:
-            self.stop_requested.set()
-            self._thread.join()
-
-RemoteAgentInstance = ray.remote(AgentInstance)
-
-class DoublesSession:
-    """Session for doubles matches with 1-2 AI agents."""
-
-    def __init__(
-        self,
-        agents: Dict[int, AgentInstance],  # port -> AgentInstance
-    ):
-        self.agents = agents
-        
-    def num_menu_frames(self) -> int:
-        """Return the maximum number of menu frames across all agents."""
-        frames = [agent.num_menu_frames.remote() for agent in self.agents.values()]
-        if frames:
-            frames_values = ray.get(frames)
-            return max(frames_values)
-        return 0
-
-    def status(self) -> dict:
-        """Return the combined status of all agents."""
-        # Fix: use .remote() for Ray actor method calls
-        agent_status_refs = {port: agent.status.remote() for port, agent in self.agents.items()}
-        agent_statuses = {port: ray.get(status_ref) for port, status_ref in agent_status_refs.items()}
-        all_alive = all(status['is_alive'] for status in agent_statuses.values())
-        max_menu_frames = max([status['num_menu_frames'] for status in agent_statuses.values()], default=0)
-        
-        return {
-            'agent_statuses': agent_statuses,
-            'is_alive': all_alive,
-            'num_menu_frames': max_menu_frames,
+            'num_menu_frames': self._num_menu_frames,
+            'last_error': self._last_error,
         }
 
     def start(self):
-        """Start all agents."""
-        for port, agent in self.agents.items():
-            agent.start.remote()  # Ray actor reference
+        with self._lock:
+            if self._thread is not None:
+                raise RuntimeError("DoublesSession is already started.")
+
+            try:
+                self._load_state_and_agent()
+                self._start_dolphins()
+                self._agent.start()
+
+                self._thread = threading.Thread(
+                    target=self._run_loop,
+                    name=f"DiscordDoublesSession-{self.connect_code}",
+                    daemon=True,
+                )
+                self._thread.start()
+            except Exception:
+                if self._agent is not None:
+                    self._agent.stop()
+                    self._agent = None
+                self._stop_dolphins()
+                raise
 
     def stop(self):
-        """Stop all agents."""
-        for port, agent in self.agents.items():
-            agent.stop.remote()  # Ray actor reference
+        self.stop_requested.set()
+        self._stop_dolphins(clear=False)
+
+        thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=10)
+
+        if self._agent is not None:
+            self._agent.stop()
+            self._agent = None
+
+    def _load_state_and_agent(self):
+        agent_kwargs = self.agent_kwargs.copy()
+        path = agent_kwargs.pop('path', None)
+        tag = agent_kwargs.pop('tag', None)
+        name_change_mode = agent_kwargs.pop(
+            'name_change_mode', eval_lib.NameChangeMode.FIXED)
+        if name_change_mode != eval_lib.NameChangeMode.FIXED:
+            logging.warning(
+                "Discord fused sessions currently use a fixed agent name; got %s",
+                name_change_mode)
+        async_inference = agent_kwargs.pop('async_inference', False)
+        if async_inference:
+            logging.info(
+                "Ignoring --agent.async_inference=True for Discord fused sessions; "
+                "the Ray session actor is the single inference worker.")
+
+        self._state = eval_lib.load_state(path=path, tag=tag)
+        self._agent = eval_lib.build_delayed_agent(
+            state=self._state,
+            batch_size=len(self.bot_specs),
+            console_delay=self.dolphin_config.online_delay,
+            run_on_cpu=True,
+            async_inference=False,
+            **agent_kwargs,
+        )
+        if self._agent.batch_steps > self._agent.delay + 1:
+            raise ValueError(
+                f"agent.batch_steps={self._agent.batch_steps} exceeds delay slack "
+                f"for policy delay={self._agent.delay} after console delay.")
+
+    def _start_dolphins(self):
+        for index, spec in enumerate(self.bot_specs):
+            config = self._dolphin_config_for_spec(spec, save_replays=(index == 0))
+            with open(config.user_json_path) as f:
+                self._bot_codes[spec.logical_port] = json.load(f)['connectCode']
+
+            player = dolphin_lib.AI()
+            if spec.character is not None:
+                player.character = spec.character
+            eval_lib.update_character(player, self._state['config'])
+
+            dolphin_kwargs = config.to_kwargs()
+            dolphin_kwargs['headless'] = config.headless
+            dolphin_kwargs['render'] = config.render
+
+            logging.info(
+                "Launching Discord bot Dolphin logical_port=%s save_replays=%s "
+                "user_json=%s slippi_port=%s team=%s",
+                spec.logical_port, config.save_replays, config.user_json_path,
+                config.slippi_port, spec.team_color)
+            dolphin = dolphin_lib.Dolphin(
+                players={1: player},
+                desired_teams={1: spec.team_color},
+                **dolphin_kwargs,
+            )
+            log_path = os.path.join(
+                dolphin.console._get_dolphin_home_path(), 'Logs', 'dolphin.log')
+            logging.info(
+                "Started Discord bot Dolphin logical_port=%s temp_dir=%s log=%s",
+                spec.logical_port, dolphin.console.temp_dir, log_path)
+
+            self._players[spec.logical_port] = player
+            self._dolphins[spec.logical_port] = dolphin
+            self._controllers[spec.logical_port] = dolphin.controllers[1]
+
+    def _dolphin_config_for_spec(
+        self,
+        spec: BotSpec,
+        save_replays: bool,
+    ) -> dolphin_lib.DolphinConfig:
+        config = dataclasses.replace(self.dolphin_config)
+        config.slippi_port = portpicker.pick_unused_port()
+        config.connect_code = self.connect_code
+        config.teams_connect_code = self.connect_code
+        config.save_replays = save_replays
+        if spec.user_json_path:
+            config.user_json_path = spec.user_json_path
+        return config
+
+    def _run_loop(self):
+        gamestate_queues: Dict[int, queue.Queue] = {
+            logical_port: queue.Queue(maxsize=1)
+            for logical_port in self._dolphins
+        }
+        advance_events: Dict[int, threading.Event] = {
+            logical_port: threading.Event()
+            for logical_port in self._dolphins
+        }
+
+        def read_gamestates(logical_port: int, dolphin: dolphin_lib.Dolphin):
+            try:
+                for gamestate in dolphin.iter_gamestates(skip_menu_frames=False):
+                    if self.stop_requested.is_set():
+                        return
+                    while not self.stop_requested.is_set():
+                        try:
+                            gamestate_queues[logical_port].put(gamestate, timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
+                    advance_event = advance_events[logical_port]
+                    while (
+                        not self.stop_requested.is_set() and
+                        not advance_event.wait(timeout=0.5)
+                    ):
+                        pass
+                    advance_event.clear()
+            except Exception as exc:
+                if not self.stop_requested.is_set():
+                    logging.exception(
+                        "Discord bot Dolphin reader crashed for logical_port=%s",
+                        logical_port)
+                    gamestate_queues[logical_port].put(exc)
+
+        self._reader_threads = {
+            logical_port: threading.Thread(
+                target=read_gamestates,
+                args=(logical_port, dolphin),
+                name=f"DiscordDolphinReader-{logical_port}",
+                daemon=True,
+            )
+            for logical_port, dolphin in self._dolphins.items()
+        }
+        for thread in self._reader_threads.values():
+            thread.start()
+
+        try:
+            while not self.stop_requested.is_set():
+                current = {}
+                for logical_port, gamestate_queue in gamestate_queues.items():
+                    while not self.stop_requested.is_set():
+                        try:
+                            item = gamestate_queue.get(timeout=0.5)
+                            break
+                        except queue.Empty:
+                            continue
+                    if self.stop_requested.is_set():
+                        return
+                    if isinstance(item, Exception):
+                        raise item
+                    current[logical_port] = item
+
+                if any(dolphin_lib.is_menu_state(gs) for gs in current.values()):
+                    self._num_menu_frames += 1
+                    for event in advance_events.values():
+                        event.set()
+                    continue
+
+                self._num_menu_frames = 0
+                games = []
+                needs_reset = []
+                ordered_ports = [spec.logical_port for spec in self.bot_specs]
+
+                for logical_port in ordered_ports:
+                    gamestate = current[logical_port]
+                    new_game = gamestate.frame == -123
+                    if new_game or logical_port not in self._player_orders:
+                        self._set_player_ports(logical_port, gamestate)
+                    game = get_game(gamestate, ports=self._player_orders[logical_port])
+                    games.append(utils.map_nt(lambda x: np.expand_dims(x, 0), game))
+                    needs_reset.append(new_game)
+
+                batched_game = utils.map_nt(
+                    lambda *xs: np.concatenate(xs, axis=0), *games)
+                sample_outputs = self._agent.step(
+                    batched_game,
+                    np.array(needs_reset, dtype=np.bool_),
+                )
+                decoded = self._agent.embed_controller.decode(
+                    sample_outputs.controller_state)
+
+                for index, logical_port in enumerate(ordered_ports):
+                    controller = self._controllers[logical_port]
+                    game = games[index]
+                    gamestate = current[logical_port]
+                    if self._is_game_over(game, gamestate):
+                        controller.release_all()
+                        continue
+
+                    action = utils.map_single_structure(lambda x: x[index], decoded)
+                    send_controller(controller, action)
+                    self._maybe_stock_steal(logical_port, game, gamestate, controller)
+
+                for event in advance_events.values():
+                    event.set()
+
+        except Exception as exc:
+            if not self.stop_requested.is_set():
+                self._last_error = str(exc)
+                logging.exception("Discord fused session crashed")
+        finally:
+            if self._agent is not None:
+                self._agent.stop()
+                self._agent = None
+            self._stop_dolphins()
+            for thread in self._reader_threads.values():
+                if thread.is_alive():
+                    thread.join(timeout=2)
+
+    def _set_player_ports(self, logical_port: int, gamestate: melee.GameState):
+        my_port = getattr(gamestate, 'local_player_port', None)
+        if my_port not in gamestate.players:
+            bot_code = self._bot_codes[logical_port]
+            matching_ports = [
+                port for port, player in gamestate.players.items()
+                if player.connectCode == bot_code
+            ]
+            if len(matching_ports) != 1:
+                raise RuntimeError(
+                    f"Could not uniquely identify bot port for {bot_code}: "
+                    f"{matching_ports}")
+            my_port = matching_ports[0]
+
+        teammate_port = my_port
+        for port, player in gamestate.players.items():
+            if port == my_port:
+                continue
+            if player.team_id == gamestate.players[my_port].team_id:
+                teammate_port = port
+                break
+
+        player_order = (int(my_port), int(teammate_port))
+        player_order += tuple(p for p in (1, 2, 3, 4) if p not in player_order)
+        self._player_orders[logical_port] = player_order
+        self._teammate_ports[logical_port] = int(teammate_port)
+        logging.info(
+            "Discord bot logical_port=%s local_player_port=%s teammate_port=%s "
+            "player_order=%s",
+            logical_port, my_port, teammate_port, player_order)
+
+    def _maybe_stock_steal(
+        self,
+        logical_port: int,
+        game,
+        gamestate: melee.GameState,
+        controller: melee.Controller,
+    ):
+        teammate_port = self._teammate_ports.get(logical_port)
+        if self._as_bool(game.p0.is_dead):
+            self._dead_frames[logical_port] += 1
+            teammate_has_stock = (
+                teammate_port in gamestate.players and
+                gamestate.players[teammate_port].stock > 1
+            )
+            if (
+                not self._pressed_start[logical_port] and
+                self._dead_frames[logical_port] >= 120 and
+                teammate_has_stock
+            ):
+                logging.info(
+                    "logical_port=%s p0 is dead, stock stealing from %s",
+                    logical_port, teammate_port)
+                controller.press_button(melee.Button.BUTTON_START)
+                self._pressed_start[logical_port] = True
+            elif self._pressed_start[logical_port]:
+                controller.release_button(melee.Button.BUTTON_START)
+                self._pressed_start[logical_port] = False
+        else:
+            self._dead_frames[logical_port] = 0
+
+    def _is_game_over(self, game, gamestate: melee.GameState) -> bool:
+        left_team_out = (
+            self._as_bool(game.p0.stocks_left == 0) and
+            self._as_bool(game.p1.stocks_left == 0)
+        )
+        right_team_out = (
+            self._as_bool(game.p2.stocks_left == 0) and
+            self._as_bool(game.p3.stocks_left == 0)
+        )
+        return left_team_out or right_team_out or gamestate.frame >= 28799
+
+    def _as_bool(self, value) -> bool:
+        return bool(np.asarray(value).reshape(-1)[0])
+
+    def _stop_dolphins(self, clear: bool = True):
+        with self._dolphins_lock:
+            dolphins = list(self._dolphins.items())
+        for logical_port, dolphin in dolphins:
+            with self._dolphins_lock:
+                if logical_port in self._stopped_dolphins:
+                    continue
+                self._stopped_dolphins.add(logical_port)
+            try:
+                dolphin.stop()
+            except Exception:
+                if not self.stop_requested.is_set():
+                    logging.exception("Failed to stop Discord bot Dolphin")
+        if clear:
+            with self._dolphins_lock:
+                self._dolphins.clear()
+                self._controllers.clear()
             
 
 RemoteDoublesSession = ray.remote(DoublesSession)
@@ -271,7 +456,6 @@ class SessionInfo:
     connect_code: str
     agents: Dict[int, str]  # port -> agent name
     team_colors: Dict[int, int]  # port -> team color
-    personalities: Dict[int, str] = dataclasses.field(default_factory=dict)  # port -> playstyle name
 
 def format_td(td: datetime.timedelta) -> str:
     """Chop off microseconds."""
@@ -359,22 +543,6 @@ def get_valid_character_choices():
         choices.append(app_commands.Choice(name=display_name, value=char.name))
     
     return choices
-
-def get_valid_playstyle_choices():
-    """Return a list of playstyle choices for the Discord API."""
-    personalities = [
-        "Master Player",
-        "Ralph",
-        "Darkatma",
-        "Dragunov",
-        "Tempo",
-        "xRunRiot",
-        "Cody",
-        "Ginger",
-        "Buddyboom",
-    ]
-    
-    return [app_commands.Choice(name=p, value=p) for p in personalities]
 
 # Custom command tree that restricts commands to specific channels
 class ChannelRestrictedCommandTree(app_commands.CommandTree):
@@ -588,8 +756,7 @@ class DiscordBot(commands.Bot):
         @app_commands.describe(
             connect_code="Your Slippi lobby code (no # needed)",
             team_color="Team color for the AI agent",
-            character="Character for the AI to play",
-            playstyle="Playstyle for the AI agent"
+            character="Character for the AI to play"
         )
         @app_commands.choices(team_color=[
             app_commands.Choice(name="Red", value="red"),
@@ -597,13 +764,11 @@ class DiscordBot(commands.Bot):
             app_commands.Choice(name="Green", value="green"),
         ])
         @app_commands.choices(character=get_valid_character_choices())
-        @app_commands.choices(playstyle=get_valid_playstyle_choices())
         async def play_command(
             interaction: discord.Interaction, 
             connect_code: str,
             character: str, 
             team_color: str = "red",
-            playstyle: str = "Master Player",
         ):
             with self.lock:
                 user_id = interaction.user.id
@@ -655,7 +820,7 @@ class DiscordBot(commands.Bot):
                     char_display = "Fox"
                 
                 agent_name = self._get_opponent(user_id)
-                message = f"Connecting to {interaction.user.name} ({connect_code}) with agent {agent_name} on port {port} with team color {team_color} playing {char_display} using playstyle: {playstyle}"
+                message = f"Connecting to {interaction.user.name} ({connect_code}) with agent {agent_name} on port {port} with team color {team_color} playing {char_display}"
                 logging.info(message)
                 
                 # Tell the user we're processing
@@ -663,18 +828,19 @@ class DiscordBot(commands.Bot):
 
                 team_colors = {port: team_color_num}
                 
-                # Create and start agent instance
-                agent_instance = self._create_agent_instance(
-                    connect_code, 
-                    team_color_num,
-                    self._get_agent_kwargs(user_id, port, agent_name, playstyle),
-                    character=char_enum,
-                    user_json_path='./bot3-user.json'
+                bot_specs = [
+                    BotSpec(
+                        logical_port=port,
+                        team_color=team_color_num,
+                        character=char_enum,
+                        user_json_path=self.dolphin_config.user_json_path3,
+                    ),
+                ]
+                session = self._start_session(
+                    connect_code=connect_code,
+                    agent_kwargs=self._get_agent_kwargs(user_id, port, agent_name),
+                    bot_specs=bot_specs,
                 )
-                
-                # Create session with single agent
-                agents = {port: agent_instance}
-                session = self._start_session(agents)
                 
                 self._sessions[user_id] = SessionInfo(
                     session=session,
@@ -684,7 +850,6 @@ class DiscordBot(commands.Bot):
                     connect_code=connect_code,
                     agents={port: agent_name},
                     team_colors=team_colors,
-                    personalities={port: playstyle}
                 )
         
         @self.tree.command(name="play2", description="Start a game with two AI agents")
@@ -694,8 +859,6 @@ class DiscordBot(commands.Bot):
             team1="Team color for first agent",
             character2="Character for second agent",
             team2="Team color for second agent",
-            playstyle1="Playstyle for first agent",
-            playstyle2="Playstyle for second agent"
         )
         @app_commands.choices(team1=[
             app_commands.Choice(name="Red", value="red"),
@@ -709,8 +872,6 @@ class DiscordBot(commands.Bot):
         ])
         @app_commands.choices(character1=get_valid_character_choices())
         @app_commands.choices(character2=get_valid_character_choices())
-        @app_commands.choices(playstyle1=get_valid_playstyle_choices())
-        @app_commands.choices(playstyle2=get_valid_playstyle_choices())
         async def play2_command(
             interaction: discord.Interaction, 
             connect_code: str, 
@@ -718,8 +879,6 @@ class DiscordBot(commands.Bot):
             team1: str,
             character2: str,
             team2: str,
-            playstyle1: str = "Master Player",
-            playstyle2: str = "Master Player",
         ):
             with self.lock:
                 user_id = interaction.user.id
@@ -785,32 +944,31 @@ class DiscordBot(commands.Bot):
                 agent2_name = self._get_opponent(user_id, 2)
                 
                 message = f"Connecting to {interaction.user.name} ({connect_code}) with:\n" \
-                         f"- Agent {agent1_name} with team color {team1} playing {char1_display} using playstyle: {playstyle1}\n" \
-                         f"- Agent {agent2_name} with team color {team2} playing {char2_display} using playstyle: {playstyle2}"
+                         f"- Agent {agent1_name} with team color {team1} playing {char1_display}\n" \
+                         f"- Agent {agent2_name} with team color {team2} playing {char2_display}"
                 logging.info(message)
                 
                 # Tell the user we're processing
                 await interaction.response.send_message(message)
 
-                # Create agent instances (each with its own Dolphin)
-                agent1 = self._create_agent_instance(
-                    connect_code,
-                    team1_num,
-                    self._get_agent_kwargs(user_id, 1, agent1_name, playstyle1),  # Pass playstyle1
-                    character=char1_enum
+                bot_specs = [
+                    BotSpec(
+                        logical_port=1,
+                        team_color=team1_num,
+                        character=char1_enum,
+                    ),
+                    BotSpec(
+                        logical_port=2,
+                        team_color=team2_num,
+                        character=char2_enum,
+                        user_json_path=self.dolphin_config.user_json_path2,
+                    ),
+                ]
+                session = self._start_session(
+                    connect_code=connect_code,
+                    agent_kwargs=self._get_agent_kwargs(user_id, 1, agent1_name),
+                    bot_specs=bot_specs,
                 )
-                
-                agent2 = self._create_agent_instance(
-                    connect_code,
-                    team2_num,
-                    self._get_agent_kwargs(user_id, 2, agent2_name, playstyle2),  # Pass playstyle2
-                    character=char2_enum,
-                    is_second_agent=True  # Mark this as the second agent
-                )
-                
-                # Create session with both agents (using logical ports 1 and 2 as keys)
-                agents = {1: agent1, 2: agent2}
-                session = self._start_session(agents)
                 
                 # Store the team colors keyed by logical ports (these are just for display purposes)
                 team_colors = {1: team1_num, 2: team2_num}
@@ -823,7 +981,6 @@ class DiscordBot(commands.Bot):
                     connect_code=connect_code,
                     agents={1: agent1_name, 2: agent2_name},  # Using logical ports as keys
                     team_colors=team_colors,
-                    personalities={1: playstyle1, 2: playstyle2}
                 )
         
         @self.tree.command(name="play3", description="Start a game with three AI agents")
@@ -835,9 +992,6 @@ class DiscordBot(commands.Bot):
             team2="Team color for second agent",
             character3="Character for third agent",
             team3="Team color for third agent",
-            playstyle1="Playstyle for first agent",
-            playstyle2="Playstyle for second agent",
-            playstyle3="Playstyle for third agent"
         )
         @app_commands.choices(team1=[
             app_commands.Choice(name="Red", value="red"),
@@ -857,9 +1011,6 @@ class DiscordBot(commands.Bot):
         @app_commands.choices(character1=get_valid_character_choices())
         @app_commands.choices(character2=get_valid_character_choices())
         @app_commands.choices(character3=get_valid_character_choices())
-        @app_commands.choices(playstyle1=get_valid_playstyle_choices())
-        @app_commands.choices(playstyle2=get_valid_playstyle_choices())
-        @app_commands.choices(playstyle3=get_valid_playstyle_choices())
         async def play3_command(
             interaction: discord.Interaction, 
             connect_code: str, 
@@ -869,9 +1020,6 @@ class DiscordBot(commands.Bot):
             team2: str,
             character3: str,
             team3: str,
-            playstyle1: str = "Master Player",
-            playstyle2: str = "Master Player",
-            playstyle3: str = "Master Player",
         ):
             with self.lock:
                 user_id = interaction.user.id
@@ -951,42 +1099,38 @@ class DiscordBot(commands.Bot):
                 agent3_name = self._get_opponent(user_id, 3)
                 
                 message = f"Connecting to {interaction.user.name} ({connect_code}) with:\n" \
-                         f"- Agent {agent1_name} with team color {team1} playing {char1_display} using playstyle: {playstyle1}\n" \
-                         f"- Agent {agent2_name} with team color {team2} playing {char2_display} using playstyle: {playstyle2}\n" \
-                         f"- Agent {agent3_name} with team color {team3} playing {char3_display} using playstyle: {playstyle3}"
+                         f"- Agent {agent1_name} with team color {team1} playing {char1_display}\n" \
+                         f"- Agent {agent2_name} with team color {team2} playing {char2_display}\n" \
+                         f"- Agent {agent3_name} with team color {team3} playing {char3_display}"
                 logging.info(message)
                 
                 # Tell the user we're processing
                 await interaction.response.send_message(message)
 
-                # Create agent instances (each with its own Dolphin)
-                agent1 = self._create_agent_instance(
-                    connect_code,
-                    team1_num,
-                    self._get_agent_kwargs(user_id, 1, agent1_name, playstyle1),
-                    character=char1_enum
+                bot_specs = [
+                    BotSpec(
+                        logical_port=1,
+                        team_color=team1_num,
+                        character=char1_enum,
+                    ),
+                    BotSpec(
+                        logical_port=2,
+                        team_color=team2_num,
+                        character=char2_enum,
+                        user_json_path=self.dolphin_config.user_json_path2,
+                    ),
+                    BotSpec(
+                        logical_port=3,
+                        team_color=team3_num,
+                        character=char3_enum,
+                        user_json_path=self.dolphin_config.user_json_path3,
+                    ),
+                ]
+                session = self._start_session(
+                    connect_code=connect_code,
+                    agent_kwargs=self._get_agent_kwargs(user_id, 1, agent1_name),
+                    bot_specs=bot_specs,
                 )
-                
-                agent2 = self._create_agent_instance(
-                    connect_code,
-                    team2_num,
-                    self._get_agent_kwargs(user_id, 2, agent2_name, playstyle2),
-                    character=char2_enum,
-                    is_second_agent=True
-                )
-                
-                agent3 = self._create_agent_instance(
-                    connect_code,
-                    team3_num,
-                    self._get_agent_kwargs(user_id, 3, agent3_name, playstyle3),
-                    character=char3_enum,
-                    is_second_agent=True,
-                    user_json_path='./bot3-user.json'
-                )
-                
-                # Create session with all three agents (using logical ports 1, 2, and 3 as keys)
-                agents = {1: agent1, 2: agent2, 3: agent3}
-                session = self._start_session(agents)
                 
                 # Store the team colors keyed by logical ports (these are just for display purposes)
                 team_colors = {1: team1_num, 2: team2_num, 3: team3_num}
@@ -999,7 +1143,6 @@ class DiscordBot(commands.Bot):
                     connect_code=connect_code,
                     agents={1: agent1_name, 2: agent2_name, 3: agent3_name},
                     team_colors=team_colors,
-                    personalities={1: playstyle1, 2: playstyle2, 3: playstyle3}
                 )
         
         # Status command
@@ -1027,8 +1170,7 @@ class DiscordBot(commands.Bot):
                     for port, agent in session_info.agents.items():
                         team = session_info.team_colors.get(port, 0)
                         team_name = ["Red", "Blue", "Green"][team]
-                        playstyle = session_info.personalities.get(port, "Master Player")
-                        agents_info.append(f"Port {port}: {agent} (Team {team_name}, Playstyle: {playstyle})")
+                        agents_info.append(f"Port {port}: {agent} (Team {team_name})")
                     
                     agents_text = "\n".join(agents_info)
                     
@@ -1085,68 +1227,25 @@ class DiscordBot(commands.Bot):
             return self._requested_agents[user_id]
         return self._default_agent_name
 
-    def _get_agent_kwargs(self, user_id: int, port: int, agent_name: str, playstyle: str = "Master Player") -> dict:
+    def _get_agent_kwargs(self, user_id: int, port: int, agent_name: str) -> dict:
         """Get agent kwargs for the specified agent"""
         agent_kwargs = self.agent_kwargs.copy()
         agent_kwargs['path'] = os.path.join(self._models_path, agent_name)
-        # Add playstyle information to agent_kwargs
-        agent_kwargs['name'] = playstyle
         return agent_kwargs
 
-    def _create_agent_instance(
+    def _start_session(
         self,
         connect_code: str,
-        team_color: int,
         agent_kwargs: dict,
-        character: Character = None,
-        is_second_agent: bool = False,
-        user_json_path: str = None,
-    ) -> AgentInstance:
-        """Create a new agent instance with its own Dolphin"""
-        # Create a deep copy of the dolphin config
-        config = dataclasses.replace(self.dolphin_config)
-        
-        # Set specific parameters for this instance
-        config.slippi_port = portpicker.pick_unused_port()
-        config.connect_code = connect_code
-        
-        # Make sure teams_connect_code is set from the connect_code
-        # This is critical for doubles mode to work properly
-        config.teams_connect_code = connect_code
-        
-        # For the discordbot, ensure these are explicitly set as needed
-        #config.headless = False  # Ensure we show the Dolphin window
-        
-        # Print the config for debugging
-        logging.info(f"Creating agent with dolphin config: connect_code={connect_code}, teams_connect_code={config.teams_connect_code}, team_color={team_color}")
-        
-        if not is_second_agent:
-            config.save_replays = True
-
-        # Use the second user.json path if this is the second agent and the path is provided
-        if is_second_agent:
-            config.user_json_path = config.user_json_path2
-
-        if user_json_path:
-            config.user_json_path = user_json_path
-        
-        # Explicitly add the teams_connect_code to ensure it's passed through
-        extra_kwargs = {}
-        if hasattr(config, 'teams_connect_code') and config.teams_connect_code:
-            extra_kwargs['teams_connect_code'] = config.teams_connect_code
-            
-        # Get playstyle from agent_kwargs if available
-        playstyle = agent_kwargs.get('name', "Master Player")
-        logging.info(f"Creating agent with playstyle: {playstyle}")
-        
-        # Create and return the remote agent instance
-        return RemoteAgentInstance.remote(
-            config, agent_kwargs, team_color, character, extra_kwargs
+        bot_specs: List[BotSpec],
+    ) -> DoublesSession:
+        """Start one fused doubles session actor for all local bots."""
+        session = RemoteDoublesSession.remote(
+            self.dolphin_config,
+            agent_kwargs,
+            connect_code,
+            bot_specs,
         )
-
-    def _start_session(self, agents: Dict[int, AgentInstance]) -> DoublesSession:
-        """Start a new doubles session with the specified agents"""
-        session = RemoteDoublesSession.remote(agents)
         # Call the remote method and get the result
         ray.get(session.start.remote())
         return session
@@ -1157,7 +1256,7 @@ class DiscordBot(commands.Bot):
             # Create list of tasks and wait for them to complete
             stop_tasks = [info.session.stop.remote() for info in infos]
             if stop_tasks:
-                ray.wait(stop_tasks)
+                ray.get(stop_tasks)
 
             for info in infos:
                 if info.discord_id in self._sessions:

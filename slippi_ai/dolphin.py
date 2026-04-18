@@ -125,6 +125,7 @@ class Dolphin:
       render: Optional[bool] = None,  # Render even when running headless.
       connect_code: Optional[str] = None,
       teams_connect_code: Optional[str] = None,
+      user_json_path3: Optional[str] = None,  # Bot launcher config; not used by a single Dolphin.
       desired_teams: Mapping[int, int] = {},
       existing_dolphin: bool = False,
       starting_stocks: int = 0,
@@ -298,7 +299,7 @@ class Dolphin:
     while is_menu_state(gamestate):
       for i, (controller, player) in enumerate(self._menuing_controllers):
         autostart_enabled = False
-        if self._autostart and menu_frames > 180:
+        if self._autostart and menu_frames > 60:
           if i == 0 or getattr(self.menu_helper, 'stage_selected', False):
             autostart_enabled = True
 
@@ -330,7 +331,7 @@ class Dolphin:
 
         for i, (controller, player) in enumerate(self._menuing_controllers):
           autostart_enabled = False
-          if self._autostart and menu_frames > 180:
+          if self._autostart and menu_frames > 60:
             if i == 0 or getattr(self.menu_helper, 'stage_selected', False):
               autostart_enabled = True
 
@@ -398,8 +399,10 @@ class DolphinConfig:
 
   # For online play
   connect_code: Optional[str] = None
+  teams_connect_code: Optional[str] = None
   user_json_path: Optional[str] = None
   user_json_path2: Optional[str] = None
+  user_json_path3: Optional[str] = None
 
   def to_kwargs(self) -> dict:
     kwargs = dataclasses.asdict(self)

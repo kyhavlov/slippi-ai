@@ -75,11 +75,17 @@ def run_agent(agent: eval_lib.Agent,
   gamestate = dolphin.step()
 
   def set_player_ports(gamestate):
-    code_to_port = {
-        player.connectCode: port for port, player in gamestate.players.items()
-    }
-
-    actual_port = code_to_port[connect_code]
+    actual_port = getattr(gamestate, 'local_player_port', None)
+    if actual_port not in gamestate.players:
+      matching_ports = [
+          port for port, player in gamestate.players.items()
+          if player.connectCode == connect_code
+      ]
+      if len(matching_ports) != 1:
+        raise RuntimeError(
+            f"Could not uniquely identify bot port for {connect_code}: "
+            f"{matching_ports}")
+      actual_port = matching_ports[0]
     teammate_port = 1
     for port, player in gamestate.players.items():
       if port == actual_port:

@@ -784,6 +784,7 @@ BATCH_AGENT_FLAGS = dict(
     sample_temperature=ff.Float(1.0, 'Change sampling temperature at run-time.'),
     compile=ff.Boolean(True, 'Compile the sample function.'),
     jit_compile=ff.Boolean(False, 'Jit-compile the sample function.'),
+    batch_steps=ff.Integer(0, 'Batch consecutive agent steps for inference.'),
     name=ff.String(nametags.DEFAULT_NAME, 'Name of the agent.'),
     # arg to build_delayed_agent
     async_inference=ff.Boolean(False, 'run agent asynchronously'),

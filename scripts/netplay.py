@@ -64,11 +64,17 @@ def main(_):
       user_json = json.load(f)
     display_name = user_json['displayName']
 
-    name_to_port = {
-        player.displayName: port for port, player in gamestate.players.items()
-    }
-
-    actual_port = name_to_port[display_name]
+    actual_port = getattr(gamestate, 'local_player_port', None)
+    if actual_port not in gamestate.players:
+      matching_ports = [
+          port for port, player in gamestate.players.items()
+          if player.displayName == display_name
+      ]
+      if len(matching_ports) != 1:
+        raise RuntimeError(
+            f"Could not uniquely identify bot port for {display_name}: "
+            f"{matching_ports}")
+      actual_port = matching_ports[0]
     ports = list(gamestate.players)
     ports.remove(actual_port)
     opponent_port = ports[0]
