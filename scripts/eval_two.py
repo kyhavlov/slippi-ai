@@ -39,6 +39,7 @@ player_flags = utils.map_nt(lambda x: x, eval_lib.PLAYER_FLAGS)
 player_flags['ai']['async_inference'] = ff.Boolean(True)
 
 PLAYERS = {p: ff.DEFINE_dict(f"p{p}", **player_flags) for p in PORTS}
+USE_GPU = flags.DEFINE_boolean('use_gpu', False, 'Use GPU for inference.')
 
 dolphin_config = dolphin_lib.DolphinConfig(
     headless=False,
@@ -53,7 +54,8 @@ DOLPHIN = ff.DEFINE_dict(
 FLAGS = flags.FLAGS
 
 def main(_):
-  eval_lib.disable_gpus()
+  if not USE_GPU.value:
+    eval_lib.disable_gpus()
 
   players = {
       port: eval_lib.get_player(**player.value)
@@ -70,6 +72,7 @@ def main(_):
           opponent_port=opponent_port,
           is_singles=True,
           console_delay=DOLPHIN.value['online_delay'],
+          run_on_cpu=not USE_GPU.value,
           **PLAYERS[port].value['ai'],
       )
       agent.start()

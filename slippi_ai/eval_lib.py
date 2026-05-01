@@ -373,6 +373,15 @@ class DelayedAgent:
     delayed_controller = self.pop()
     return delayed_controller
 
+  def step_undelayed(
+      self,
+      game: embed.Game,
+      needs_reset: np.ndarray,
+  ) -> SampleOutputs:
+    """Sample immediately when the caller already supplied delayed observations."""
+    with self.step_profiler:
+      return self._agent.step(game, needs_reset)
+
   # Present the same interface as the async agent.
   def push(self, game: embed.Game, needs_reset: np.ndarray):
     if self._batch_steps == 0:
@@ -586,6 +595,14 @@ def build_delayed_agent(
     sample_temperature: float = 1.0,
     **agent_kwargs,
 ) -> tp.Union[DelayedAgent, AsyncDelayedAgent]:
+  if isinstance(name, str) and not name.strip():
+    name = nametags.DEFAULT_NAME
+  elif isinstance(name, list):
+    name = [
+        (n if not isinstance(n, str) or n.strip() else nametags.DEFAULT_NAME)
+        for n in name
+    ]
+
   rl_name = get_name_from_rl_state(state)
 
   if rl_name is not None:
