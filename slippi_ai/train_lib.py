@@ -192,6 +192,7 @@ class Config:
   value_function: ValueFunctionConfig = _field(ValueFunctionConfig)
 
   max_names: int = 16
+  name_whitelist: str = ''
 
   expt_root: str = 'experiments'
   expt_dir: tp.Optional[str] = None
@@ -208,10 +209,41 @@ class Config:
 def _get_loss(stats: dict):
   return stats['total_loss'].numpy().mean()
 
+def _parse_name_whitelist(name_whitelist: str) -> list[str]:
+  names = []
+  seen = set()
+  for raw_name in name_whitelist.split(','):
+    raw_name = raw_name.strip()
+    if not raw_name:
+      continue
+    name = nametags.normalize_name(raw_name)
+    if name in seen:
+      continue
+    names.append(name)
+    seen.add(name)
+  return names
+
+
+def _add_name_group_aliases(name_map: dict[str, int]) -> dict[str, int]:
+  # Bake in name groups from nametags.py.
+  for first, *rest in nametags.name_groups:
+    if first not in name_map:
+      continue
+    for name in rest:
+      name_map[name] = name_map[first]
+  return name_map
+
+
 def create_name_map(
     replays: list[data_lib.ReplayInfo],
     max_names: int,
+    name_whitelist: str = '',
 ) -> dict[str, int]:
+  whitelisted_names = _parse_name_whitelist(name_whitelist)
+  if whitelisted_names:
+    name_map = {name: i for i, name in enumerate(whitelisted_names)}
+    return _add_name_group_aliases(name_map)
+
   name_map = {}
   name_counts = collections.Counter()
 
@@ -223,14 +255,49 @@ def create_name_map(
   for i, (name, _) in enumerate(name_counts.most_common(max_names)):
     name_map[name] = i
 
-  # Bake in name groups from nametags.py
-  for first, *rest in nametags.name_groups:
-    if first not in name_map:
-      continue
-    for name in rest:
-      name_map[name] = name_map[first]
+  return _add_name_group_aliases(name_map)
 
-  return name_map
+
+def _summarize_replays_by_name(
+    replays: list[data_lib.ReplayInfo],
+    names: list[str],
+) -> dict[str, dict[str, int]]:
+  counts = {
+      name: {'singles': 0, 'doubles': 0, 'unknown': 0}
+      for name in names
+  }
+  for replay in replays:
+    name = nametags.normalize_name(replay.main_player.name)
+    if name not in counts:
+      continue
+    meta = getattr(replay, 'meta', ())
+    if getattr(meta, 'is_singles', None) is True:
+      counts[name]['singles'] += 1
+    elif getattr(meta, 'is_singles', None) is False:
+      counts[name]['doubles'] += 1
+    else:
+      counts[name]['unknown'] += 1
+  return counts
+
+
+def _log_name_whitelist_distribution(
+    split_name: str,
+    replays: list[data_lib.ReplayInfo],
+    name_whitelist: str,
+):
+  names = _parse_name_whitelist(name_whitelist)
+  if not names:
+    return
+  counts = _summarize_replays_by_name(replays, names)
+  logging.info('Name whitelist replay distribution [%s]:', split_name)
+  for name in names:
+    by_mode = counts[name]
+    total = by_mode['singles'] + by_mode['doubles'] + by_mode['unknown']
+    logging.info(
+        '  %s: total=%d singles=%d doubles=%d unknown=%d',
+        name, total, by_mode['singles'], by_mode['doubles'],
+        by_mode['unknown'])
+
 
 def train(config: Config):
   tag = config.tag or train_lib.get_experiment_tag()
@@ -318,6 +385,18 @@ def train(config: Config):
             opponent_pooling_lib.OpponentPoolingConfig(**opponent_pooling))
       config.value_function = ValueFunctionConfig(**restored_value_function)
 
+  whitelisted_names = _parse_name_whitelist(config.name_whitelist)
+  if whitelisted_names:
+    if restored:
+      logging.warning(
+          'Ignoring --config.name_whitelist because restored checkpoints keep '
+          'their existing name_map/network shape.')
+    else:
+      config.max_names = len(whitelisted_names)
+      logging.info(
+          'Using name whitelist with %d entries; setting max_names=%d.',
+          len(whitelisted_names), config.max_names)
+
   policy = saving.policy_from_config(dataclasses.asdict(config))
 
   value_function = None
@@ -360,11 +439,17 @@ def train(config: Config):
 
   _log_replay_distribution('train', train_replays)
   _log_replay_distribution('test', test_replays)
+  if config.name_whitelist:
+    _log_name_whitelist_distribution(
+        'all', train_replays + test_replays, config.name_whitelist)
+    _log_name_whitelist_distribution('train', train_replays, config.name_whitelist)
+    _log_name_whitelist_distribution('test', test_replays, config.name_whitelist)
 
   if restored:
     name_map: dict[str, int] = combined_state['name_map']
   else:
-    name_map = create_name_map(train_replays, config.max_names)
+    name_map = create_name_map(
+        train_replays, config.max_names, config.name_whitelist)
 
   # Record name map
   print(name_map)
