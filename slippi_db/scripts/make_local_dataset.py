@@ -1,6 +1,8 @@
 """The final step of dataset creation.
 
-python slippi_db/scripts/make_local_dataset.py --root=Root
+python slippi_db/scripts/make_local_dataset.py --root=Root \
+  --singles_blacklist=singles_blacklist.txt \
+  --doubles_whitelist=doubles_whitelist.txt
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ import os
 import pickle
 import json
 import tarfile
-from typing import Dict, Iterable, Optional
+from typing import Iterable, Optional
 
 import tqdm
 from slippi_ai import nametags
@@ -18,6 +20,8 @@ from melee import Character
 
 from absl import app, flags
 from slippi_db import file_layout
+
+DEFAULT_SUMMARY_LIMIT = 300
 
 ROOT = flags.DEFINE_string('root', None, 'root directory', required=True)
 WINNER_ONLY = flags.DEFINE_boolean(
@@ -28,10 +32,22 @@ MAKE_TAR = flags.DEFINE_boolean('tar', False, 'Create dataset tar archive')
 DOUBLES_ONLY = flags.DEFINE_boolean(
   'doubles_only', True, 'only use doubles games')
 
-ALLOWED_PLAYERS_FILE = flags.DEFINE_string(
-    'allowed_players_file',
+SINGLES_BLACKLIST = flags.DEFINE_string(
+    'singles_blacklist',
     None,
-    'Optional path to a newline-separated whitelist of allowed players.',
+    'Optional path to newline-separated player names to exclude from singles.',
+)
+
+DOUBLES_WHITELIST = flags.DEFINE_string(
+    'doubles_whitelist',
+    None,
+    'Optional path to newline-separated player names to include for doubles.',
+)
+
+SUMMARY_LIMIT = flags.DEFINE_integer(
+    'summary_limit',
+    DEFAULT_SUMMARY_LIMIT,
+    'Maximum player/character pairings to print in metadata summaries.',
 )
 
 
@@ -44,56 +60,51 @@ _EXCLUDED_CHARACTERS = {
 }
 
 
-def _normalize_allowed_players(
-    allowed_players: Optional[Dict[str, Optional[Iterable[Character]]]],
-) -> Optional[Dict[str, Optional[set[Character]]]]:
-  if allowed_players is None:
+def _normalize_player_names(
+    names: Optional[Iterable[str]],
+) -> Optional[set[str]]:
+  if names is None:
     return None
 
-  normalised: Dict[str, Optional[set[Character]]] = {}
-  for name, characters in allowed_players.items():
-    if characters is None:
-      normalised[name] = None
-    else:
-      normalised[name] = set(characters)
-  return normalised
+  return {nametags.normalize_name(name.strip()) for name in names if name.strip()}
 
 
-def _load_allowed_players_file(
+def _load_player_names_file(
     path: Optional[str],
-) -> Optional[Dict[str, Optional[set[Character]]]]:
+) -> Optional[set[str]]:
   if not path:
     return None
 
-  allowed_players: Dict[str, Optional[set[Character]]] = {}
   with open(path) as f:
-    for raw_line in f:
-      line = raw_line.strip()
-      if not line or line.startswith('#'):
-        continue
-      allowed_players[nametags.normalize_name(line)] = None
-  return allowed_players
+    return _normalize_player_names(
+        line for line in f
+        if line.strip() and not line.strip().startswith('#'))
 
 
-def _matching_allowed_player_indices(
+def _metadata_player_name(row: dict, player: dict) -> str:
+  code = nametags.name_from_metadata(player, raw=row.get('raw'))
+  return nametags.normalize_name(code)
+
+
+def _selected_main_player_indices(
     row: dict,
     *,
-    allowed_players: Optional[Dict[str, Optional[set[Character]]]],
+    singles_blacklist: Optional[set[str]],
+    doubles_whitelist: Optional[set[str]],
 ) -> list[int]:
-  if allowed_players is None:
+  if not row.get('is_teams') and singles_blacklist is None:
+    return list(range(len(row['players'])))
+
+  if row.get('is_teams') and doubles_whitelist is None:
     return list(range(len(row['players'])))
 
   matching_indices: list[int] = []
-  raw = row.get('raw')
   for i, player in enumerate(row['players']):
-    code = nametags.name_from_metadata(player, raw=raw)
-    name = nametags.normalize_name(code)
-    if name not in allowed_players:
-      continue
-
-    allowed_chars = allowed_players[name]
-    character = Character(player['character'])
-    if allowed_chars is None or character in allowed_chars:
+    name = _metadata_player_name(row, player)
+    if row.get('is_teams'):
+      if name in doubles_whitelist:
+        matching_indices.append(i)
+    elif name not in singles_blacklist:
       matching_indices.append(i)
 
   return matching_indices
@@ -103,7 +114,8 @@ def is_valid_replay(
     row: dict,
     *,
     doubles_only: bool,
-    allowed_players: Optional[Dict[str, Optional[set[Character]]]],
+    singles_blacklist: Optional[set[str]],
+    doubles_whitelist: Optional[set[str]],
 ) -> bool:
   if not row.get('is_training'):
     return False
@@ -115,16 +127,17 @@ def is_valid_replay(
     if Character(player['character']) in _EXCLUDED_CHARACTERS:
       return False
 
-  if allowed_players is None:
-    return True
-
-  return bool(_matching_allowed_player_indices(
+  return bool(_selected_main_player_indices(
       row,
-      allowed_players=allowed_players,
+      singles_blacklist=singles_blacklist,
+      doubles_whitelist=doubles_whitelist,
   ))
 
-def _summarize(rows: list[dict]) -> None:
-  _summarize_rows(rows, only_allowed_main_players=False)
+def _summarize(rows: list[dict], *, summary_limit: int) -> None:
+  _summarize_rows(
+      rows,
+      only_allowed_main_players=False,
+      summary_limit=summary_limit)
 
 
 def _iter_summary_players(
@@ -148,6 +161,7 @@ def _summarize_rows(
     rows: list[dict],
     *,
     only_allowed_main_players: bool,
+    summary_limit: int,
 ) -> None:
   player_character_counts = collections.Counter()
   character_counts = collections.Counter()
@@ -175,18 +189,23 @@ def _summarize_rows(
     print(f"({character}): {count}")
   print("")
   print("Player/Character Pairings:")
-  for (name, character), count in player_character_counts.most_common(n=300):
+  for (name, character), count in player_character_counts.most_common(
+      n=summary_limit):
     print(f"{name} ({character}): {count}")
 
 
-def _summarize_singles(rows: list[dict]) -> None:
-  _summarize_singles_rows(rows, only_allowed_main_players=False)
+def _summarize_singles(rows: list[dict], *, summary_limit: int) -> None:
+  _summarize_singles_rows(
+      rows,
+      only_allowed_main_players=False,
+      summary_limit=summary_limit)
 
 
 def _summarize_singles_rows(
     rows: list[dict],
     *,
     only_allowed_main_players: bool,
+    summary_limit: int,
 ) -> None:
   singles_player_character_counts = collections.Counter()
   singles_character_counts = collections.Counter()
@@ -213,18 +232,19 @@ def _summarize_singles_rows(
     print(f"({character}): {count}")
   print("")
   print("Singles player/character pairings:")
-  for (name, character), count in singles_player_character_counts.most_common(n=300):
+  for (name, character), count in singles_player_character_counts.most_common(
+      n=summary_limit):
     print(f"{name} ({character}): {count}")
 
 
 def _summarize_selected_players(
     rows: list[dict],
     *,
-    allowed_players: Dict[str, Optional[set[Character]]],
+    configured_players: Optional[Iterable[str]],
 ) -> None:
-  replay_counts = collections.Counter({
-      name: 0 for name in sorted(allowed_players)
-  })
+  replay_counts = collections.Counter()
+  if configured_players is not None:
+    replay_counts.update({name: 0 for name in sorted(configured_players)})
 
   for row in rows:
     allowed_indices = row.get('allowed_main_player_indices')
@@ -238,7 +258,7 @@ def _summarize_selected_players(
       replay_counts[name] += 1
 
   print("")
-  print("Selected player replay counts:")
+  print("Selected main-player replay counts:")
   for name, count in replay_counts.items():
     print(f"{name}: {count}")
 
@@ -249,8 +269,11 @@ def build_meta(
     doubles_only: Optional[bool] = None,
     winner_only: Optional[bool] = None,
     make_tar: Optional[bool] = None,
-    allowed_players_file: Optional[str] = None,
-    allowed_players: Optional[Dict[str, Optional[Iterable[Character]]]] = None,
+    singles_blacklist: Optional[Iterable[str]] = None,
+    doubles_whitelist: Optional[Iterable[str]] = None,
+    singles_blacklist_file: Optional[str] = None,
+    doubles_whitelist_file: Optional[str] = None,
+    summary_limit: Optional[int] = None,
     quiet: bool = False,
 ) -> list[dict]:
   root_path = os.fspath(root)
@@ -261,16 +284,27 @@ def build_meta(
   doubles_only = DOUBLES_ONLY.value if doubles_only is None else doubles_only
   winner_only = WINNER_ONLY.value if winner_only is None else winner_only
   make_tar = MAKE_TAR.value if make_tar is None else make_tar
+  if summary_limit is None:
+    summary_limit = (
+        SUMMARY_LIMIT.value if flags.FLAGS.is_parsed()
+        else DEFAULT_SUMMARY_LIMIT)
 
-  if allowed_players_file is None:
-    allowed_players_file = ALLOWED_PLAYERS_FILE.value
+  if singles_blacklist_file is None:
+    singles_blacklist_file = SINGLES_BLACKLIST.value
+  if doubles_whitelist_file is None:
+    doubles_whitelist_file = DOUBLES_WHITELIST.value
 
-  file_allowed_players = _load_allowed_players_file(allowed_players_file)
-  allowed_players = _normalize_allowed_players(allowed_players)
-  if file_allowed_players is not None:
-    allowed_players = file_allowed_players
-  elif allowed_players is None and hasattr(nametags, 'ALLOWED_PLAYERS'):
-    allowed_players = _normalize_allowed_players(nametags.ALLOWED_PLAYERS)
+  file_singles_blacklist = _load_player_names_file(singles_blacklist_file)
+  file_doubles_whitelist = _load_player_names_file(doubles_whitelist_file)
+  singles_blacklist = _normalize_player_names(singles_blacklist)
+  doubles_whitelist = _normalize_player_names(doubles_whitelist)
+  if file_singles_blacklist is not None:
+    singles_blacklist = file_singles_blacklist
+  if file_doubles_whitelist is not None:
+    doubles_whitelist = file_doubles_whitelist
+
+  has_player_filter = (
+      singles_blacklist is not None or doubles_whitelist is not None)
 
   total_rows = len(rows)
   filtered_rows: list[dict] = []
@@ -278,18 +312,20 @@ def build_meta(
     if not is_valid_replay(
         row,
         doubles_only=doubles_only,
-        allowed_players=allowed_players,
+        singles_blacklist=singles_blacklist,
+        doubles_whitelist=doubles_whitelist,
     ):
       continue
 
     row = dict(row)
-    if allowed_players is None:
-      row.pop('allowed_main_player_indices', None)
-    else:
-      row['allowed_main_player_indices'] = _matching_allowed_player_indices(
+    if has_player_filter:
+      row['allowed_main_player_indices'] = _selected_main_player_indices(
           row,
-          allowed_players=allowed_players,
+          singles_blacklist=singles_blacklist,
+          doubles_whitelist=doubles_whitelist,
       )
+    else:
+      row.pop('allowed_main_player_indices', None)
     filtered_rows.append(row)
   rows = filtered_rows
 
@@ -308,15 +344,24 @@ def build_meta(
     print(f"Doubles games: {doubles_games}, Singles games: {singles_games}")
 
   if not quiet:
-    if allowed_players is not None:
-      _summarize_rows(rows, only_allowed_main_players=True)
+    if has_player_filter:
+      _summarize_rows(
+          rows,
+          only_allowed_main_players=True,
+          summary_limit=summary_limit)
       if not doubles_only:
-        _summarize_singles_rows(rows, only_allowed_main_players=True)
-      _summarize_selected_players(rows, allowed_players=allowed_players)
+        _summarize_singles_rows(
+            rows,
+            only_allowed_main_players=True,
+            summary_limit=summary_limit)
+      _summarize_selected_players(
+          rows,
+          configured_players=doubles_whitelist,
+      )
     else:
-      _summarize(rows)
+      _summarize(rows, summary_limit=summary_limit)
       if not doubles_only:
-        _summarize_singles(rows)
+        _summarize_singles(rows, summary_limit=summary_limit)
 
   tar = None
   if make_tar:

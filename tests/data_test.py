@@ -481,7 +481,6 @@ class DataTest(unittest.TestCase):
           doubles_only=False,
           winner_only=False,
           make_tar=False,
-          allowed_players=None,
           quiet=True,
       )
 
@@ -523,8 +522,8 @@ class DataTest(unittest.TestCase):
                                    if i not in (info.main_player_index, info.teammate_index))
         self.assertEqual(info.opponent_order, expected_opponents)
 
-  def test_build_meta_allowed_players_file_annotates_and_summarizes(self):
-    kept_row = dict(
+  def test_build_meta_selects_singles_blacklist_and_doubles_whitelist(self):
+    kept_doubles_row = dict(
         name='kept.slp',
         slp_md5='facefeed',
         slp_size=0,
@@ -552,8 +551,8 @@ class DataTest(unittest.TestCase):
         raw='ignored.zip',
         compression='zlib',
     )
-    dropped_row = dict(
-        kept_row,
+    dropped_doubles_row = dict(
+        kept_doubles_row,
         name='dropped.slp',
         slp_md5='deadc0de',
         players=[
@@ -567,48 +566,74 @@ class DataTest(unittest.TestCase):
                  netplay=dict(name='OpponentB', code='OPPB#1', suid=''), team=1),
         ],
     )
+    singles_row = dict(
+        kept_doubles_row,
+        name='singles.slp',
+        slp_md5='abc12345',
+        num_players=2,
+        players=[
+            dict(port=0, character=1, type=0, name_tag='',
+                 netplay=dict(name='Platinum Player', code='', suid=''), team=0),
+            dict(port=1, character=22, type=0, name_tag='',
+                 netplay=dict(name='Tempo', code='TEMP#0', suid=''), team=1),
+        ],
+        is_teams=False,
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
       root = pathlib.Path(tmp)
       parsed_dir = root / 'Parsed'
       parsed_dir.mkdir()
 
-      for md5 in (kept_row['slp_md5'], dropped_row['slp_md5']):
+      for md5 in (
+          kept_doubles_row['slp_md5'],
+          dropped_doubles_row['slp_md5'],
+          singles_row['slp_md5'],
+      ):
         hashed_dir = parsed_dir / md5[:file_layout.PARQUET_PREFIX_LEN]
         hashed_dir.mkdir(parents=True, exist_ok=True)
         (hashed_dir / md5).touch()
 
       with open(root / 'parsed.pkl', 'wb') as f:
         import pickle
-        pickle.dump([kept_row, dropped_row], f)
+        pickle.dump([kept_doubles_row, dropped_doubles_row, singles_row], f)
 
-      whitelist_path = root / 'players.txt'
-      whitelist_path.write_text('ENZYME#0\nTempo\nMissingPlayer\n')
+      doubles_whitelist_path = root / 'doubles_whitelist.txt'
+      doubles_whitelist_path.write_text('ENZYME#0\nTempo\nMissingPlayer\n')
+      singles_blacklist_path = root / 'singles_blacklist.txt'
+      singles_blacklist_path.write_text('Platinum Player\n')
 
       stdout = io.StringIO()
       with contextlib.redirect_stdout(stdout):
         rows = make_local_dataset.build_meta(
             root,
-            doubles_only=True,
+            doubles_only=False,
             winner_only=False,
             make_tar=False,
-            allowed_players_file=str(whitelist_path),
+            doubles_whitelist_file=str(doubles_whitelist_path),
+            singles_blacklist_file=str(singles_blacklist_path),
             quiet=False,
         )
 
-      self.assertEqual(len(rows), 1)
-      self.assertEqual(rows[0]['allowed_main_player_indices'], [0, 1])
+      self.assertEqual(len(rows), 2)
+      by_md5 = {row['slp_md5']: row for row in rows}
+      self.assertEqual(
+          by_md5[kept_doubles_row['slp_md5']]['allowed_main_player_indices'],
+          [0, 1])
+      self.assertEqual(
+          by_md5[singles_row['slp_md5']]['allowed_main_player_indices'],
+          [1])
 
       with open(root / 'meta.json') as f:
         meta_rows = json.load(f)
-      self.assertEqual(len(meta_rows), 1)
-      self.assertEqual(meta_rows[0]['allowed_main_player_indices'], [0, 1])
+      self.assertEqual(len(meta_rows), 2)
 
       output = stdout.getvalue()
-      self.assertIn('Selected player replay counts:', output)
+      self.assertIn('Selected main-player replay counts:', output)
       self.assertIn('Enzyme: 1', output)
-      self.assertIn('Tempo: 1', output)
+      self.assertIn('Tempo: 2', output)
       self.assertIn('MissingPlayer: 0', output)
+      self.assertNotIn('Platinum Player', output)
       self.assertNotIn('OpponentA', output)
       self.assertNotIn('OpponentB', output)
       self.assertNotIn('Someone', output)
