@@ -4,6 +4,7 @@ import copy
 import logging
 import multiprocessing as mp
 from multiprocessing.connection import Connection
+import random
 import socket
 import traceback
 import typing as tp
@@ -1410,22 +1411,98 @@ class FakeBatchedEnvironment:
   def __init__(
       self,
       num_envs: int,
-      players: tp.Collection[int],
+      players: Mapping[int, dolphin.Player],
+      agent_names: list[tuple[str, ...]] = [],
+      env_ids: Optional[list[int]] = None,
+      scheduler = None,
+      episode_length: int = 4,
   ):
-    game = utils.map_nt(
+    self._num_envs = num_envs
+    self._players = players
+    self._logical_ports = tuple(sorted(players))
+    self._agent_names = agent_names or [tuple() for _ in range(num_envs)]
+    self._env_ids = env_ids or list(range(num_envs))
+    self._scheduler = scheduler
+    self._episode_length = max(1, int(episode_length))
+    self._steps_until_reset = np.full([num_envs], self._episode_length, dtype=np.int32)
+    self._rngs = [random.Random(1000 + env_id) for env_id in self._env_ids]
+    self._active_assignments: list[Optional[Assignment]] = [None] * num_envs
+    self._current_characters: list[tuple[enums.Character, ...]] = [tuple() for _ in range(num_envs)]
+    self._assignment_history: list[list[dict[str, tp.Any]]] = [[] for _ in range(num_envs)]
+    self._template_game = utils.map_nt(
         lambda t: np.full([num_envs], 0, dtype=t), reified_game)
-    game.stage[:] = Stage.FINAL_DESTINATION.value  # make the stage valid
-    game.is_teams[:] = bool(len(players) != 2)
-    self._dummy_output = EnvOutput(
-        gamestates={p: game for p in players},
-        needs_reset=np.full([num_envs], False),
-    )
+    self._template_game.stage[:] = Stage.FINAL_DESTINATION.value
+    self._template_game.is_teams[:] = bool(len(self._logical_ports) != 2)
+    for env_index in range(num_envs):
+      self._assign_characters(env_index, is_initial=True)
+    self._dummy_output = self._make_output(np.full([num_envs], True))
     self.num_steps = 1
     self._output_queue = collections.deque()
     self._output_queue.append(self._dummy_output)
 
   def stop(self):
     pass
+
+  def debug_assignment_history(self) -> list[list[dict[str, tp.Any]]]:
+    return copy.deepcopy(self._assignment_history)
+
+  def current_assignments(self) -> list[tuple[enums.Character, ...]]:
+    return list(self._current_characters)
+
+  def _sample_character(self, env_index: int, player: dolphin.Player) -> enums.Character:
+    if isinstance(player, dolphin.AI):
+      if player.character_weight_table:
+        population = list(player.character_weight_table.keys())
+        weights = list(player.character_weight_table.values())
+        character = self._rngs[env_index].choices(population, weights=weights, k=1)[0]
+      else:
+        character = player.character
+      player.character = character
+      return character
+    if hasattr(player, 'character'):
+      return getattr(player, 'character')
+    return enums.Character.FOX
+
+  def _assign_characters(self, env_index: int, *, is_initial: bool) -> None:
+    if self._scheduler is not None:
+      if not is_initial and self._active_assignments[env_index] is not None:
+        previous = self._active_assignments[env_index]
+        self._scheduler.report_outcome(
+            self._env_ids[env_index],
+            previous.assignment_id,
+            AssignmentStatus.COMPLETE,
+        )
+      assignment = self._scheduler.request_assignment(self._env_ids[env_index])
+      self._active_assignments[env_index] = assignment
+      characters = assignment.characters
+    else:
+      characters = tuple(
+          self._sample_character(env_index, self._players[port])
+          for port in self._logical_ports
+      )
+
+    self._current_characters[env_index] = tuple(characters)
+    history_item = dict(
+        env_id=self._env_ids[env_index],
+        names=tuple(self._agent_names[env_index]) if env_index < len(self._agent_names) else tuple(),
+        characters=tuple(char.name for char in characters),
+    )
+    if self._active_assignments[env_index] is not None:
+      history_item['assignment_id'] = self._active_assignments[env_index].assignment_id
+    self._assignment_history[env_index].append(history_item)
+
+  def _make_output(self, needs_reset: np.ndarray) -> EnvOutput:
+    game = copy.deepcopy(self._template_game)
+    for env_index, characters in enumerate(self._current_characters):
+      for slot_index, character in enumerate(characters):
+        player = getattr(game, f'p{slot_index}')
+        player.character[env_index] = character.value
+        player.stocks_left[env_index] = 4
+        player.is_dead[env_index] = False
+    return EnvOutput(
+        gamestates={p: game for p in self._logical_ports},
+        needs_reset=needs_reset.astype(np.bool_),
+    )
 
   def current_state(self) -> EnvOutput:
     return self._dummy_output
@@ -1434,9 +1511,14 @@ class FakeBatchedEnvironment:
     return self._output_queue.popleft()
 
   def push(self, controllers: Controllers):
-    # TODO: increment frame counter in the gamestates
     del controllers
-    self._output_queue.append(self._dummy_output)
+    self._steps_until_reset -= 1
+    needs_reset = self._steps_until_reset <= 0
+    if np.any(needs_reset):
+      for env_index in np.flatnonzero(needs_reset):
+        self._assign_characters(int(env_index), is_initial=False)
+        self._steps_until_reset[env_index] = self._episode_length
+    self._output_queue.append(self._make_output(needs_reset))
 
   def step(self, controllers: Controllers):
     self.push(controllers)

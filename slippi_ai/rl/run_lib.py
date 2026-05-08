@@ -1,8 +1,10 @@
 import dataclasses
 import enum
 import logging
+import math
 import os
 import pickle
+import random
 import typing as tp
 
 import numpy as np
@@ -82,6 +84,7 @@ class AgentConfig:
   name: list[str] = field(lambda: [nametags.DEFAULT_NAME])
   batch_steps: int = 0
   async_inference: bool = False
+  use_name_scheduler: bool = True
   name_allowlist: tp.Optional[str] = None
   name_layout_seed: int = 0
   scheduler_seed: int = 0
@@ -234,6 +237,60 @@ def _default_slot_names(configured_names: list[str], slots_per_env: int) -> list
   if not cleaned:
     cleaned = [nametags.DEFAULT_NAME]
   return [cleaned[index % len(cleaned)] for index in range(slots_per_env)]
+
+
+def _basic_name_layout(
+    configured_names: list[str],
+    num_envs: int,
+    slots_per_env: int,
+    layout_seed: int,
+) -> list[tuple[str, ...]]:
+  cleaned = [name.strip() for name in configured_names if name.strip()]
+  if not cleaned:
+    cleaned = [nametags.DEFAULT_NAME]
+  if slots_per_env <= 0:
+    raise ValueError('slots_per_env must be > 0.')
+  if num_envs < 0:
+    raise ValueError('num_envs must be >= 0.')
+  if not num_envs:
+    return []
+
+  base = len(cleaned)
+  total_layouts = base ** slots_per_env
+  if total_layouts == 1:
+    only_layout = tuple([cleaned[0]] * slots_per_env)
+    return [only_layout] * num_envs
+
+  rng = random.Random(layout_seed)
+  start = rng.randrange(total_layouts)
+  step = rng.randrange(1, total_layouts)
+  while math.gcd(step, total_layouts) != 1:
+    step = rng.randrange(1, total_layouts)
+
+  layouts: list[tuple[str, ...]] = []
+  for env_index in range(num_envs):
+    encoded = (start + env_index * step) % total_layouts
+    slot_names = []
+    for _ in range(slots_per_env):
+      encoded, remainder = divmod(encoded, base)
+      slot_names.append(cleaned[remainder])
+    slot_names.reverse()
+    layouts.append(tuple(slot_names))
+  return layouts
+
+
+def _port_name_batches_from_layout(
+    env_name_layout: list[tuple[str, ...]],
+    active_ports: tuple[int, ...],
+) -> dict[int, list[str]]:
+  port_name_batches: dict[int, list[str]] = {port: [] for port in active_ports}
+  for names in env_name_layout:
+    if len(names) != len(active_ports):
+      raise ValueError(
+          f'Expected layout width {len(active_ports)}, got {len(names)}.')
+    for idx, port in enumerate(active_ports):
+      port_name_batches[port].append(names[idx])
+  return port_name_batches
 
 
 TWOVONE_PORT_LAYOUTS: tuple[tuple[int, int, int], tuple[int, int, int]] = (
@@ -543,7 +600,8 @@ def run(config: Config):
   PORT = 1
 
   teacher_name_map = teacher_state.get('name_map', {})
-  use_name_scheduler = bool(teacher_name_map)
+  teacher_has_name_map = bool(teacher_name_map)
+  use_name_scheduler = config.agent.use_name_scheduler and teacher_has_name_map
   no_name_char_weights: dict[Character, int] | None = None
   if use_name_scheduler:
     if not config.agent.name_allowlist:
@@ -554,13 +612,24 @@ def run(config: Config):
     allowlist = None
     normalized_names = []
     no_name_char_weights = _uniform_character_weight_table(pretraining_config)
-    logging.info(
-        'Teacher name_map is empty; disabling scheduler and sampling characters '
-        'uniformly each game from: %s',
-        ','.join(c.name for c in sorted(no_name_char_weights, key=lambda c: c.value)))
+    if teacher_has_name_map and not config.agent.use_name_scheduler:
+      logging.info(
+          'Name scheduler explicitly disabled; using fixed basic name slots and '
+          'sampling characters uniformly each game from: %s',
+          ','.join(c.name for c in sorted(no_name_char_weights, key=lambda c: c.value)))
+    else:
+      logging.info(
+          'Teacher name_map is empty; disabling scheduler and sampling characters '
+          'uniformly each game from: %s',
+          ','.join(c.name for c in sorted(no_name_char_weights, key=lambda c: c.value)))
     if config.agent.name_allowlist:
-      logging.warning(
-          '--config.agent.name_allowlist is ignored when teacher name_map is empty.')
+      if teacher_has_name_map and not config.agent.use_name_scheduler:
+        logging.warning(
+            '--config.agent.name_allowlist is ignored when '
+            '--config.agent.use_name_scheduler=False.')
+      else:
+        logging.warning(
+            '--config.agent.name_allowlist is ignored when teacher name_map is empty.')
 
   main_agent_kwargs = config.agent.get_kwargs()
   main_agent_kwargs['state'] = rl_state
@@ -711,12 +780,16 @@ def run(config: Config):
     else:
       if no_name_char_weights is None:
         raise ValueError('no_name_char_weights must be set when scheduler is disabled.')
-      slot_names = _default_slot_names(config.agent.name, 4)
-      env_name_layout_doubles = [tuple(slot_names)] * num_envs_doubles
-      port_name_batches = {
-          port: [slot_names[port - 1]] * num_envs_doubles
-          for port in range(1, 5)
-      }
+      env_name_layout_doubles = _basic_name_layout(
+          config.agent.name,
+          num_envs_doubles,
+          4,
+          config.agent.name_layout_seed,
+      )
+      port_name_batches = _port_name_batches_from_layout(
+          env_name_layout_doubles,
+          (1, 2, 3, 4),
+      )
       default_character = next(iter(no_name_char_weights))
       players = {
           port: dolphin_lib.AI(
@@ -747,6 +820,7 @@ def run(config: Config):
         use_ray_envs=config.actor.ray_envs,
         async_envs=config.actor.async_envs,
         use_gpu=config.actor.gpu_inference,
+        damage_ratio=0,
         use_fake_envs=config.actor.use_fake_envs,
         fuse_ports_inference=config.actor.fuse_ports_inference,
         agent_names=env_name_layout_doubles,
@@ -814,12 +888,16 @@ def run(config: Config):
     else:
       if no_name_char_weights is None:
         raise ValueError('no_name_char_weights must be set when scheduler is disabled.')
-      slot_names = _default_slot_names(config.agent.name, slots_per_env)
-      env_name_layout_twovone = [tuple(slot_names)] * num_envs_twovone_mode
-      port_name_batches = {
-          port: [slot_names[idx]] * num_envs_twovone_mode
-          for idx, port in enumerate(active_ports)
-      }
+      env_name_layout_twovone = _basic_name_layout(
+          config.agent.name,
+          num_envs_twovone_mode,
+          slots_per_env,
+          config.agent.name_layout_seed + seed_offset,
+      )
+      port_name_batches = _port_name_batches_from_layout(
+          env_name_layout_twovone,
+          active_ports,
+      )
       default_character = next(iter(no_name_char_weights))
       players = {
           port: dolphin_lib.AI(
@@ -852,6 +930,7 @@ def run(config: Config):
         use_ray_envs=config.actor.ray_envs,
         async_envs=config.actor.async_envs,
         use_gpu=config.actor.gpu_inference,
+        damage_ratio=0,
         use_fake_envs=config.actor.use_fake_envs,
         fuse_ports_inference=config.actor.fuse_ports_inference,
         agent_names=env_name_layout_twovone,
@@ -919,12 +998,16 @@ def run(config: Config):
     else:
       if no_name_char_weights is None:
         raise ValueError('no_name_char_weights must be set when scheduler is disabled.')
-      slot_names = _default_slot_names(config.agent.name, 2)
-      env_name_layout_singles = [tuple(slot_names)] * num_envs_singles
-      port_name_batches = {
-          port: [slot_names[port - 1]] * num_envs_singles
-          for port in (1, 2)
-      }
+      env_name_layout_singles = _basic_name_layout(
+          config.agent.name,
+          num_envs_singles,
+          2,
+          config.agent.name_layout_seed + 1,
+      )
+      port_name_batches = _port_name_batches_from_layout(
+          env_name_layout_singles,
+          (1, 2),
+      )
       default_character = next(iter(no_name_char_weights))
       players = {
           port: dolphin_lib.AI(
@@ -955,6 +1038,7 @@ def run(config: Config):
         use_ray_envs=config.actor.ray_envs,
         async_envs=config.actor.async_envs,
         use_gpu=config.actor.gpu_inference,
+        damage_ratio=0,
         use_fake_envs=config.actor.use_fake_envs,
         fuse_ports_inference=config.actor.fuse_ports_inference,
         agent_names=env_name_layout_singles,
