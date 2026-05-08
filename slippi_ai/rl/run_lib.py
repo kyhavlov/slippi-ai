@@ -730,7 +730,7 @@ def run(config: Config):
     twovone_slippi_ports_a = twovone_ports[:num_envs_twovone_a]
     twovone_slippi_ports_b = twovone_ports[num_envs_twovone_a:]
 
-  rollout_workers: list[TrajectoryRolloutWorker] = []
+  rollout_group_specs: list[evaluators.RolloutGroupSpec] = []
   scheduler_managers: list[tp.Any] = []
 
   env_name_layout = []
@@ -812,21 +812,21 @@ def run(config: Config):
     doubles_env_kwargs = dict(env_kwargs_base)
     if doubles_slippi_ports is not None:
       doubles_env_kwargs['slippi_ports'] = doubles_slippi_ports
-    worker = evaluators.RolloutWorker(
+    rollout_group_specs.append(evaluators.RolloutGroupSpec(
+        label='doubles',
+        ports=(1, 2, 3, 4),
         agent_kwargs=agent_kwargs,
         dolphin_kwargs=dolphin_kwargs,
-        env_kwargs=doubles_env_kwargs,
         num_envs=num_envs_doubles,
-        use_ray_envs=config.actor.ray_envs,
         async_envs=config.actor.async_envs,
+        env_kwargs=doubles_env_kwargs,
         use_gpu=config.actor.gpu_inference,
         damage_ratio=0,
         use_fake_envs=config.actor.use_fake_envs,
-        fuse_ports_inference=config.actor.fuse_ports_inference,
+        use_ray_envs=config.actor.ray_envs,
         agent_names=env_name_layout_doubles,
         scheduler=scheduler_proxy,
-    )
-    rollout_workers.append(TrajectoryRolloutWorker(worker, ports=(1, 2, 3, 4), label='doubles'))
+    ))
 
   def _add_twovone_worker(
       *,
@@ -922,21 +922,21 @@ def run(config: Config):
     twovone_env_kwargs = dict(env_kwargs_base)
     if slippi_ports is not None:
       twovone_env_kwargs['slippi_ports'] = slippi_ports
-    worker = evaluators.RolloutWorker(
+    rollout_group_specs.append(evaluators.RolloutGroupSpec(
+        label=label,
+        ports=active_ports,
         agent_kwargs=agent_kwargs,
         dolphin_kwargs=dolphin_kwargs,
-        env_kwargs=twovone_env_kwargs,
         num_envs=num_envs_twovone_mode,
-        use_ray_envs=config.actor.ray_envs,
         async_envs=config.actor.async_envs,
+        env_kwargs=twovone_env_kwargs,
         use_gpu=config.actor.gpu_inference,
         damage_ratio=0,
         use_fake_envs=config.actor.use_fake_envs,
-        fuse_ports_inference=config.actor.fuse_ports_inference,
+        use_ray_envs=config.actor.ray_envs,
         agent_names=env_name_layout_twovone,
         scheduler=scheduler_proxy,
-    )
-    rollout_workers.append(TrajectoryRolloutWorker(worker, ports=active_ports, label=label))
+    ))
 
   _add_twovone_worker(
       num_envs_twovone_mode=num_envs_twovone_a,
@@ -1030,23 +1030,23 @@ def run(config: Config):
     singles_env_kwargs = dict(env_kwargs_base, enable_singles=True)
     if singles_slippi_ports is not None:
       singles_env_kwargs['slippi_ports'] = singles_slippi_ports
-    worker = evaluators.RolloutWorker(
+    rollout_group_specs.append(evaluators.RolloutGroupSpec(
+        label='singles',
+        ports=(1, 2),
         agent_kwargs=agent_kwargs,
         dolphin_kwargs=dolphin_kwargs,
-        env_kwargs=singles_env_kwargs,
         num_envs=num_envs_singles,
-        use_ray_envs=config.actor.ray_envs,
         async_envs=config.actor.async_envs,
+        env_kwargs=singles_env_kwargs,
         use_gpu=config.actor.gpu_inference,
         damage_ratio=0,
         use_fake_envs=config.actor.use_fake_envs,
-        fuse_ports_inference=config.actor.fuse_ports_inference,
+        use_ray_envs=config.actor.ray_envs,
         agent_names=env_name_layout_singles,
         scheduler=scheduler_proxy,
-    )
-    rollout_workers.append(TrajectoryRolloutWorker(worker, ports=(1, 2), label='singles'))
+    ))
 
-  if not rollout_workers:
+  if not rollout_group_specs:
     raise ValueError(
         'No rollout workers were constructed; check singles_fraction, '
         'twovone_fraction, and num_envs.')
@@ -1057,11 +1057,43 @@ def run(config: Config):
       + 2 * num_envs_singles
   )
 
-  build_actor = lambda: (
-      rollout_workers[0]
-      if len(rollout_workers) == 1
-      else MixedTrajectoryRolloutWorker(rollout_workers)
-  )
+  def build_actor():
+    if (
+        config.actor.fuse_ports_inference
+        and len(rollout_group_specs) > 1
+        and not config.actor.ray_envs
+    ):
+      logging.info(
+          'Using mixed cross-mode fused inference across %d env groups.',
+          len(rollout_group_specs))
+      return evaluators.MixedFusedRolloutWorker(rollout_group_specs)
+
+    rollout_workers = [
+        TrajectoryRolloutWorker(
+            evaluators.RolloutWorker(
+                agent_kwargs=spec.agent_kwargs,
+                dolphin_kwargs=spec.dolphin_kwargs,
+                num_envs=spec.num_envs,
+                async_envs=spec.async_envs,
+                env_kwargs=spec.env_kwargs,
+                use_gpu=spec.use_gpu,
+                damage_ratio=spec.damage_ratio,
+                use_fake_envs=spec.use_fake_envs,
+                use_ray_envs=spec.use_ray_envs,
+                agent_names=spec.agent_names,
+                scheduler=spec.scheduler,
+                fuse_ports_inference=config.actor.fuse_ports_inference,
+            ),
+            ports=spec.ports,
+            label=spec.label,
+        )
+        for spec in rollout_group_specs
+    ]
+    return (
+        rollout_workers[0]
+        if len(rollout_workers) == 1
+        else MixedTrajectoryRolloutWorker(rollout_workers)
+    )
 
   learner_manager = LearnerManager(
       config=config,
@@ -1326,7 +1358,7 @@ def run(config: Config):
     pickled_state = pickle.dumps(combined_state)
 
     save_path = pickle_path 
-    if step % 100 == 0:
+    if step % 500 == 0:
       save_path = pickle_path + '_' + str(step)
     logging.info('saving state to %s', save_path)
     with open(save_path, 'wb') as f:

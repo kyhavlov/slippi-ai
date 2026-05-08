@@ -2,6 +2,7 @@
 
 import collections
 import contextlib
+import dataclasses
 import typing as tp
 import cProfile
 
@@ -49,6 +50,60 @@ class Trajectory(tp.NamedTuple):
     return utils.map_nt(
         lambda axis, *ts: utils.concat_nest_nt(ts, axis),
         batch_dims, *trajectories)
+
+
+@dataclasses.dataclass(frozen=True)
+class RolloutGroupSpec:
+  label: str
+  ports: tuple[Port, ...]
+  agent_kwargs: tp.Mapping[Port, dict]
+  dolphin_kwargs: dict
+  num_envs: int
+  async_envs: bool = False
+  env_kwargs: dict = dataclasses.field(default_factory=dict)
+  use_gpu: bool = False
+  damage_ratio: float = 0
+  use_fake_envs: bool = False
+  use_ray_envs: bool = False
+  agent_names: list[tuple[str, ...]] = dataclasses.field(default_factory=list)
+  scheduler: tp.Any = None
+
+
+def _build_env_instance(
+    *,
+    num_envs: int,
+    dolphin_kwargs: dict,
+    async_envs: bool,
+    env_kwargs: dict,
+    use_fake_envs: bool,
+    use_ray_envs: bool,
+    agent_names: list[tuple[str, ...]],
+    scheduler: tp.Any,
+    env_ids: list[int],
+):
+  if use_ray_envs:
+    return env_lib.RayBatchedEnvironment(
+        num_envs, dolphin_kwargs, **env_kwargs)
+  if use_fake_envs:
+    return env_lib.FakeBatchedEnvironment(
+        num_envs,
+        players=dolphin_kwargs['players'],
+        agent_names=agent_names,
+        env_ids=env_ids,
+        scheduler=scheduler,
+    )
+  env_class = (
+      env_lib.AsyncBatchedEnvironmentMP if async_envs
+      else env_lib.BatchedEnvironment)
+  env_kwargs = dict(env_kwargs)
+  env_kwargs.setdefault('env_ids', env_ids)
+  return env_class(
+      num_envs,
+      dolphin_kwargs,
+      agent_names=agent_names,
+      scheduler=scheduler,
+      **env_kwargs,
+  )
 
 
 class RolloutWorker:
@@ -236,26 +291,17 @@ class RolloutWorker:
     return per_port
 
   def _build_env(self):
-    if self._use_ray_envs:
-      self._env = env_lib.RayBatchedEnvironment(
-          self._num_envs, self._dolphin_kwargs, **self._env_kwargs)
-    elif self._use_fake_envs:
-      self._env = env_lib.FakeBatchedEnvironment(
-          self._num_envs, players=list(self._agents) if self._agents else list(self._ports))
-    else:
-      if not self._async_envs:
-        env_class = env_lib.BatchedEnvironment
-      else:
-        env_class = env_lib.AsyncBatchedEnvironmentMP
-      env_kwargs = dict(self._env_kwargs)
-      env_kwargs.setdefault('env_ids', self._env_ids)
-      self._env = env_class(
-          self._num_envs,
-          self._dolphin_kwargs,
-          agent_names=self._agent_names,
-          scheduler=self._scheduler,
-          **env_kwargs,
-      )
+    self._env = _build_env_instance(
+        num_envs=self._num_envs,
+        dolphin_kwargs=self._dolphin_kwargs,
+        async_envs=self._async_envs,
+        env_kwargs=self._env_kwargs,
+        use_fake_envs=self._use_fake_envs,
+        use_ray_envs=self._use_ray_envs,
+        agent_names=self._agent_names,
+        scheduler=self._scheduler,
+        env_ids=self._env_ids,
+    )
 
   def reset_env(self):
     self._env.stop()
@@ -408,18 +454,22 @@ class RolloutWorker:
     is_resetting = np.array(is_resetting)
     for i, port in enumerate(self._ports):
       agent = self._agents[port] if self._fused_agent is None else self._fused_agent
-      name_code = agent.name_code
+      name_code = np.asarray(agent.name_code, dtype=embed.NAME_DTYPE)
       if self._fused_agent is not None:
         B = self._num_envs
+        if name_code.ndim == 0:
+          name_code = np.full([B * len(self._ports)], name_code, dtype=embed.NAME_DTYPE)
         name_code = name_code[i * B:(i + 1) * B]
+      elif name_code.ndim == 0:
+        name_code = np.full([self._num_envs], name_code, dtype=embed.NAME_DTYPE)
       states=utils.batch_nest_nt(gamestates[port])
       trajectories[port] = Trajectory(
           # TODO: Let the learner call from_state on game
           states=agent._policy.embed_game.from_state(states),
-          name=np.full(
+          name=np.broadcast_to(
+              np.asarray(name_code, dtype=embed.NAME_DTYPE),
               [num_steps + 1, self._num_envs],
-              name_code,
-              dtype=embed.NAME_DTYPE),
+          ).copy(),
           actions=utils.batch_nest_nt(sample_outputs[port]),
           rewards=reward.compute_rewards(states, self._damage_ratio),
           is_resetting=is_resetting,
@@ -491,6 +541,397 @@ class RolloutWorker:
       for agent in self._agents.values():
         agent.stop()
     self._env.stop()
+
+
+@dataclasses.dataclass
+class _MixedGroupRuntime:
+  spec: RolloutGroupSpec
+  env: tp.Any
+  env_ids: list[int]
+  batch_slices: dict[Port, slice]
+  env_pop_profiler: utils.Profiler = dataclasses.field(
+      default_factory=lambda: utils.Profiler())
+  env_push_profiler: utils.Profiler = dataclasses.field(
+      default_factory=lambda: utils.Profiler())
+
+
+class MixedFusedRolloutWorker:
+
+  def __init__(self, group_specs: tp.Sequence[RolloutGroupSpec]):
+    if not group_specs:
+      raise ValueError('MixedFusedRolloutWorker requires at least one group.')
+
+    self._group_specs = list(group_specs)
+    self._ports = tuple(dict.fromkeys(
+        port
+        for spec in self._group_specs
+        for port in spec.ports
+    ))
+    self._groups: list[_MixedGroupRuntime] = []
+    self._fused_agent = None
+    self._prev_agent_outputs = collections.deque()
+    self._agent_pop_profiler = utils.Profiler()
+    self._total_batch_size = 0
+    self._build()
+
+  @property
+  def ports(self) -> tuple[int, ...]:
+    return self._ports
+
+  def _build(self):
+    first_spec = self._group_specs[0]
+    first_port = first_spec.ports[0]
+    first_kwargs = dict(first_spec.agent_kwargs[first_port])
+    first_state = first_kwargs.get('state')
+    if first_state is None:
+      raise ValueError('Mixed fused worker requires preloaded state in agent kwargs.')
+    first_online_delay = first_spec.dolphin_kwargs['online_delay']
+    damage_ratio = first_spec.damage_ratio
+
+    fused_kwargs = {
+        key: value
+        for key, value in first_kwargs.items()
+        if key != 'name'
+    }
+    fused_names: list[str] = []
+    offset = 0
+
+    for spec in self._group_specs:
+      if spec.use_ray_envs:
+        raise ValueError('Mixed fused worker does not support ray_envs=True.')
+      if spec.dolphin_kwargs['online_delay'] != first_online_delay:
+        raise ValueError('All mixed fused groups must share the same online_delay.')
+      if spec.use_gpu != first_spec.use_gpu:
+        raise ValueError('All mixed fused groups must share the same use_gpu setting.')
+      if spec.damage_ratio != damage_ratio:
+        raise ValueError('All mixed fused groups must share the same damage_ratio.')
+
+      batch_slices: dict[Port, slice] = {}
+      for port in spec.ports:
+        kwargs = dict(spec.agent_kwargs[port])
+        if kwargs.get('state') is not first_state:
+          raise ValueError('All mixed fused groups must share the same state object.')
+        port_names = kwargs.get('name')
+        if port_names is None or len(port_names) != spec.num_envs:
+          raise ValueError(
+              f'Expected name list length {spec.num_envs} for port {port} in group {spec.label}.')
+        other_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key != 'name'
+        }
+        for key in other_kwargs:
+          if key == 'state':
+            continue
+          if other_kwargs[key] != fused_kwargs.get(key):
+            raise ValueError(
+                f'Mixed fused groups require identical agent kwarg {key}; '
+                f'group {spec.label} port {port} differed.')
+        fused_names.extend(port_names)
+        batch_slices[port] = slice(offset, offset + spec.num_envs)
+        offset += spec.num_envs
+
+      dolphin_kwargs = spec.dolphin_kwargs.copy()
+      for port in spec.ports:
+        eval_lib.update_character(
+            dolphin_kwargs['players'][port],
+            first_state['config'],
+        )
+      env_ids = list(range(spec.num_envs))
+      env = _build_env_instance(
+          num_envs=spec.num_envs,
+          dolphin_kwargs=dolphin_kwargs,
+          async_envs=spec.async_envs,
+          env_kwargs=spec.env_kwargs,
+          use_fake_envs=spec.use_fake_envs,
+          use_ray_envs=spec.use_ray_envs,
+          agent_names=spec.agent_names,
+          scheduler=spec.scheduler,
+          env_ids=env_ids,
+      )
+      self._groups.append(_MixedGroupRuntime(
+          spec=spec,
+          env=env,
+          env_ids=env_ids,
+          batch_slices=batch_slices,
+      ))
+
+    self._total_batch_size = offset
+    fused_kwargs['name'] = fused_names
+    self._fused_agent = eval_lib.build_delayed_agent(
+        console_delay=first_online_delay,
+        batch_size=self._total_batch_size,
+        run_on_cpu=not first_spec.use_gpu,
+        **fused_kwargs,
+    )
+    self._damage_ratio = damage_ratio
+
+    self._prev_agent_outputs.append(
+        self._split_outputs(self._fused_agent.dummy_sample_outputs)
+    )
+
+    slack = 1 + self._fused_agent.delay
+    max_agent_buffer = self._fused_agent.batch_steps - 1
+    max_env_buffer = max(group.env.num_steps - 1 for group in self._groups)
+    if max_agent_buffer + max_env_buffer >= slack:
+      self.stop()
+      raise ValueError(
+          f'Agent and environment step buffer sizes are too large: '
+          f'{max_agent_buffer} + {max_env_buffer} >= {slack}')
+
+    self.env_runahead = self._fused_agent.delay - (self._fused_agent.batch_steps - 1)
+    for _ in range(self.env_runahead):
+      self._push_actions()
+
+  def _rebuild_envs(self):
+    first_state = self._group_specs[0].agent_kwargs[self._group_specs[0].ports[0]]['state']
+    new_groups: list[_MixedGroupRuntime] = []
+    for group in self._groups:
+      group.env.stop()
+      dolphin_kwargs = group.spec.dolphin_kwargs.copy()
+      for port in group.spec.ports:
+        eval_lib.update_character(
+            dolphin_kwargs['players'][port],
+            first_state['config'],
+        )
+      env = _build_env_instance(
+          num_envs=group.spec.num_envs,
+          dolphin_kwargs=dolphin_kwargs,
+          async_envs=group.spec.async_envs,
+          env_kwargs=group.spec.env_kwargs,
+          use_fake_envs=group.spec.use_fake_envs,
+          use_ray_envs=group.spec.use_ray_envs,
+          agent_names=group.spec.agent_names,
+          scheduler=group.spec.scheduler,
+          env_ids=group.env_ids,
+      )
+      new_groups.append(_MixedGroupRuntime(
+          spec=group.spec,
+          env=env,
+          env_ids=group.env_ids,
+          batch_slices=group.batch_slices,
+      ))
+    self._groups = new_groups
+
+  def _split_outputs(
+      self,
+      outputs: SampleOutputs,
+  ) -> list[dict[Port, SampleOutputs]]:
+    split_groups: list[dict[Port, SampleOutputs]] = []
+    for group in self._groups:
+      per_port: dict[Port, SampleOutputs] = {}
+      for port in group.spec.ports:
+        sl = group.batch_slices[port]
+        per_port[port] = utils.map_single_structure(
+            lambda x, sl=sl: x[sl],
+            outputs,
+        )
+      split_groups.append(per_port)
+    return split_groups
+
+  def _split_controllers(
+      self,
+      controllers_all,
+  ) -> list[dict[Port, tp.Any]]:
+    split_groups: list[dict[Port, tp.Any]] = []
+    for group in self._groups:
+      per_port = {}
+      for port in group.spec.ports:
+        sl = group.batch_slices[port]
+        per_port[port] = utils.map_single_structure(
+            lambda x, sl=sl: x[sl],
+            controllers_all,
+        )
+      split_groups.append(per_port)
+    return split_groups
+
+  def _pack_states(self, outputs: list[env_lib.EnvOutput]) -> Game:
+    packed = []
+    for group, output in zip(self._groups, outputs):
+      for port in group.spec.ports:
+        packed.append(output.gamestates[port])
+    return utils.map_nt(lambda *xs: np.concatenate(xs, axis=0), *packed)
+
+  def _pack_needs_reset(self, outputs: list[env_lib.EnvOutput]) -> np.ndarray:
+    pieces = []
+    for group, output in zip(self._groups, outputs):
+      pieces.extend([output.needs_reset] * len(group.spec.ports))
+    return np.concatenate(pieces, axis=0)
+
+  def reset_env(self):
+    self._rebuild_envs()
+    assert len(self._prev_agent_outputs) == 1 + self.env_runahead
+    for outputs_by_group in list(self._prev_agent_outputs)[1:]:
+      decoded_actions_by_group = []
+      for per_port in outputs_by_group:
+        decoded_actions_by_group.append({
+            port: self._fused_agent.embed_controller.decode(output.controller_state)
+            for port, output in per_port.items()
+        })
+      for group, decoded_actions in zip(self._groups, decoded_actions_by_group):
+        with group.env_push_profiler:
+          group.env.push(decoded_actions)
+
+  def _push_actions(self):
+    with self._agent_pop_profiler:
+      combined = self._fused_agent.pop()
+    outputs_by_group = self._split_outputs(combined)
+    self._prev_agent_outputs.append(outputs_by_group)
+
+    decoded_all = self._fused_agent.embed_controller.decode(
+        combined.controller_state)
+    decoded_actions_by_group = self._split_controllers(decoded_all)
+    for group, decoded_actions in zip(self._groups, decoded_actions_by_group):
+      with group.env_push_profiler:
+        group.env.push(decoded_actions)
+
+  def rollout(self, num_steps: int) -> tuple[Trajectory, Timings]:
+    if num_steps % self._fused_agent.batch_steps != 0:
+      raise ValueError('Agent batch steps must divide rollout length.')
+
+    gamestates = [
+        {port: [] for port in group.spec.ports}
+        for group in self._groups
+    ]
+    sample_outputs = [
+        {port: [] for port in group.spec.ports}
+        for group in self._groups
+    ]
+    is_resetting = [[] for _ in self._groups]
+
+    fused_initial = self._fused_agent.hidden_state
+    initial_states: list[dict[Port, policies.RecurrentState]] = []
+    for group in self._groups:
+      per_port = {}
+      for port in group.spec.ports:
+        sl = group.batch_slices[port]
+        per_port[port] = utils.map_single_structure(
+            lambda x, sl=sl: x[sl],
+            fused_initial,
+        )
+      initial_states.append(per_port)
+
+    def record_state(
+        outputs: list[env_lib.EnvOutput],
+        prev_outputs: list[dict[Port, SampleOutputs]],
+    ):
+      for group_index, (group, output, prev) in enumerate(
+          zip(self._groups, outputs, prev_outputs)):
+        for port in group.spec.ports:
+          gamestates[group_index][port].append(output.gamestates[port])
+          sample_outputs[group_index][port].append(prev[port])
+        is_resetting[group_index].append(output.needs_reset)
+
+    for _ in range(num_steps):
+      outputs = []
+      for group in self._groups:
+        with group.env_pop_profiler:
+          outputs.append(group.env.pop())
+
+      record_state(outputs, self._prev_agent_outputs.popleft())
+      packed_game = self._pack_states(outputs)
+      packed_reset = self._pack_needs_reset(outputs)
+      self._fused_agent.push(packed_game, packed_reset)
+      self._push_actions()
+
+    final_outputs = [group.env.peek() for group in self._groups]
+    record_state(final_outputs, self._prev_agent_outputs[0])
+
+    assert len(self._prev_agent_outputs) == 1 + self.env_runahead
+    remaining_actions = list(self._prev_agent_outputs)[1:]
+    delayed_actions = [
+        {port: [] for port in group.spec.ports}
+        for group in self._groups
+    ]
+    for outputs_by_group in remaining_actions:
+      for group_index, group_outputs in enumerate(outputs_by_group):
+        for port in self._groups[group_index].spec.ports:
+          delayed_actions[group_index][port].append(group_outputs[port])
+
+    num_left = self._fused_agent.delay - self.env_runahead
+    peeked = self._fused_agent.peek_n(num_left)
+    for combined in peeked:
+      outputs_by_group = self._split_outputs(combined)
+      for group_index, group_outputs in enumerate(outputs_by_group):
+        for port in self._groups[group_index].spec.ports:
+          delayed_actions[group_index][port].append(group_outputs[port])
+
+    group_trajectories: list[Trajectory] = []
+    unexpected_reset_by_mode: dict[str, np.ndarray] = {}
+    timing_by_mode: dict[str, tp.Any] = {}
+    name_code = np.asarray(self._fused_agent.name_code, dtype=embed.NAME_DTYPE)
+    if name_code.ndim == 0:
+      name_code = np.full(
+          [self._total_batch_size],
+          name_code,
+          dtype=embed.NAME_DTYPE,
+      )
+    for group_index, group in enumerate(self._groups):
+      per_port_trajectories = []
+      group_is_resetting = np.array(is_resetting[group_index])
+      unexpected_reset_by_mode[group.spec.label] = group_is_resetting[1:]
+      for port in group.spec.ports:
+        sl = group.batch_slices[port]
+        states = utils.batch_nest_nt(gamestates[group_index][port])
+        per_port_trajectories.append(Trajectory(
+            states=self._fused_agent._policy.embed_game.from_state(states),
+            name=np.broadcast_to(
+                np.asarray(name_code[sl], dtype=embed.NAME_DTYPE),
+                [num_steps + 1, group.spec.num_envs],
+            ).copy(),
+            actions=utils.batch_nest_nt(sample_outputs[group_index][port]),
+            rewards=reward.compute_rewards(states, self._damage_ratio),
+            is_resetting=group_is_resetting,
+            initial_state=initial_states[group_index][port],
+            delayed_actions=delayed_actions[group_index][port],
+        ))
+      group_trajectories.append(Trajectory.batch(per_port_trajectories))
+
+      timing_by_mode[group.spec.label] = {
+          'env_pop': group.env_pop_profiler.mean_time(),
+          'env_push': group.env_push_profiler.mean_time(),
+          'agent_pop': {
+              port: self._agent_pop_profiler.mean_time()
+              for port in group.spec.ports
+          },
+          'agent_step': {
+              port: self._fused_agent.step_profiler.mean_time()
+              for port in group.spec.ports
+          },
+      }
+
+    return (
+        Trajectory.batch(group_trajectories),
+        dict(
+            timing=timing_by_mode,
+            unexpected_reset=unexpected_reset_by_mode,
+        ),
+    )
+
+  def update_variables(self, updates: tp.Mapping[Port, Params]):
+    if not updates:
+      return
+    any_values = next(iter(updates.values()))
+    policy = self._fused_agent._policy
+    for var, val in zip(policy.variables, any_values):
+      var.assign(val)
+
+  @contextlib.contextmanager
+  def run(self):
+    try:
+      self.start()
+      yield
+    finally:
+      self.stop()
+
+  def start(self):
+    self._fused_agent.start()
+
+  def stop(self):
+    if self._fused_agent is not None:
+      self._fused_agent.stop()
+    for group in self._groups:
+      group.env.stop()
 
 class RolloutMetrics(tp.NamedTuple):
   reward: float
