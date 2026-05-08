@@ -174,8 +174,6 @@ class Dolphin:
     # if we have remote players, dont wait for them to select characters
     remote_players = [port for port, player in players.items() if isinstance(player, RemoteAI)]
     self.menu_helper = melee.MenuHelper(is_singles=len(players) == 2, remote_players=remote_players)
-    if starting_stocks and console_kwargs.get('infinite_time', False):
-      raise ValueError('starting_stocks is incompatible with infinite_time=True.')
     if instant_match:
       if existing_dolphin:
         raise ValueError('instant_match requires launching a fresh Dolphin instance.')
@@ -184,10 +182,7 @@ class Dolphin:
           stage=stage,
           character_pool=instant_match_character_pool,
           stage_pool=instant_match_stage_pool,
-          starting_stocks=starting_stocks,
       )
-
-    console_starting_stocks = starting_stocks
     console = melee.Console(
         path=path,
         online_delay=online_delay,
@@ -198,17 +193,15 @@ class Dolphin:
         copy_home_directory=False,
         setup_gecko_codes=True,
         save_replays=save_replays,
-        slippi_starting_stocks=console_starting_stocks,
         **console_kwargs,
     )
     _enable_gecko_cheats(console)
     if self._instant_match_config is not None:
       instant_match_lib.inject_gecko_codes(console, self._instant_match_config)
       logging.info(
-          'Enabled instant_match with chars=%s stages=%s stocks=%d',
+          'Enabled instant_match with chars=%s stages=%s',
           [c.name for c in self._instant_match_config.character_pool],
           [s.name for s in self._instant_match_config.stage_pool],
-          self._instant_match_config.starting_stocks,
       )
     atexit.register(console.stop)
     self.console = console

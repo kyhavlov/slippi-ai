@@ -298,6 +298,7 @@ class DoublesSession:
         self._bot_codes: Dict[int, str] = {}
         self._player_orders: Dict[int, Tuple[int, ...]] = {}
         self._teammate_ports: Dict[int, Optional[int]] = {}
+        self._no_teammate_signatures: Dict[int, Tuple[int, Tuple[int, ...]]] = {}
         self._dead_frames: Dict[int, int] = {spec.logical_port: 0 for spec in self.bot_specs}
         self._pressed_start: Dict[int, bool] = {spec.logical_port: False for spec in self.bot_specs}
         self._has_entered_game = False
@@ -761,10 +762,18 @@ class DoublesSession:
                 break
 
         if teammate_port is None:
-            logging.warning(
-                "Discord bot could not identify teammate yet "
-                "logical_port=%s local_player_port=%s players=%s",
-                logical_port, my_port, sorted(gamestate.players))
+            no_teammate_signature = (
+                int(my_port),
+                tuple(sorted(int(port) for port in gamestate.players)),
+            )
+            if self._no_teammate_signatures.get(logical_port) != no_teammate_signature:
+                self._no_teammate_signatures[logical_port] = no_teammate_signature
+                logging.warning(
+                    "Discord bot could not identify teammate yet "
+                    "logical_port=%s local_player_port=%s players=%s",
+                    logical_port, my_port, sorted(gamestate.players))
+        else:
+            self._no_teammate_signatures.pop(logical_port, None)
 
         known_order = [int(my_port)]
         if teammate_port is not None and teammate_port not in known_order:
