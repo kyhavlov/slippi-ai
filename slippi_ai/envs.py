@@ -12,7 +12,6 @@ from typing import Mapping, Optional
 import time
 
 import numpy as np
-import portpicker
 
 from melee.slippstream import EnetDisconnected
 from melee import GameState, Stage, enums
@@ -377,7 +376,7 @@ class SafeEnvironment:
 
   def _reset_port(self):
     old_port = self._dolphin_kwargs['slippi_port']
-    new_port = portpicker.pick_unused_port()
+    new_port = utils.find_open_udp_port()
     logging.warning('Switching from port %d to port %d.', old_port, new_port)
     self._dolphin_kwargs['slippi_port'] = new_port
 

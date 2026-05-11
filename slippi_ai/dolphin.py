@@ -8,12 +8,11 @@ import random
 from typing import Dict, Mapping, Optional, Iterator
 
 import fancyflags as ff
-import portpicker
 
 import melee
 from melee.console import get_dolphin_version, DumpConfig, DolphinBuild
 
-from slippi_ai import instant_match as instant_match_lib
+from slippi_ai import instant_match as instant_match_lib, utils
 
 class Player(abc.ABC):
 
@@ -169,7 +168,7 @@ class Dolphin:
             'Headless requires mainline dolphin or a custom dolphin build. '
             'See https://github.com/vladfi1/libmelee?tab=readme-ov-file#setup-instructions')
 
-    slippi_port = slippi_port or portpicker.pick_unused_port()
+    slippi_port = slippi_port or utils.find_open_udp_port()
 
     # if we have remote players, dont wait for them to select characters
     remote_players = [port for port, player in players.items() if isinstance(player, RemoteAI)]

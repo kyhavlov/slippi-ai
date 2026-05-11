@@ -12,11 +12,10 @@ from typing import Optional
 from absl import app, flags
 import fancyflags as ff
 from twitchio.ext import commands, routines
-import portpicker
 import ray
 
 from slippi_ai import train_lib
-from slippi_ai import flag_utils, eval_lib
+from slippi_ai import flag_utils, eval_lib, utils
 from slippi_ai import dolphin as dolphin_lib
 
 # Twitch settings
@@ -479,7 +478,7 @@ class Bot(commands.Bot):
       render: bool = False,
   ) -> Session:
     config = dataclasses.replace(self.dolphin_config)
-    config.slippi_port = portpicker.pick_unused_port()
+    config.slippi_port = utils.find_open_udp_port()
     config.connect_code = connect_code
     config.render = render
     config.headless = not render
@@ -498,7 +497,7 @@ class Bot(commands.Bot):
 
   def _start_bot_session(self, render: bool = True) -> BotSession:
     config = dataclasses.replace(self.dolphin_config)
-    config.slippi_port = portpicker.pick_unused_port()
+    config.slippi_port = utils.find_open_udp_port()
     config.connect_code = None
     config.render = render
     config.headless = not render

@@ -3,6 +3,7 @@ import dataclasses
 import gc
 import logging
 import multiprocessing as mp
+import os
 import platform
 import queue
 import random
@@ -311,9 +312,24 @@ def interleave(*iterables: tp.Iterable[T]) -> tp.Iterator[T]:
       except StopIteration:
         iterators.remove(iterator)
 
+SLIPPI_PORT_MIN = int(os.environ.get('SLIPPI_PORT_MIN', '25000'))
+SLIPPI_PORT_MAX = int(os.environ.get('SLIPPI_PORT_MAX', '65535'))
+
+
+def get_slippi_port_range() -> tuple[int, int]:
+  min_port = SLIPPI_PORT_MIN
+  max_port = SLIPPI_PORT_MAX
+  if min_port < 0 or max_port < 0:
+    raise ValueError(f'Port range must be non-negative, got {min_port}-{max_port}')
+  if min_port >= max_port:
+    raise ValueError(f'Invalid port range {min_port}-{max_port}')
+  if max_port > 65535:
+    raise ValueError(f'Port range upper bound must be <= 65535, got {max_port}')
+  return min_port, max_port
+
+
 def find_open_udp_ports(num: int):
-  min_port = 10_000
-  max_port = 2 ** 16
+  min_port, max_port = get_slippi_port_range()
 
   system = platform.system()
   if system == 'Linux':
@@ -342,12 +358,16 @@ def find_open_udp_ports(num: int):
     if address in ('::', 'localhost', '0.0.0.0', '*'):
       used_ports.add(int(port))
 
-  available_ports = set(range(min_port, max_port)) - used_ports
+  available_ports = set(range(min_port, max_port + 1)) - used_ports
 
   if len(available_ports) < num:
     raise RuntimeError('Not enough available ports.')
 
   return random.sample(list(available_ports), num)
+
+
+def find_open_udp_port() -> int:
+  return find_open_udp_ports(1)[0]
 
 
 def ref_path_exists(
