@@ -1,5 +1,6 @@
 """Bot that runs on Discord and lets people play against phillip 2 in doubles matches."""
 
+import copy
 import dataclasses
 import datetime
 import json
@@ -8,6 +9,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from typing import Optional, Dict, List, Tuple, Any
 
 from absl import app, flags
@@ -16,14 +18,15 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import numpy as np
-import portpicker
 import ray
+import tensorflow as tf
 
 from slippi_ai import data as data_lib
-from slippi_ai import flag_utils, eval_lib, nametags, utils
+from slippi_ai import flag_utils, eval_lib, nametags, utils, envs as env_lib
 from slippi_ai import dolphin as dolphin_lib
 from slippi_ai.controller_lib import send_controller
 from slippi_db.parse_libmelee import get_game
+from slippi_ai.types import Game
 from melee.enums import Character
 import melee
 
@@ -57,6 +60,15 @@ agent_flags.update(
     jit_compile=ff.Boolean(False),
 )
 AGENT = ff.DEFINE_dict('agent', **agent_flags)
+GPU_MODEL = flags.DEFINE_string(
+    'gpu_model', None,
+    'Basename or path of a single checkpoint to serve on a shared GPU inference actor.')
+GPU_MICROBATCH_MS = flags.DEFINE_float(
+    'gpu_microbatch_ms', 1.0,
+    'Maximum time in milliseconds to wait for additional GPU-model session requests before running a batch.')
+GPU_MEMORY_LIMIT_MB = flags.DEFINE_integer(
+    'gpu_memory_limit_mb', None,
+    'Optional TensorFlow VRAM cap in MB for the shared Discord GPU inference process.')
 
 # Session management settings
 MENU_TIMEOUT = flags.DEFINE_float(
@@ -64,25 +76,56 @@ MENU_TIMEOUT = flags.DEFINE_float(
 MAX_SESSIONS = flags.DEFINE_integer(
     'max_sessions', 4, 'Maximum number of concurrent sessions')
 STALL_TIMEOUT_SECONDS = 120.0
-
-SUPPORTED_PLAYSTYLES = (
-    'Master Player',
-    'Ralph',
-    'Darkatma',
-    'Dragunov',
-    'Tempo',
-    'xRunRiot',
-)
-
+DEFAULT_PLAYSTYLE_SENTINEL = "__DEFAULT__"
 
 class SessionLaunchError(Exception):
     """User-facing session launch failure."""
 
 
-def get_playstyle_choices():
+PLAYABLE_CHARACTER_CHOICES = [
+    (Character.FOX, "Fox"),
+    (Character.FALCO, "Falco"),
+    (Character.SHEIK, "Sheik"),
+    (Character.MARTH, "Marth"),
+    (Character.PEACH, "Peach"),
+    (Character.CPTFALCON, "Captain Falcon"),
+    (Character.JIGGLYPUFF, "Jigglypuff"),
+    (Character.PIKACHU, "Pikachu"),
+    (Character.SAMUS, "Samus"),
+    (Character.YOSHI, "Yoshi"),
+    (Character.POPO, "Ice Climbers"),
+    (Character.LUIGI, "Luigi"),
+    (Character.DK, "Donkey Kong"),
+    (Character.GAMEANDWATCH, "Mr. Game & Watch"),
+    (Character.GANONDORF, "Ganondorf"),
+    (Character.BOWSER, "Bowser"),
+    (Character.LINK, "Link"),
+    (Character.DOC, "Dr. Mario"),
+    (Character.MARIO, "Mario"),
+    (Character.NESS, "Ness"),
+    (Character.MEWTWO, "Mewtwo"),
+    (Character.ROY, "Roy"),
+    (Character.ZELDA, "Zelda"),
+    (Character.YLINK, "Young Link"),
+    (Character.PICHU, "Pichu"),
+]
+
+
+def _filter_autocomplete_choices(
+    choices: list[tuple[str, str]],
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    normalized = current.strip().lower()
+    if normalized:
+        filtered = [
+            (name, value) for name, value in choices
+            if normalized in name.lower() or normalized in value.lower()
+        ]
+    else:
+        filtered = choices
     return [
-        app_commands.Choice(name=name, value=name)
-        for name in SUPPORTED_PLAYSTYLES
+        app_commands.Choice(name=name, value=value)
+        for name, value in filtered[:25]
     ]
 
 
@@ -115,6 +158,9 @@ def resolve_playstyle_for_state(
     if not supported_names:
         return nametags.DEFAULT_NAME
 
+    if requested_playstyle == DEFAULT_PLAYSTYLE_SENTINEL:
+        requested_playstyle = None
+
     normalized_to_supported = {
         nametags.normalize_name(name): name for name in supported_names
     }
@@ -135,6 +181,8 @@ def resolve_playstyle_for_state(
 
 
 def format_playstyle(requested_playstyle: Optional[str], resolved_playstyle: str) -> str:
+    if requested_playstyle == DEFAULT_PLAYSTYLE_SENTINEL:
+        return resolved_playstyle
     if not requested_playstyle:
         return resolved_playstyle
     if nametags.normalize_name(requested_playstyle) == nametags.normalize_name(resolved_playstyle):
@@ -168,6 +216,55 @@ def get_allowed_characters_for_state(state: dict) -> Optional[list[Character]]:
     return data_lib.chars_from_string(allowed_characters)
 
 
+def get_playstyle_autocomplete_choices(
+    state: dict,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    supported_names = _supported_state_names(state)
+    default_playstyle = supported_names[0] if supported_names else None
+    current_normalized = current.strip().lower()
+    choices = []
+    default_label = (
+        f'Default ({default_playstyle})'
+        if default_playstyle
+        else 'None'
+    )
+    if (
+        not current_normalized or
+        'default'.startswith(current_normalized) or
+        'none'.startswith(current_normalized)
+    ):
+        choices.append(app_commands.Choice(
+            name=default_label,
+            value=DEFAULT_PLAYSTYLE_SENTINEL,
+        ))
+    choices.extend(_filter_autocomplete_choices(
+        [
+            (name, name) for name in supported_names
+            if name != default_playstyle
+        ],
+        current,
+    ))
+    return choices[:25]
+
+
+def get_character_autocomplete_choices(
+    state: dict,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    allowed_characters = get_allowed_characters_for_state(state)
+    if allowed_characters is None:
+        choices = [(display_name, character.name) for character, display_name in PLAYABLE_CHARACTER_CHOICES]
+    else:
+        allowed_set = set(allowed_characters)
+        choices = [
+            (display_name, character.name)
+            for character, display_name in PLAYABLE_CHARACTER_CHOICES
+            if character in allowed_set
+        ]
+    return _filter_autocomplete_choices(choices, current)
+
+
 def format_character_list(characters: list[Character]) -> str:
     return ', '.join(format_character(character) for character in characters)
 
@@ -176,6 +273,36 @@ def format_launch_exception(exc: Exception) -> str:
     lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
     message = lines[-1] if lines else repr(exc)
     return message[:1500]
+
+
+def resolve_gpu_model_path(models_path: str, gpu_model: Optional[str]) -> Optional[str]:
+    if not gpu_model:
+        return None
+    if os.path.isabs(gpu_model):
+        return gpu_model
+    return os.path.join(models_path, gpu_model)
+
+
+def configure_tensorflow_gpu_limit(memory_limit_mb: Optional[int]):
+    if memory_limit_mb is None:
+        return
+    if memory_limit_mb <= 0:
+        raise ValueError(f'gpu_memory_limit_mb must be positive, got {memory_limit_mb}')
+    gpus = tf.config.list_physical_devices('GPU')
+    if not gpus:
+        logging.warning(
+            'Requested Discord GPU memory cap of %d MB, but no GPUs are visible.',
+            memory_limit_mb,
+        )
+        return
+    logical_config = [tf.config.LogicalDeviceConfiguration(memory_limit=memory_limit_mb)]
+    for gpu in gpus:
+        tf.config.set_logical_device_configuration(gpu, logical_config)
+    logging.info(
+        'Configured TensorFlow logical GPU memory limit to %d MB on %d visible GPU(s).',
+        memory_limit_mb,
+        len(gpus),
+    )
 
 
 class FinalizedDelayBuffer:
@@ -252,6 +379,266 @@ class FinalizedDelayBuffer:
         return ready
 
 
+class DiscordInGameFrameProcessor:
+    """Converts non-menu Slippstream frames into Discord inference frames."""
+
+    def __init__(self, *, logical_port: int, observation_delay: int):
+        self.logical_port = logical_port
+        self.observation_delay = int(observation_delay)
+        self.finalized_buffer = FinalizedDelayBuffer(self.observation_delay)
+        self.last_live_frame: Optional[int] = None
+        self.last_logged_gap_frame: Optional[int] = None
+        self.last_logged_missing_frame: Optional[int] = None
+        self.last_logged_lag_bucket: Optional[int] = None
+        self._logged_finalized_start = False
+
+    def clear(self):
+        self.finalized_buffer.clear()
+        self.last_live_frame = None
+        self.last_logged_gap_frame = None
+        self.last_logged_missing_frame = None
+        self.last_logged_lag_bucket = None
+
+    def process(self, gamestate: melee.GameState) -> list[melee.GameState]:
+        frame = int(gamestate.frame)
+        if frame < 0:
+            self.clear()
+            gamestate.custom['discordbot_delayed_finalized'] = True
+            return [gamestate]
+
+        finalized_frame = getattr(gamestate, 'finalized_frame', None)
+        if finalized_frame is None:
+            raise RuntimeError(
+                f'In-game frame missing finalized_frame for logical_port={self.logical_port} '
+                f'frame={gamestate.frame}')
+
+        if self.last_live_frame is not None:
+            if frame <= self.last_live_frame:
+                logging.warning(
+                    "Discord bot live frame rollback/correction "
+                    "logical_port=%s from=%s to=%s finalized=%s",
+                    self.logical_port, self.last_live_frame, frame, finalized_frame)
+            elif frame > self.last_live_frame + 1:
+                logging.warning(
+                    "Discord bot live frame gap logical_port=%s "
+                    "from=%s to=%s skipped=%s finalized=%s",
+                    self.logical_port, self.last_live_frame, frame,
+                    frame - self.last_live_frame - 1, finalized_frame)
+        self.last_live_frame = frame
+
+        if self.finalized_buffer.delay != self.observation_delay:
+            self.finalized_buffer = FinalizedDelayBuffer(self.observation_delay)
+            self._logged_finalized_start = False
+
+        if not self._logged_finalized_start:
+            logging.info(
+                "Using finalized Slippstream frames for logical_port=%s delay=%s",
+                self.logical_port, self.observation_delay)
+            self._logged_finalized_start = True
+
+        lag = frame - int(finalized_frame)
+        lag_bucket = lag // 5
+        if lag >= 5 and lag_bucket != self.last_logged_lag_bucket:
+            logging.info(
+                "Discord bot finalized lag logical_port=%s "
+                "live=%s finalized=%s lag=%s delay=%s",
+                self.logical_port, frame, finalized_frame, lag,
+                self.observation_delay)
+            self.last_logged_lag_bucket = lag_bucket
+
+        published = self.finalized_buffer.push(gamestate)
+        if (
+            self.finalized_buffer.last_gap_frame is not None and
+            self.finalized_buffer.last_gap_frame != self.last_logged_gap_frame
+        ):
+            logging.warning(
+                "Discord bot delayed-finalized missing frame logical_port=%s "
+                "missing=%s target=%s live=%s finalized=%s",
+                self.logical_port,
+                self.finalized_buffer.last_gap_frame,
+                self.finalized_buffer.next_frame,
+                frame,
+                finalized_frame,
+            )
+            self.last_logged_gap_frame = self.finalized_buffer.last_gap_frame
+        return published
+
+def _make_dummy_raw_game(batch_size: int) -> Game:
+    game = utils.map_nt(
+        lambda t: np.zeros([batch_size], dtype=t),
+        env_lib.reified_game,
+    )
+    game = game._replace(
+        stage=np.full([batch_size], melee.Stage.FINAL_DESTINATION.value, dtype=np.uint8),
+        is_teams=np.full([batch_size], True, dtype=np.bool_),
+    )
+    for player_name in ('p0', 'p1', 'p2', 'p3'):
+        player = getattr(game, player_name)
+        player = player._replace(
+            character=np.full([batch_size], melee.Character.FOX.value, dtype=np.uint8),
+            stocks_left=np.full([batch_size], 4, dtype=np.uint8),
+            is_dead=np.full([batch_size], False, dtype=np.bool_),
+        )
+        game = game._replace(**{player_name: player})
+    return game
+
+
+@dataclasses.dataclass
+class _SessionGpuAgent:
+    agent: Any
+    batch_size: int
+
+
+class LocalDiscordGpuInferenceServer:
+    """Single-process GPU owner that uses the normal delayed-agent path."""
+
+    def __init__(
+        self,
+        *,
+        model_path: str,
+        console_delay: int,
+        max_sessions: int,
+        max_local_bots: int,
+        batch_window_ms: float,
+        compile: bool,
+        jit_compile: bool,
+        sample_temperature: float,
+        batch_steps: int,
+    ):
+        if batch_steps != 0:
+            raise ValueError(
+                'Discord GPU inference server currently requires batch_steps=0.')
+        self.model_path = model_path
+        self.console_delay = int(console_delay)
+        self.max_total_batch = int(max_sessions) * int(max_local_bots)
+        del batch_window_ms
+        self._state = eval_lib.load_state(path=model_path)
+        policy_delay = int(self._state['config']['policy']['delay'])
+        if self.console_delay > policy_delay:
+            raise ValueError(
+                f'console_delay={self.console_delay} exceeds policy delay={policy_delay}.')
+        self.delay = policy_delay - self.console_delay
+        self._compile = compile
+        self._jit_compile = jit_compile
+        self._sample_temperature = sample_temperature
+        self._closed = False
+        self._session_agents: dict[str, _SessionGpuAgent] = {}
+        self._infer_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._batches_processed = 0
+        self._last_batch_size = 0
+        self._max_batch_size_seen = 0
+
+    def warmup(self):
+        start_time = time.time()
+        warm_names = [self._default_name()] * min(3, self.max_total_batch)
+        agent = self._build_agent(warm_names)
+        agent.start()
+        self._warm_agent(agent, len(warm_names))
+        agent.stop()
+        logging.info(
+            'Warmed local Discord GPU inference server for %s in %.3fs',
+            os.path.basename(self.model_path),
+            time.time() - start_time,
+        )
+        return dict(delay=self.delay, max_total_batch=self.max_total_batch)
+
+    def model_metadata(self):
+        return {
+            key: copy.deepcopy(self._state[key])
+            for key in ('config', 'name_map', 'rl_config', 'agent_config')
+            if key in self._state
+        }
+
+    def register_session(self, session_key: str, names: list[str]):
+        if not names:
+            raise ValueError('GPU-served sessions require at least one agent name.')
+        with self._lifecycle_lock:
+            if session_key in self._session_agents:
+                raise ValueError(f'Session {session_key} already registered.')
+            agent = self._build_agent(names)
+            agent.start()
+            self._warm_agent(agent, len(names))
+            self._session_agents[session_key] = _SessionGpuAgent(
+                agent=agent,
+                batch_size=len(names),
+            )
+        return dict(delay=self.delay, batch_size=len(names))
+
+    def unregister_session(self, session_key: str):
+        with self._lifecycle_lock:
+            session = self._session_agents.pop(session_key, None)
+        if session is not None:
+            session.agent.stop()
+
+    def infer(
+        self,
+        session_key: str,
+        game: Game,
+        needs_reset: np.ndarray,
+    ):
+        if self._closed:
+            raise RuntimeError('Discord GPU inference server is closed.')
+        session = self._session_agents.get(session_key)
+        if session is None:
+            raise ValueError(f'Unknown GPU session {session_key}.')
+        if len(needs_reset) != session.batch_size:
+            raise ValueError(
+                f'Session {session_key} expected batch_size={session.batch_size}, '
+                f'got {len(needs_reset)}')
+        with self._infer_lock:
+            self._batches_processed += 1
+            self._last_batch_size = len(needs_reset)
+            self._max_batch_size_seen = max(self._max_batch_size_seen, len(needs_reset))
+            sample_outputs = session.agent.step_undelayed(game, needs_reset)
+            return session.agent.embed_controller.decode(sample_outputs.controller_state)
+
+    def stats(self):
+        return dict(
+            batches_processed=self._batches_processed,
+            last_batch_size=self._last_batch_size,
+            max_batch_size_seen=self._max_batch_size_seen,
+        )
+
+    def close(self):
+        self._closed = True
+        with self._lifecycle_lock:
+            sessions = list(self._session_agents.values())
+            self._session_agents.clear()
+        for session in sessions:
+            session.agent.stop()
+
+    def _default_name(self) -> str:
+        rl_name = eval_lib.get_name_from_rl_state(self._state)
+        if rl_name:
+            return rl_name[0]
+        name_map = self._state.get('name_map', {})
+        if name_map:
+            return next(iter(name_map))
+        return nametags.DEFAULT_NAME
+
+    def _build_agent(self, names: list[str]):
+        return eval_lib.build_delayed_agent(
+            state=self._state,
+            batch_size=len(names),
+            console_delay=self.console_delay,
+            name=names,
+            async_inference=False,
+            sample_temperature=self._sample_temperature,
+            compile=self._compile,
+            jit_compile=self._jit_compile,
+            batch_steps=0,
+            run_on_cpu=False,
+        )
+
+    def _warm_agent(self, agent: Any, batch_size: int):
+        game = _make_dummy_raw_game(batch_size)
+        needs_reset = np.zeros([batch_size], dtype=np.bool_)
+        for _ in range(3):
+            sample_outputs = agent.step_undelayed(game, needs_reset)
+            agent.embed_controller.decode(sample_outputs.controller_state)
+
+
 @dataclasses.dataclass
 class BotSpec:
     """Configuration for one local bot inside a Discord session."""
@@ -271,12 +658,22 @@ class DoublesSession:
         agent_kwargs: dict,
         connect_code: str,
         bot_specs: List[BotSpec],
+        gpu_server: Optional[Any] = None,
+        gpu_model_basename: Optional[str] = None,
+        disable_process_gpus: bool = True,
     ):
-        eval_lib.disable_gpus()
+        if disable_process_gpus:
+            eval_lib.disable_gpus()
         self.dolphin_config = dolphin_config
         self.agent_kwargs = agent_kwargs
         self.connect_code = connect_code
         self.bot_specs = list(bot_specs)
+        self._gpu_server = gpu_server
+        self._gpu_model_basename = gpu_model_basename
+        self._gpu_session_key: Optional[str] = None
+        self._gpu_serving_enabled = False
+        self._resolved_agent_names: list[str] = []
+        self._policy_observation_delay = 0
 
         self.stop_requested = threading.Event()
         self._lock = threading.RLock()
@@ -299,9 +696,11 @@ class DoublesSession:
         self._player_orders: Dict[int, Tuple[int, ...]] = {}
         self._teammate_ports: Dict[int, Optional[int]] = {}
         self._no_teammate_signatures: Dict[int, Tuple[int, Tuple[int, ...]]] = {}
+        self._player_order_signatures: Dict[int, Tuple[int, Optional[int], Tuple[int, ...]]] = {}
         self._dead_frames: Dict[int, int] = {spec.logical_port: 0 for spec in self.bot_specs}
         self._pressed_start: Dict[int, bool] = {spec.logical_port: False for spec in self.bot_specs}
         self._has_entered_game = False
+        self._in_menu = True
         now = time.monotonic()
         self._last_activity_time = now
         self._last_frame_advance_time = now
@@ -319,12 +718,16 @@ class DoublesSession:
             'current_agent': self._current_agent_label,
             'pending_agent': self._pending_agent_label,
             'has_entered_game': self._has_entered_game,
+            'in_menu': self._in_menu,
             'seconds_since_activity': now - self._last_activity_time,
             'seconds_since_frame_advance': now - self._last_frame_advance_time,
         }
 
     def set_agent(self, agent_kwargs: dict) -> dict:
         """Request a model switch at the next game boundary."""
+        if self._gpu_serving_enabled:
+            raise RuntimeError(
+                'Active session model switching is not yet supported for GPU-served Discord sessions.')
         with self._lock:
             self._pending_agent_kwargs = agent_kwargs.copy()
             self._pending_agent_label = self._agent_label(agent_kwargs)
@@ -343,8 +746,18 @@ class DoublesSession:
 
             try:
                 self._set_state_and_agent(self.agent_kwargs)
+                self._register_gpu_session_if_needed()
+                if self._agent is not None:
+                    warmup_start = time.time()
+                    self._agent.warmup()
+                    logging.info(
+                        "Warmed Discord session agent %s in %.3fs",
+                        self._current_agent_label,
+                        time.time() - warmup_start,
+                    )
                 self._start_dolphins()
-                self._agent.start()
+                if self._agent is not None:
+                    self._agent.start()
 
                 self._thread = threading.Thread(
                     target=self._run_loop,
@@ -356,6 +769,7 @@ class DoublesSession:
                 if self._agent is not None:
                     self._agent.stop()
                     self._agent = None
+                self._unregister_gpu_session_if_needed()
                 self._stop_dolphins()
                 raise
 
@@ -370,6 +784,13 @@ class DoublesSession:
         if self._agent is not None:
             self._agent.stop()
             self._agent = None
+        self._unregister_gpu_session_if_needed()
+
+    def _uses_gpu_model(self, source_agent_kwargs: dict) -> bool:
+        if self._gpu_server is None or not self._gpu_model_basename:
+            return False
+        path = source_agent_kwargs.get('path')
+        return bool(path) and os.path.basename(path) == self._gpu_model_basename
 
     def _agent_label(self, agent_kwargs: dict) -> str:
         path = agent_kwargs.get('path')
@@ -384,6 +805,7 @@ class DoublesSession:
         agent_kwargs = source_agent_kwargs.copy()
         path = agent_kwargs.pop('path', None)
         tag = agent_kwargs.pop('tag', None)
+        use_gpu_serving = self._uses_gpu_model(source_agent_kwargs)
         name_change_mode = agent_kwargs.pop(
             'name_change_mode', eval_lib.NameChangeMode.FIXED)
         if name_change_mode != eval_lib.NameChangeMode.FIXED:
@@ -396,9 +818,14 @@ class DoublesSession:
                 "Ignoring --agent.async_inference=True for Discord fused sessions; "
                 "the Ray session actor is the single inference worker.")
 
-        state = eval_lib.load_state(path=path, tag=tag)
+        if use_gpu_serving:
+            if tag is not None:
+                raise ValueError('GPU-served Discord sessions currently require a local checkpoint path.')
+            state = self._gpu_server.model_metadata()
+        else:
+            state = eval_lib.load_state(path=path, tag=tag)
         default_name = agent_kwargs.pop('name', None)
-        agent_kwargs['name'] = [
+        resolved_names = [
             resolve_playstyle_for_state(spec.playstyle, default_name, state)
             for spec in self.bot_specs
         ]
@@ -406,9 +833,14 @@ class DoublesSession:
             "Discord fused session playstyles: %s",
             {
                 spec.logical_port: name
-                for spec, name in zip(self.bot_specs, agent_kwargs['name'])
+                for spec, name in zip(self.bot_specs, resolved_names)
             },
         )
+        self._resolved_agent_names = resolved_names
+        if use_gpu_serving:
+            return state, None, self._agent_label(source_agent_kwargs), True
+
+        agent_kwargs['name'] = resolved_names
         agent = eval_lib.build_delayed_agent(
             state=state,
             batch_size=len(self.bot_specs),
@@ -421,14 +853,43 @@ class DoublesSession:
             raise ValueError(
                 f"agent.batch_steps={agent.batch_steps} exceeds delay slack "
                 f"for policy delay={agent.delay} after console delay.")
-        return state, agent, self._agent_label(source_agent_kwargs)
+        return state, agent, self._agent_label(source_agent_kwargs), False
 
     def _set_state_and_agent(self, source_agent_kwargs: dict):
-        state, agent, label = self._build_state_and_agent(source_agent_kwargs)
+        state, agent, label, gpu_serving_enabled = self._build_state_and_agent(source_agent_kwargs)
         self._state = state
         self._agent = agent
         self._current_agent_label = label
+        self._gpu_serving_enabled = gpu_serving_enabled
+        self._policy_observation_delay = (
+            int(self._state['config']['policy']['delay']) - self.dolphin_config.online_delay
+        )
         self.agent_kwargs = source_agent_kwargs.copy()
+
+    def _register_gpu_session_if_needed(self):
+        if not self._gpu_serving_enabled or self._gpu_server is None:
+            return
+        if self._gpu_session_key is None:
+            actor_id = ray.get_runtime_context().get_actor_id()
+            if actor_id:
+                self._gpu_session_key = f"{actor_id}:{self.connect_code}"
+            else:
+                self._gpu_session_key = f"local:{uuid.uuid4().hex}:{self.connect_code}"
+        self._gpu_server.register_session(
+            self._gpu_session_key,
+            self._resolved_agent_names,
+        )
+
+    def _unregister_gpu_session_if_needed(self):
+        if self._gpu_session_key is None or self._gpu_server is None:
+            return
+        try:
+            self._gpu_server.unregister_session(self._gpu_session_key)
+        except Exception:
+            if not self.stop_requested.is_set():
+                logging.exception("Failed to unregister Discord GPU inference session")
+        finally:
+            self._gpu_session_key = None
 
     def _apply_pending_agent_if_needed(self):
         with self._lock:
@@ -440,9 +901,17 @@ class DoublesSession:
         logging.info(
             "Applying pending Discord fused session model switch to %s",
             pending_agent_label)
+        if self._gpu_serving_enabled or self._uses_gpu_model(pending_agent_kwargs):
+            self._last_error = (
+                f"Failed to switch agent to {pending_agent_label}: "
+                "GPU-served Discord sessions do not support active model switching yet.")
+            with self._lock:
+                self._pending_agent_kwargs = None
+                self._pending_agent_label = None
+            return
         old_agent = self._agent
         try:
-            state, agent, label = self._build_state_and_agent(pending_agent_kwargs)
+            state, agent, label, gpu_serving_enabled = self._build_state_and_agent(pending_agent_kwargs)
             agent.start()
         except Exception as exc:
             self._last_error = f"Failed to switch agent to {pending_agent_label}: {exc}"
@@ -457,6 +926,7 @@ class DoublesSession:
         self._state = state
         self._agent = agent
         self._current_agent_label = label
+        self._gpu_serving_enabled = gpu_serving_enabled
         self.agent_kwargs = pending_agent_kwargs.copy()
         with self._lock:
             self._pending_agent_kwargs = None
@@ -506,7 +976,7 @@ class DoublesSession:
         save_replays: bool,
     ) -> dolphin_lib.DolphinConfig:
         config = dataclasses.replace(self.dolphin_config)
-        config.slippi_port = portpicker.pick_unused_port()
+        config.slippi_port = utils.find_open_udp_port()
         config.connect_code = self.connect_code
         config.teams_connect_code = self.connect_code
         config.save_replays = save_replays
@@ -525,12 +995,10 @@ class DoublesSession:
         }
 
         def read_gamestates(logical_port: int, dolphin: dolphin_lib.Dolphin):
-            finalized_buffer: Optional[FinalizedDelayBuffer] = None
-            using_finalized_metadata = False
-            last_live_frame: Optional[int] = None
-            last_logged_gap_frame: Optional[int] = None
-            last_logged_missing_frame: Optional[int] = None
-            last_logged_lag_bucket: Optional[int] = None
+            processor = DiscordInGameFrameProcessor(
+                logical_port=logical_port,
+                observation_delay=int(self._policy_observation_delay),
+            )
 
             def publish_gamestate(gamestate: melee.GameState):
                 while not self.stop_requested.is_set():
@@ -552,80 +1020,12 @@ class DoublesSession:
                     if self.stop_requested.is_set():
                         return
                     if dolphin_lib.is_menu_state(gamestate):
-                        if finalized_buffer is not None:
-                            finalized_buffer.clear()
+                        processor.clear()
                         publish_gamestate(gamestate)
                         continue
 
-                    finalized_frame = getattr(gamestate, 'finalized_frame', None)
-                    if finalized_frame is None:
-                        publish_gamestate(gamestate)
-                        continue
-                    frame = int(gamestate.frame)
-                    if last_live_frame is not None:
-                        if frame <= last_live_frame:
-                            logging.warning(
-                                "Discord bot live frame rollback/correction "
-                                "logical_port=%s from=%s to=%s finalized=%s",
-                                logical_port, last_live_frame, frame, finalized_frame)
-                        elif frame > last_live_frame + 1:
-                            logging.warning(
-                                "Discord bot live frame gap logical_port=%s "
-                                "from=%s to=%s skipped=%s finalized=%s",
-                                logical_port, last_live_frame, frame,
-                                frame - last_live_frame - 1, finalized_frame)
-                    last_live_frame = frame
-
-                    if not using_finalized_metadata:
-                        logging.info(
-                            "Using finalized Slippstream frames for logical_port=%s",
-                            logical_port)
-                        using_finalized_metadata = True
-
-                    observation_delay = int(getattr(self._agent, 'delay', 0))
-                    if (
-                        finalized_buffer is None or
-                        finalized_buffer.delay != observation_delay
-                    ):
-                        finalized_buffer = FinalizedDelayBuffer(observation_delay)
-
-                    lag = frame - int(finalized_frame)
-                    lag_bucket = lag // 5
-                    if lag >= 5 and lag_bucket != last_logged_lag_bucket:
-                        logging.info(
-                            "Discord bot finalized lag logical_port=%s "
-                            "live=%s finalized=%s lag=%s delay=%s",
-                            logical_port, frame, finalized_frame, lag,
-                            observation_delay)
-                        last_logged_lag_bucket = lag_bucket
-
-                    for published in finalized_buffer.push(gamestate):
-                        if (
-                            finalized_buffer.last_gap_frame is not None and
-                            finalized_buffer.last_gap_frame != last_logged_gap_frame
-                        ):
-                            logging.warning(
-                                "Discord bot delayed-finalized source gap "
-                                "logical_port=%s after_frame=%s next_published=%s",
-                                logical_port, finalized_buffer.last_gap_frame,
-                                published.frame)
-                            last_logged_gap_frame = finalized_buffer.last_gap_frame
+                    for published in processor.process(gamestate):
                         publish_gamestate(published)
-
-                    next_frame = finalized_buffer._next_frame
-                    if (
-                        next_frame is not None and
-                        next_frame <= min(frame - observation_delay, int(finalized_frame)) and
-                        next_frame not in finalized_buffer._frames and
-                        next_frame != last_logged_missing_frame
-                    ):
-                        logging.warning(
-                            "Discord bot delayed-finalized missing frame "
-                            "logical_port=%s missing=%s live=%s finalized=%s "
-                            "delay=%s",
-                            logical_port, next_frame, frame, finalized_frame,
-                            observation_delay)
-                        last_logged_missing_frame = next_frame
             except Exception as exc:
                 if not self.stop_requested.is_set():
                     logging.exception(
@@ -663,11 +1063,13 @@ class DoublesSession:
                 self._last_activity_time = time.monotonic()
 
                 if any(dolphin_lib.is_menu_state(gs) for gs in current.values()):
+                    self._in_menu = True
                     self._num_menu_frames += 1
                     for event in advance_events.values():
                         event.set()
                     continue
 
+                self._in_menu = False
                 self._num_menu_frames = 0
                 self._has_entered_game = True
                 frame_signature = tuple(current[p].frame for p in sorted(current))
@@ -696,20 +1098,23 @@ class DoublesSession:
 
                 batched_game = utils.map_nt(
                     lambda *xs: np.concatenate(xs, axis=0), *games)
-                all_delayed_finalized = all(
+                assert all(
                     gs.custom.get('discordbot_delayed_finalized', False)
-                    for gs in current.values())
-                agent_step = (
-                    self._agent.step_undelayed
-                    if all_delayed_finalized
-                    else self._agent.step
-                )
-                sample_outputs = agent_step(
-                    batched_game,
-                    np.array(needs_reset, dtype=np.bool_),
-                )
-                decoded = self._agent.embed_controller.decode(
-                    sample_outputs.controller_state)
+                    for gs in current.values()
+                ), 'Expected only finalized delayed in-game frames in Discord bot session.'
+                if self._gpu_serving_enabled:
+                    decoded = self._gpu_server.infer(
+                        self._gpu_session_key,
+                        batched_game,
+                        np.array(needs_reset, dtype=np.bool_),
+                    )
+                else:
+                    sample_outputs = self._agent.step_undelayed(
+                        batched_game,
+                        np.array(needs_reset, dtype=np.bool_),
+                    )
+                    decoded = self._agent.embed_controller.decode(
+                        sample_outputs.controller_state)
 
                 for index, logical_port in enumerate(ordered_ports):
                     controller = self._controllers[logical_port]
@@ -782,10 +1187,13 @@ class DoublesSession:
         player_order += tuple(p for p in (1, 2, 3, 4) if p not in player_order)
         self._player_orders[logical_port] = player_order
         self._teammate_ports[logical_port] = teammate_port
-        logging.info(
-            "Discord bot logical_port=%s local_player_port=%s teammate_port=%s "
-            "player_order=%s",
-            logical_port, my_port, teammate_port, player_order)
+        signature = (int(my_port), teammate_port, player_order)
+        if self._player_order_signatures.get(logical_port) != signature:
+            self._player_order_signatures[logical_port] = signature
+            logging.info(
+                "Discord bot logical_port=%s local_player_port=%s teammate_port=%s "
+                "player_order=%s",
+                logical_port, my_port, teammate_port, player_order)
 
     def _maybe_stock_steal(
         self,
@@ -848,9 +1256,50 @@ class DoublesSession:
             with self._dolphins_lock:
                 self._dolphins.clear()
                 self._controllers.clear()
-            
+
 
 RemoteDoublesSession = ray.remote(DoublesSession)
+
+class RemoteSessionHandle:
+
+    def __init__(self, actor):
+        self._actor = actor
+
+    def start(self):
+        return ray.get(self._actor.start.remote())
+
+    def stop(self):
+        return ray.get(self._actor.stop.remote())
+
+    def status(self):
+        return ray.get(self._actor.status.remote())
+
+    def set_agent(self, agent_kwargs: dict):
+        return ray.get(self._actor.set_agent.remote(agent_kwargs))
+
+    def kill(self):
+        return ray.kill(self._actor, no_restart=True)
+
+
+class LocalSessionHandle:
+
+    def __init__(self, session: DoublesSession):
+        self._session = session
+
+    def start(self):
+        return self._session.start()
+
+    def stop(self):
+        return self._session.stop()
+
+    def status(self):
+        return self._session.status()
+
+    def set_agent(self, agent_kwargs: dict):
+        return self._session.set_agent(agent_kwargs)
+
+    def kill(self):
+        return None
 
 @dataclasses.dataclass
 class SessionInfo:
@@ -926,41 +1375,10 @@ def get_character_from_name(name: str) -> Character:
 
 def get_valid_character_choices():
     """Return a list of character choices for the Discord API."""
-    choices = []
-    
-    # List of playable characters - excluding certain characters
-    playable_characters = [
-        (Character.FOX, "Fox"),
-        (Character.FALCO, "Falco"),
-        (Character.SHEIK, "Sheik"),
-        (Character.MARTH, "Marth"),
-        (Character.PEACH, "Peach"),
-        (Character.CPTFALCON, "Captain Falcon"),
-        (Character.JIGGLYPUFF, "Jigglypuff"),
-        (Character.PIKACHU, "Pikachu"),
-        (Character.SAMUS, "Samus"),
-        (Character.YOSHI, "Yoshi"),
-        (Character.POPO, "Ice Climbers"),
-        (Character.LUIGI, "Luigi"),
-        (Character.DK, "Donkey Kong"),
-        (Character.GAMEANDWATCH, "Mr. Game & Watch"),
-        (Character.GANONDORF, "Ganondorf"),
-        (Character.BOWSER, "Bowser"),
-        (Character.LINK, "Link"),
-        (Character.DOC, "Dr. Mario"),
-        (Character.MARIO, "Mario"),
-        (Character.NESS, "Ness"),
-        (Character.MEWTWO, "Mewtwo"),
-        (Character.ROY, "Roy"),
-        (Character.ZELDA, "Zelda"),
-        (Character.YLINK, "Young Link"),
-        (Character.PICHU, "Pichu"),
+    return [
+        app_commands.Choice(name=display_name, value=char.name)
+        for char, display_name in PLAYABLE_CHARACTER_CHOICES
     ]
-    
-    for char, display_name in playable_characters:
-        choices.append(app_commands.Choice(name=display_name, value=char.name))
-    
-    return choices
 
 # Custom command tree that restricts commands to specific channels
 class ChannelRestrictedCommandTree(app_commands.CommandTree):
@@ -992,6 +1410,8 @@ class DiscordBot(commands.Bot):
         admin_role: str = "AI Admin",
         max_sessions: int = 4,
         menu_timeout: float = 3,  # in minutes
+        gpu_server: Optional[Any] = None,
+        gpu_model_basename: Optional[str] = None,
     ):
         # Set up intents
         intents = discord.Intents.default()
@@ -1012,6 +1432,8 @@ class DiscordBot(commands.Bot):
         self.admin_role = admin_role
         self._max_sessions = max_sessions
         self._menu_timeout = menu_timeout
+        self._gpu_server = gpu_server
+        self._gpu_model_basename = gpu_model_basename
 
         self._sessions: Dict[int, SessionInfo] = {}  # User ID -> SessionInfo
         self.lock = threading.RLock()
@@ -1168,8 +1590,8 @@ class DiscordBot(commands.Bot):
             if user_id in self._sessions:
                 session_info = self._sessions[user_id]
                 try:
-                    result = ray.get(session_info.session.set_agent.remote(
-                        self._get_agent_kwargs(user_id, 1, agent_name)))
+                    result = session_info.session.set_agent(
+                        self._get_agent_kwargs(user_id, 1, agent_name))
                 except Exception:
                     logging.exception("Failed to queue active Discord session agent switch")
                     await interaction.response.send_message(
@@ -1210,8 +1632,6 @@ class DiscordBot(commands.Bot):
             app_commands.Choice(name="Blue", value="blue"),
             app_commands.Choice(name="Green", value="green"),
         ])
-        @app_commands.choices(character=get_valid_character_choices())
-        @app_commands.choices(playstyle=get_playstyle_choices())
         async def play_command(
             interaction: discord.Interaction, 
             connect_code: str,
@@ -1351,6 +1771,20 @@ class DiscordBot(commands.Bot):
                     bot_specs=bot_specs,
                     launch_message=launch_message,
                 )
+
+        @play_command.autocomplete('character')
+        async def play1_character_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_character_for_port(interaction, current, 1)
+
+        @play_command.autocomplete('playstyle')
+        async def play1_playstyle_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_playstyle_for_port(interaction, current, 1)
         
         @self.tree.command(name="play2", description="Start a game with two AI agents")
         @app_commands.describe(
@@ -1372,14 +1806,10 @@ class DiscordBot(commands.Bot):
             app_commands.Choice(name="Blue", value="blue"),
             app_commands.Choice(name="Green", value="green"),
         ])
-        @app_commands.choices(character1=get_valid_character_choices())
-        @app_commands.choices(character2=get_valid_character_choices())
-        @app_commands.choices(playstyle1=get_playstyle_choices())
-        @app_commands.choices(playstyle2=get_playstyle_choices())
         async def play2_command(
             interaction: discord.Interaction, 
             connect_code: str, 
-            character1: str,
+            character1: str, 
             team1: str,
             character2: str,
             team2: str,
@@ -1541,6 +1971,34 @@ class DiscordBot(commands.Bot):
                     bot_specs=bot_specs,
                     launch_message=launch_message,
                 )
+
+        @play2_command.autocomplete('character1')
+        async def play2_character1_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_character_for_port(interaction, current, 1)
+
+        @play2_command.autocomplete('character2')
+        async def play2_character2_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_character_for_port(interaction, current, 2)
+
+        @play2_command.autocomplete('playstyle1')
+        async def play2_playstyle1_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_playstyle_for_port(interaction, current, 1)
+
+        @play2_command.autocomplete('playstyle2')
+        async def play2_playstyle2_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_playstyle_for_port(interaction, current, 2)
         
         @self.tree.command(name="play3", description="Start a game with three AI agents")
         @app_commands.describe(
@@ -1570,15 +2028,9 @@ class DiscordBot(commands.Bot):
             app_commands.Choice(name="Blue", value="blue"),
             app_commands.Choice(name="Green", value="green"),
         ])
-        @app_commands.choices(character1=get_valid_character_choices())
-        @app_commands.choices(character2=get_valid_character_choices())
-        @app_commands.choices(character3=get_valid_character_choices())
-        @app_commands.choices(playstyle1=get_playstyle_choices())
-        @app_commands.choices(playstyle2=get_playstyle_choices())
-        @app_commands.choices(playstyle3=get_playstyle_choices())
         async def play3_command(
             interaction: discord.Interaction, 
-            connect_code: str, 
+            connect_code: str,
             character1: str,
             team1: str,
             character2: str,
@@ -1770,6 +2222,48 @@ class DiscordBot(commands.Bot):
                     bot_specs=bot_specs,
                     launch_message=launch_message,
                 )
+
+        @play3_command.autocomplete('character1')
+        async def play3_character1_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_character_for_port(interaction, current, 1)
+
+        @play3_command.autocomplete('character2')
+        async def play3_character2_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_character_for_port(interaction, current, 2)
+
+        @play3_command.autocomplete('character3')
+        async def play3_character3_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_character_for_port(interaction, current, 3)
+
+        @play3_command.autocomplete('playstyle1')
+        async def play3_playstyle1_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_playstyle_for_port(interaction, current, 1)
+
+        @play3_command.autocomplete('playstyle2')
+        async def play3_playstyle2_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_playstyle_for_port(interaction, current, 2)
+
+        @play3_command.autocomplete('playstyle3')
+        async def play3_playstyle3_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ):
+            return await self._autocomplete_playstyle_for_port(interaction, current, 3)
         
         # Status command
         @self.tree.command(name="status", description="Show current bot status and active sessions")
@@ -1788,7 +2282,7 @@ class DiscordBot(commands.Bot):
                 for user_id, session_info in self._sessions.items():
                     timedelta = format_td(now - session_info.start_time)
                     # Get the status using remote call
-                    status = ray.get(session_info.session.status.remote())
+                    status = session_info.session.status()
                     menu_frames = status['num_menu_frames']
                     menu_time = format_td(datetime.timedelta(seconds=menu_frames / 60))
                     model_text = status.get('current_agent') or 'unknown'
@@ -1889,6 +2383,31 @@ class DiscordBot(commands.Bot):
         agent_kwargs['path'] = os.path.join(self._models_path, agent_name)
         return agent_kwargs
 
+    def _get_effective_agent_name(self, user_id: int, port: int) -> str:
+        return self._get_opponent(user_id, port)
+
+    def _get_state_for_port(self, user_id: int, port: int) -> dict:
+        agent_name = self._get_effective_agent_name(user_id, port)
+        return self._models[agent_name]
+
+    async def _autocomplete_playstyle_for_port(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+        port: int,
+    ) -> list[app_commands.Choice[str]]:
+        state = self._get_state_for_port(interaction.user.id, port)
+        return get_playstyle_autocomplete_choices(state, current)
+
+    async def _autocomplete_character_for_port(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+        port: int,
+    ) -> list[app_commands.Choice[str]]:
+        state = self._get_state_for_port(interaction.user.id, port)
+        return get_character_autocomplete_choices(state, current)
+
     def _resolve_playstyle(self, agent_name: str, playstyle: Optional[str]) -> str:
         state = self._models[agent_name]
         return resolve_playstyle_for_state(
@@ -1971,18 +2490,35 @@ class DiscordBot(commands.Bot):
         bot_specs: List[BotSpec],
     ) -> DoublesSession:
         """Start one fused doubles session actor for all local bots."""
-        session = RemoteDoublesSession.remote(
-            self.dolphin_config,
-            agent_kwargs,
-            connect_code,
-            bot_specs,
+        use_local_gpu_session = (
+            self._gpu_server is not None and
+            self._gpu_model_basename is not None and
+            os.path.basename(agent_kwargs.get('path', '')) == self._gpu_model_basename
         )
-        # Call the remote method and get the result
+        if use_local_gpu_session:
+            session = LocalSessionHandle(DoublesSession(
+                self.dolphin_config,
+                agent_kwargs,
+                connect_code,
+                bot_specs,
+                self._gpu_server,
+                self._gpu_model_basename,
+                disable_process_gpus=False,
+            ))
+        else:
+            session = RemoteSessionHandle(RemoteDoublesSession.remote(
+                self.dolphin_config,
+                agent_kwargs,
+                connect_code,
+                bot_specs,
+                None,
+                None,
+            ))
         try:
-            ray.get(session.start.remote())
+            session.start()
         except Exception as exc:
             try:
-                ray.kill(session, no_restart=True)
+                session.kill()
             except Exception:
                 logging.exception("Failed to clean up Discord session after launch failure")
             raise SessionLaunchError(
@@ -1993,10 +2529,8 @@ class DiscordBot(commands.Bot):
     def _stop_sessions(self, infos: List[SessionInfo]):
         """Stop the specified sessions"""
         with self.lock:
-            # Create list of tasks and wait for them to complete
-            stop_tasks = [info.session.stop.remote() for info in infos]
-            if stop_tasks:
-                ray.get(stop_tasks)
+            for info in infos:
+                info.session.stop()
 
             for info in infos:
                 if info.discord_id in self._sessions:
@@ -2008,11 +2542,12 @@ class DiscordBot(commands.Bot):
             to_gc: List[SessionInfo] = []
             for info in self._sessions.values():
                 # Get the status using remote call and ray.get
-                status = ray.get(info.session.status.remote())
+                status = info.session.status()
                 menu_minutes = status['num_menu_frames'] / (60 * 60)
                 stale_activity = status.get('seconds_since_activity', 0) > STALL_TIMEOUT_SECONDS
                 stale_frame = (
                     status.get('has_entered_game') and
+                    not status.get('in_menu', True) and
                     status.get('seconds_since_frame_advance', 0) > STALL_TIMEOUT_SECONDS
                 )
                 if (
@@ -2034,7 +2569,7 @@ class DiscordBot(commands.Bot):
             infos = [info for info in self._sessions.values() if not info.playing_announced]
 
         for info in infos:
-            status = ray.get(info.session.status.remote())
+            status = info.session.status()
             if not status.get('is_alive') or not status.get('has_entered_game'):
                 continue
             try:
@@ -2085,7 +2620,6 @@ class DiscordBot(commands.Bot):
 
 # Modify the main function to use the bot's run method
 def main(_):
-    eval_lib.disable_gpus()
     ray.init()
 
     logging.basicConfig(
@@ -2095,6 +2629,30 @@ def main(_):
     agent_kwargs = AGENT.value
     if not agent_kwargs['path']:
         raise ValueError('Must provide agent path.')
+
+    gpu_server = None
+    gpu_model_basename = None
+    gpu_model_path = resolve_gpu_model_path(MODELS_PATH.value, GPU_MODEL.value)
+    if not gpu_model_path:
+        eval_lib.disable_gpus()
+    if gpu_model_path:
+        configure_tensorflow_gpu_limit(GPU_MEMORY_LIMIT_MB.value)
+        gpu_model_basename = os.path.basename(gpu_model_path)
+        logging.info(
+            'Starting shared Discord GPU inference server for %s',
+            gpu_model_basename)
+        gpu_server = LocalDiscordGpuInferenceServer(
+            model_path=gpu_model_path,
+            console_delay=DOLPHIN.value['online_delay'],
+            max_sessions=MAX_SESSIONS.value,
+            max_local_bots=3,
+            batch_window_ms=GPU_MICROBATCH_MS.value,
+            compile=agent_kwargs.get('compile', True),
+            jit_compile=agent_kwargs.get('jit_compile', False),
+            sample_temperature=agent_kwargs.get('sample_temperature', 1.0),
+            batch_steps=agent_kwargs.get('batch_steps', 0),
+        )
+        gpu_server.warmup()
 
     bot = DiscordBot(
         token=BOT_TOKEN.value,
@@ -2106,12 +2664,19 @@ def main(_):
         agent_kwargs=agent_kwargs,
         max_sessions=MAX_SESSIONS.value,
         menu_timeout=MENU_TIMEOUT.value,
+        gpu_server=gpu_server,
+        gpu_model_basename=gpu_model_basename,
     )
 
     try:
         bot.run(bot.token)
     finally:
         bot.shutdown()
+        if gpu_server is not None:
+            try:
+                gpu_server.close()
+            except Exception:
+                logging.exception('Failed to close Discord GPU inference server')
 
 if __name__ == '__main__':
     app.run(main)
