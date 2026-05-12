@@ -8,11 +8,11 @@ from slippi_ai import embed
 
 ControllerType = tp.TypeVar('ControllerType')
 
-class SampleOutputs(tp.NamedTuple):
+class SampleOutputs(tp.NamedTuple, tp.Generic[ControllerType]):
   controller_state: ControllerType
   logits: ControllerType
 
-class DistanceOutputs(tp.NamedTuple):
+class DistanceOutputs(tp.NamedTuple, tp.Generic[ControllerType]):
   distance: ControllerType
   logits: ControllerType
 

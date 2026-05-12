@@ -409,6 +409,132 @@ class DelayedAgent:
   def stop(self):
     """For compatibility with the async agent."""
 
+
+def _sample_outputs_to_numpy(sample_outputs: SampleOutputs) -> SampleOutputs:
+  return utils.map_single_structure(np.asarray, sample_outputs)
+
+
+class JaxDelayedAgent:
+  """DelayedAgent-compatible wrapper using the JAX policy implementation."""
+
+  def __init__(
+      self,
+      state: dict,
+      batch_size: int,
+      console_delay: int = 0,
+      batch_steps: int = 0,
+      name_code: tp.Union[int, tp.Sequence[int]] = 0,
+      sample_kwargs: dict = {},
+      compile: bool = True,
+      jit_compile: bool = False,
+      fake: bool = False,
+      async_inference: bool = False,
+      **agent_kwargs,
+  ):
+    if fake:
+      raise ValueError('fake agents are not supported with platform="jax"')
+    if async_inference:
+      raise ValueError('async_inference is not supported with platform="jax"')
+    if jit_compile:
+      logging.info('Ignoring jit_compile=True for JAX inference; JAX uses jit.')
+    unsupported = set(agent_kwargs)
+    if unsupported:
+      raise ValueError(
+          f'Unsupported JAX agent kwargs: {sorted(unsupported)}')
+
+    from slippi_ai.jax import agents as jax_agents
+    from slippi_ai.jax import tf_checkpoint
+
+    policy = tf_checkpoint.load_policy_from_tf_state(state)
+
+    self._batch_steps = batch_steps
+    self._input_queue = []
+    self._agent = jax_agents.BasicAgent(
+        policy=policy,
+        batch_size=batch_size,
+        name_code=name_code,
+        sample_kwargs=sample_kwargs,
+        compile=compile,
+        pack_args=True,
+    )
+    self.warmup = self._agent.warmup
+    self._policy = policy
+    self.embed_controller = policy.controller_head.controller_embedding
+
+    if console_delay > policy.delay:
+      raise ValueError(
+          f'console delay ({console_delay}) must be <='
+          f' policy delay ({policy.delay})')
+
+    self.delay = policy.delay - console_delay
+    self._output_queue: utils.PeekableQueue[SampleOutputs] = utils.PeekableQueue()
+
+    self.dummy_sample_outputs = dummy_sample_outputs(
+        self.embed_controller, [batch_size])
+    for _ in range(self.delay):
+      self._output_queue.put(self.dummy_sample_outputs)
+
+    self.pop = self._output_queue.get
+    self.peek_n = self._output_queue.peek_n
+    self.step_profiler = utils.Profiler(burnin=1)
+
+  @property
+  def batch_steps(self) -> int:
+    return self._batch_steps or 1
+
+  @property
+  def hidden_state(self):
+    hidden_state = self._agent.hidden_state
+    return hidden_state() if callable(hidden_state) else hidden_state
+
+  @property
+  def name_code(self):
+    return self._agent.name_code
+
+  def set_name_code(self, name_code: tp.Union[int, tp.Sequence[int]]):
+    self._agent.set_name_code(name_code)
+
+  def step(
+      self,
+      game: embed.Game,
+      needs_reset: np.ndarray
+  ) -> SampleOutputs:
+    self.push(game, needs_reset)
+    return self.pop()
+
+  def step_undelayed(
+      self,
+      game: embed.Game,
+      needs_reset: np.ndarray,
+  ) -> SampleOutputs:
+    with self.step_profiler:
+      return _sample_outputs_to_numpy(self._agent.step(game, needs_reset))
+
+  def push(self, game: embed.Game, needs_reset: np.ndarray):
+    if self._batch_steps == 0:
+      with self.step_profiler:
+        sampled_controller = self._agent.step(game, needs_reset)
+      self._output_queue.put(_sample_outputs_to_numpy(sampled_controller))
+      return
+
+    self._input_queue.append((game, needs_reset))
+    if len(self._input_queue) == self._batch_steps:
+      with self.step_profiler:
+        sample_outputs = self._agent.multi_step(self._input_queue)
+      for output in sample_outputs:
+        self._output_queue.put(_sample_outputs_to_numpy(output))
+      self._input_queue = []
+
+  @contextlib.contextmanager
+  def run(self):
+    yield self
+
+  def start(self):
+    """For compatibility with the async agent."""
+
+  def stop(self):
+    """For compatibility with the async agent."""
+
 import multiprocessing as mp
 from typing import Optional, Tuple
 
@@ -593,8 +719,9 @@ def build_delayed_agent(
     name: Optional[tp.Union[str, list[str]]] = None,
     async_inference: bool = False,
     sample_temperature: float = 1.0,
+    platform: str = 'tf',
     **agent_kwargs,
-) -> tp.Union[DelayedAgent, AsyncDelayedAgent]:
+) -> tp.Union[DelayedAgent, AsyncDelayedAgent, JaxDelayedAgent]:
   if isinstance(name, str) and not name.strip():
     name = nametags.DEFAULT_NAME
   elif isinstance(name, list):
@@ -635,7 +762,16 @@ def build_delayed_agent(
   else:
     name_code = [get_name_code(state, n) for n in name]
 
-  agent_class = AsyncDelayedAgent if async_inference else DelayedAgent
+  platform = str(platform).lower()
+  if platform == 'jax':
+    if async_inference:
+      raise ValueError('async_inference is not supported with platform="jax"')
+    agent_class = JaxDelayedAgent
+  elif platform == 'tf':
+    agent_class = AsyncDelayedAgent if async_inference else DelayedAgent
+  else:
+    raise ValueError(f'Unknown inference platform: {platform}')
+
   return agent_class(
       state=state,
       name_code=name_code,
@@ -803,6 +939,7 @@ BATCH_AGENT_FLAGS = dict(
     jit_compile=ff.Boolean(False, 'Jit-compile the sample function.'),
     batch_steps=ff.Integer(0, 'Batch consecutive agent steps for inference.'),
     name=ff.String(nametags.DEFAULT_NAME, 'Name of the agent.'),
+    platform=ff.Enum('tf', ('tf', 'jax'), 'Inference backend.'),
     # arg to build_delayed_agent
     async_inference=ff.Boolean(False, 'run agent asynchronously'),
     fake=ff.Boolean(False, 'Use fake agents.'),

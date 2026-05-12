@@ -104,6 +104,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.windowsvenv/
 env/
 venv/
 ENV/
@@ -183,3 +184,6 @@ match_data/
 testmodels/
 melee_data/
 wandb_*
+.msl/
+reports/triage/
+top_100_meta_players_by_mode.txt

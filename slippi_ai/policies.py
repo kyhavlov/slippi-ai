@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 from typing import Any, Tuple
 import typing as tp
 
@@ -17,6 +18,13 @@ from slippi_ai.value_function import ValueOutputs
 
 Outputs = tf_utils.Outputs
 RecurrentState = networks.RecurrentState
+ControllerType = tp.TypeVar('ControllerType')
+RecurrentStateT = tp.TypeVar('RecurrentStateT')
+
+
+class Platform(enum.Enum):
+  TF = 'tf'
+  JAX = 'jax'
 
 def _mean_nest(x, y):
   return tf.nest.map_structure(lambda a, b: 0.5 * (a + b), x, y)
@@ -35,7 +43,7 @@ class UnrollWithOutputs(tp.NamedTuple):
   final_state: RecurrentState  # [B]
   metrics: dict  # mixed
 
-class Policy(snt.Module):
+class Policy(snt.Module, tp.Generic[ControllerType, RecurrentStateT]):
 
   def __init__(
       self,
@@ -77,6 +85,14 @@ class Policy(snt.Module):
     self.value_head = snt.Linear(1, name='value_head')
     if not train_value_head:
       self.value_head = snt.Sequential([tf.stop_gradient, self.value_head])
+
+  @property
+  def platform(self) -> Platform:
+    return Platform.TF
+
+  def build_agent(self, batch_size: int, **kwargs):
+    from slippi_ai import eval_lib  # avoid circular import
+    return eval_lib.BasicAgent(self, batch_size, **kwargs)
 
   @property
   def controller_embedding(self) -> embed.Embedding[embed.Controller, embed.Action]:

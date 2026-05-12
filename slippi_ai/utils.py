@@ -161,7 +161,9 @@ def unbatch_nest(nest: T) -> list[T]:
 
 def reify_tuple_type(t: type[T]) -> T:
   """Takes a tuple type and returns a structure with types at the leaves."""
-  # TODO: support typing.Tuple
+  if not isinstance(t, type):
+    from slippi_ai import types
+    return types.reify_tuple_type(t)
 
   if issubclass(t, tuple):  # namedtuple
     return t(*[

@@ -13,7 +13,7 @@ import time
 from concurrent import futures
 from typing import (
     Any, Callable, Iterable, List, Optional, Set, Tuple, Iterator, NamedTuple,
-    Union,
+    Union, Generic, TypeVar,
 )
 import zlib
 
@@ -25,7 +25,7 @@ import melee
 
 from slippi_ai import reward, utils, nametags, paths
 from slippi_db import file_layout
-from slippi_ai.types import Game, game_array_to_nt, Controller
+from slippi_ai.types import Game, game_array_to_nt, Controller, NAME_DTYPE, Rank2
 
 class PlayerMeta(NamedTuple):
   character: int
@@ -102,31 +102,41 @@ class Chunk(NamedTuple):
   states: Game
   meta: ChunkMeta
 
-# Action = TypeVar('Action')
+S = TypeVar('S', bound=tuple[int, ...])
+ActionT = TypeVar('ActionT')
 Action = Controller
 
-class StateAction(NamedTuple):
+class StateAction(NamedTuple, Generic[S, ActionT]):
   state: Game
   # The action could actually be an "encoded" action type,
   # which might discretize certain components of the controller
   # such as the sticks and shoulder. Unfortunately NamedTuples can't be
   # generic. We could use a dataclass instead, but TF can't trace them.
   # Note that this is the action taken on the _previous_ frame.
-  action: Action
+  action: ActionT
 
   # Encoded name
   name: int
 
-class Frames(NamedTuple):
-  state_action: StateAction
+class Frames(NamedTuple, Generic[S, ActionT]):
+  state_action: StateAction[S, ActionT]
   is_resetting: bool
   # The reward will have length one less than the states and actions.
   reward: np.float32
 
-class Batch(NamedTuple):
+class Batch(NamedTuple, Generic[S]):
   frames: Frames
   count: int  # For reproducing batches
   meta: ChunkMeta
+
+
+class BatchWithMeta(NamedTuple, Generic[S]):
+  batch: Batch[S]
+  meta: ChunkMeta
+
+
+class AbstractDataSource(Iterator[tuple[BatchWithMeta[Rank2], float]]):
+  batch_size: int
 
 
 class ReplayTask(NamedTuple):
