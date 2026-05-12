@@ -64,6 +64,9 @@ class PackedState:
   needs_reset: np.ndarray
 
 
+ArrayFactory = tp.Callable[[tuple[int, ...], np.dtype | type], np.ndarray]
+
+
 class SimBatchedEnvironment:
   """Batched melee_sim-backed environment with the existing slippi-ai env shape."""
 
@@ -111,7 +114,7 @@ class SimBatchedEnvironment:
         terminal=np.zeros(self._num_envs, dtype=_TERMINAL_DTYPE),
         step_t=-1,
     )
-    self._packed = _PackedGameBuilder(self._num_envs)
+    self._packed = make_packed_game_builder(self._num_envs)
     self._output_queue = collections.deque([
         self.current_state(needs_reset=np.ones(self._num_envs, dtype=np.bool_))
     ])
@@ -327,6 +330,15 @@ def supported_stages() -> tuple[melee.Stage, ...]:
   return SUPPORTED_STAGES
 
 
+def make_packed_game_builder(
+    batch_size: int,
+    *,
+    array_factory: ArrayFactory = np.zeros,
+) -> '_PackedGameBuilder':
+  """Create reusable packed policy-game buffers for `batch_size` envs."""
+  return _PackedGameBuilder(batch_size, array_factory=array_factory)
+
+
 def _write_controller_action(action_frame: np.ndarray, controller: Controller, player_index: int):
   player = action_frame['p'][:, int(player_index)]
   player['main_stick_x'][:] = controller.main_stick.x
@@ -475,16 +487,34 @@ def _stage_array(stage_id: np.ndarray) -> np.ndarray:
   return out
 
 
+def _make_array(
+    array_factory: ArrayFactory,
+    shape: tuple[int, ...] | int,
+    dtype: np.dtype | type,
+) -> np.ndarray:
+  shape = (int(shape),) if isinstance(shape, int) else tuple(shape)
+  return array_factory(shape, dtype)
+
+
 class _PackedGameBuilder:
 
-  def __init__(self, batch_size: int):
+  def __init__(
+      self,
+      batch_size: int,
+      *,
+      array_factory: ArrayFactory = np.zeros,
+  ):
     self.batch_size = int(batch_size)
     self.packed_size = self.batch_size * 2
-    self.needs_reset = np.zeros(self.packed_size, dtype=np.bool_)
+    self._array_factory = array_factory
+    self.needs_reset = _make_array(array_factory, self.packed_size, np.bool_)
     self._percent_tmp = np.zeros(self.batch_size, dtype=np.float32)
-    self._p0_arrays = _player_arrays(self.packed_size)
-    self._p2_arrays = _player_arrays(self.packed_size)
-    self._item_arrays = [_item_arrays(self.packed_size) for _ in Items._fields]
+    self._p0_arrays = _player_arrays(self.packed_size, array_factory=array_factory)
+    self._p2_arrays = _player_arrays(self.packed_size, array_factory=array_factory)
+    self._item_arrays = [
+        _item_arrays(self.packed_size, array_factory=array_factory)
+        for _ in Items._fields
+    ]
     self._items = Items(**{
         f'item_{i}': Item(**arrays)
         for i, arrays in enumerate(self._item_arrays)
@@ -496,19 +526,33 @@ class _PackedGameBuilder:
         p1=_empty_player(self.packed_size),
         p2=Player(**self._p2_arrays, controller=controller, nana=empty_nana),
         p3=_empty_player(self.packed_size),
-        stage=np.zeros(self.packed_size, dtype=np.uint8),
-        randall_phase=np.zeros(self.packed_size, dtype=np.float32),
+        stage=_make_array(array_factory, self.packed_size, np.uint8),
+        randall_phase=_make_array(array_factory, self.packed_size, np.float32),
         randall=Randall(
-            x=np.zeros(self.packed_size, dtype=np.float32),
-            y=np.zeros(self.packed_size, dtype=np.float32),
+            x=_make_array(array_factory, self.packed_size, np.float32),
+            y=_make_array(array_factory, self.packed_size, np.float32),
         ),
         items=self._items,
-        is_teams=np.zeros(self.packed_size, dtype=np.bool_),
+        is_teams=_make_array(array_factory, self.packed_size, np.bool_),
     )
 
   def fill(self, frame: np.ndarray, needs_reset: np.ndarray):
-    first = slice(0, self.batch_size)
-    second = slice(self.batch_size, self.packed_size)
+    self.fill_slice(frame, needs_reset, slice(0, self.batch_size))
+
+  def fill_slice(
+      self,
+      frame: np.ndarray,
+      needs_reset: np.ndarray,
+      env_slice: slice,
+  ):
+    first = env_slice
+    second = slice(
+        self.batch_size + int(env_slice.start or 0),
+        self.batch_size + int(env_slice.stop),
+    )
+    local_batch = int(env_slice.stop) - int(env_slice.start or 0)
+    if self._percent_tmp.shape[0] != local_batch:
+      self._percent_tmp = np.zeros(local_batch, dtype=np.float32)
     self.needs_reset[first] = needs_reset
     self.needs_reset[second] = needs_reset
 
@@ -564,28 +608,38 @@ class _PackedGameBuilder:
       arrays['y'][target] = src['pos_y']
 
 
-def _player_arrays(batch_size: int) -> dict[str, np.ndarray]:
-  return {
-      'percent': np.zeros(batch_size, dtype=np.uint16),
-      'facing': np.zeros(batch_size, dtype=np.bool_),
-      'x': np.zeros(batch_size, dtype=np.float32),
-      'y': np.zeros(batch_size, dtype=np.float32),
-      'action': np.zeros(batch_size, dtype=np.uint16),
-      'invulnerable': np.zeros(batch_size, dtype=np.bool_),
-      'character': np.zeros(batch_size, dtype=np.uint8),
-      'jumps_left': np.zeros(batch_size, dtype=np.uint8),
-      'shield_strength': np.zeros(batch_size, dtype=np.float32),
-      'on_ground': np.zeros(batch_size, dtype=np.bool_),
-      'is_dead': np.ones(batch_size, dtype=np.bool_),
-      'stocks_left': np.zeros(batch_size, dtype=np.uint8),
+def _player_arrays(
+    batch_size: int,
+    *,
+    array_factory: ArrayFactory = np.zeros,
+) -> dict[str, np.ndarray]:
+  arrays = {
+      'percent': _make_array(array_factory, batch_size, np.uint16),
+      'facing': _make_array(array_factory, batch_size, np.bool_),
+      'x': _make_array(array_factory, batch_size, np.float32),
+      'y': _make_array(array_factory, batch_size, np.float32),
+      'action': _make_array(array_factory, batch_size, np.uint16),
+      'invulnerable': _make_array(array_factory, batch_size, np.bool_),
+      'character': _make_array(array_factory, batch_size, np.uint8),
+      'jumps_left': _make_array(array_factory, batch_size, np.uint8),
+      'shield_strength': _make_array(array_factory, batch_size, np.float32),
+      'on_ground': _make_array(array_factory, batch_size, np.bool_),
+      'is_dead': _make_array(array_factory, batch_size, np.bool_),
+      'stocks_left': _make_array(array_factory, batch_size, np.uint8),
   }
+  arrays['is_dead'][:] = True
+  return arrays
 
 
-def _item_arrays(batch_size: int) -> dict[str, np.ndarray]:
+def _item_arrays(
+    batch_size: int,
+    *,
+    array_factory: ArrayFactory = np.zeros,
+) -> dict[str, np.ndarray]:
   return {
-      'exists': np.zeros(batch_size, dtype=np.bool_),
-      'type': np.zeros(batch_size, dtype=np.uint16),
-      'state': np.zeros(batch_size, dtype=np.uint8),
-      'x': np.zeros(batch_size, dtype=np.float32),
-      'y': np.zeros(batch_size, dtype=np.float32),
+      'exists': _make_array(array_factory, batch_size, np.bool_),
+      'type': _make_array(array_factory, batch_size, np.uint16),
+      'state': _make_array(array_factory, batch_size, np.uint8),
+      'x': _make_array(array_factory, batch_size, np.float32),
+      'y': _make_array(array_factory, batch_size, np.float32),
   }
