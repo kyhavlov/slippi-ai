@@ -159,9 +159,24 @@ class AutoRegressiveComponent(nnx.Module):
     # Sample the component
     sample = self.embedder.sample(rng, logits, **kwargs)
     # Condition future components on the current sample
-    sample_embedding = self.embedder(sample)
-    residual = residual + self.decoder(sample_embedding)
+    residual = residual + self._decoder_update(sample)
     return residual, SampleOutputs(controller_state=sample, logits=logits)
+
+  def _decoder_update(self, sample: Array) -> Array:
+    # For one-hot controller components, Linear(one_hot(sample)) is exactly a
+    # decoder-kernel row gather plus bias. This avoids materializing [B, K]
+    # one-hot arrays in the autoregressive hot path.
+    if isinstance(self.embedder, embed.OneHotEmbedding):
+      kernel = self.decoder.kernel[...]
+      bias = self.decoder.bias[...]
+      return jnp.take(kernel, sample.astype(jnp.int32), axis=0) + bias
+    if isinstance(self.embedder, embed.BoolEmbedding):
+      kernel = self.decoder.kernel[...]
+      bias = self.decoder.bias[...]
+      sample_f32 = jnp.expand_dims(sample.astype(kernel.dtype), -1)
+      return sample_f32 * kernel[0] + bias
+    sample_embedding = self.embedder(sample)
+    return self.decoder(sample_embedding)
 
   def distance(
       self,
@@ -177,8 +192,7 @@ class AutoRegressiveComponent(nnx.Module):
     # Compute the distance between prediction and target
     distance = self.embedder.distance(logits, target_raw)
     # Auto-regress using the target (aka teacher forcing)
-    target_embedding = self.embedder(target_raw)
-    residual = residual + self.decoder(target_embedding)
+    residual = residual + self._decoder_update(target_raw)
     return residual, DistanceOutputs(distance=distance, logits=logits)
 
 
