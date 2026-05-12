@@ -112,6 +112,55 @@ class SimEnvTest(unittest.TestCase):
     finally:
       env.stop()
 
+  def test_packed_state_and_encoded_step(self):
+    env = sim_env.SimBatchedEnvironment(
+        num_envs=2,
+        players={
+            1: dolphin.AI(melee.Character.FOX),
+            2: dolphin.AI(melee.Character.FALCO),
+        },
+        length=8,
+    )
+    try:
+      state = env.current_packed_state(
+          needs_reset=np.ones(2, dtype=np.bool_))
+      self.assertEqual(state.needs_reset.shape, (4,))
+      self.assertEqual(state.game.p0.x.shape, (4,))
+      self.assertTrue(np.all(state.game.p0.character[:2] == melee.Character.FOX.value))
+      self.assertTrue(np.all(state.game.p0.character[2:] == melee.Character.FALCO.value))
+      self.assertTrue(np.all(state.game.p2.character[:2] == melee.Character.FALCO.value))
+      self.assertTrue(np.all(state.game.p2.character[2:] == melee.Character.FOX.value))
+
+      encoded = _neutral_encoded_controller(batch_size=4)
+      needs_reset = env.step_encoded(
+          encoded,
+          axis_spacing=32,
+          shoulder_spacing=4,
+      )
+      self.assertEqual(needs_reset.shape, (2,))
+      next_state = env.current_packed_state(needs_reset=needs_reset)
+      self.assertEqual(next_state.game.p0.x.shape, (4,))
+    finally:
+      env.stop()
+
+def _neutral_encoded_controller(batch_size: int):
+  shape = (int(batch_size),)
+  return sim_env.Controller(
+      main_stick=sim_env.Stick(
+          x=np.full(shape, 16, dtype=np.uint8),
+          y=np.full(shape, 16, dtype=np.uint8),
+      ),
+      c_stick=sim_env.Stick(
+          x=np.full(shape, 16, dtype=np.uint8),
+          y=np.full(shape, 16, dtype=np.uint8),
+      ),
+      shoulder=np.zeros(shape, dtype=np.uint8),
+      buttons=sim_env.Buttons(**{
+          name: np.zeros(shape, dtype=np.bool_)
+          for name in sim_env.Buttons._fields
+      }),
+  )
+
 
 if __name__ == '__main__':
   unittest.main()

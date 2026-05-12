@@ -66,18 +66,41 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
 
     self._sample = functools.partial(sample, policy, rngs)
 
+    def sample_controller_state(
+        policy: policies.Policy[ControllerType],
+        rngs: nnx.Rngs,
+        state_and_reset: tuple[Game, jax.Array],
+        name_code: jax.Array,
+        prev_action: ControllerType,
+        prev_state: policies.RecurrentState,
+    ) -> tuple[ControllerType, policies.RecurrentState]:
+      sample_outputs, next_state = sample(
+          policy, rngs, state_and_reset, name_code, prev_action, prev_state)
+      return sample_outputs.controller_state, next_state
+
+    self._sample_controller_state = functools.partial(
+        sample_controller_state, policy, rngs)
+
     if functionalize:
       self._jitted_sample = jax_utils.cached_functional_jit(
           sample, policy, rngs, donate_argnums=(5,))
+      self._jitted_sample_controller_state = jax_utils.cached_functional_jit(
+          sample_controller_state, policy, rngs, donate_argnums=(5,))
     else:
       if pack_args:
         jitted_sample = jax_utils.packed_nnx_jit(
             sample, donate_argnums=(1, 5), pack_argnums=(2,))
+        jitted_sample_controller_state = jax_utils.packed_nnx_jit(
+            sample_controller_state, donate_argnums=(1, 5), pack_argnums=(2,))
       else:
         jitted_sample = jax_utils.nnx_jit(sample, donate_argnums=(1, 5))
+        jitted_sample_controller_state = jax_utils.nnx_jit(
+            sample_controller_state, donate_argnums=(1, 5))
 
       self._jitted_sample = jax_utils.cached_partial(
           jitted_sample, policy, rngs)
+      self._jitted_sample_controller_state = jax_utils.cached_partial(
+          jitted_sample_controller_state, policy, rngs)
 
     def multi_sample(
         policy: policies.Policy[ControllerType],
@@ -170,6 +193,22 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
 
     # Convert to numpy?
     return jax.copy_to_host_async(sample_outputs)
+
+  def step_controller_state(
+      self,
+      game: Game,
+      needs_reset: agents.BoolArray,
+  ) -> ControllerType:
+    """Sample an action without returning logits."""
+    game = self._policy.network.encode_game(game)
+    sample_fn = (
+        self._jitted_sample_controller_state
+        if self._compile
+        else self._sample_controller_state)
+    controller_state, self._hidden_state = sample_fn(
+        (game, needs_reset), self._name_code, self._prev_controller, self._hidden_state)
+    self._prev_controller = controller_state
+    return jax.copy_to_host_async(controller_state)
 
   def multi_step(
       self,

@@ -34,6 +34,7 @@ def main():
   parser.add_argument('--no-compile', action='store_true')
   parser.add_argument('--batch-steps', type=int, default=0)
   parser.add_argument('--preembed-state', action='store_true')
+  parser.add_argument('--fast-path', action='store_true')
   parser.add_argument('--platform', choices=('tf', 'jax'), default='tf')
   parser.add_argument('--print-every', type=int, default=1000)
   args = parser.parse_args()
@@ -67,9 +68,16 @@ def main():
   measured_start = None
 
   try:
-    warmup_output = env.current_state(needs_reset=np.ones(args.batch_size, dtype=np.bool_))
-    agent.step(_pack_games(warmup_output.gamestates, args.batch_size), _pack_reset(warmup_output.needs_reset))
-    output = warmup_output
+    if args.fast_path:
+      spacing = _default_controller_spacing(state)
+      output = env.current_packed_state(
+          needs_reset=np.ones(args.batch_size, dtype=np.bool_))
+      agent.step(output.game, output.needs_reset)
+    else:
+      spacing = None
+      warmup_output = env.current_state(needs_reset=np.ones(args.batch_size, dtype=np.bool_))
+      agent.step(_pack_games(warmup_output.gamestates, args.batch_size), _pack_reset(warmup_output.needs_reset))
+      output = warmup_output
 
     while _should_continue(args, game_stats.total_games, total_steps):
       measuring = total_steps >= args.warmup_steps
@@ -77,8 +85,12 @@ def main():
         measured_start = time.perf_counter()
 
       iter_start = time.perf_counter()
-      packed_game = _pack_games(output.gamestates, args.batch_size)
-      packed_reset = _pack_reset(output.needs_reset)
+      if args.fast_path:
+        packed_game = output.game
+        packed_reset = output.needs_reset
+      else:
+        packed_game = _pack_games(output.gamestates, args.batch_size)
+        packed_reset = _pack_reset(output.needs_reset)
       elapsed = time.perf_counter() - iter_start
       if measuring:
         timings['pack_s'] += elapsed
@@ -91,29 +103,52 @@ def main():
           timings['embed_s'] += elapsed
 
       policy_start = time.perf_counter()
-      sample_outputs = agent.step(packed_game, packed_reset)
+      if args.fast_path and hasattr(agent, 'step_controller_state'):
+        controller_state = agent.step_controller_state(packed_game, packed_reset)
+        sample_outputs = None
+      else:
+        sample_outputs = agent.step(packed_game, packed_reset)
+        controller_state = sample_outputs.controller_state
       elapsed = time.perf_counter() - policy_start
       if measuring:
         timings['policy_s'] += elapsed
 
       decode_start = time.perf_counter()
-      decoded = agent.embed_controller.decode(sample_outputs.controller_state)
-      decoded = utils.map_single_structure(np.asarray, decoded)
-      controllers = _split_controllers(decoded, args.batch_size)
-      invalid_actions = _count_invalid_actions(controllers)
+      if args.fast_path:
+        invalid_actions = _count_invalid_encoded_actions(
+            controller_state,
+            axis_spacing=spacing[0],
+            shoulder_spacing=spacing[1],
+        )
+      else:
+        decoded = agent.embed_controller.decode(sample_outputs.controller_state)
+        decoded = utils.map_single_structure(np.asarray, decoded)
+        controllers = _split_controllers(decoded, args.batch_size)
+        invalid_actions = _count_invalid_actions(controllers)
       elapsed = time.perf_counter() - decode_start
       if measuring:
         counters['invalid_actions'] += invalid_actions
         timings['decode_s'] += elapsed
 
       env_start = time.perf_counter()
-      output = env.step(controllers)
+      if args.fast_path:
+        needs_reset = env.step_encoded(
+            controller_state,
+            axis_spacing=spacing[0],
+            shoulder_spacing=spacing[1],
+        )
+        output = env.current_packed_state(needs_reset=needs_reset)
+      else:
+        output = env.step(controllers)
       elapsed = time.perf_counter() - env_start
       if measuring:
         timings['env_s'] += elapsed
 
       stat_start = time.perf_counter()
-      game_stats.observe(output, env.last_step_info)
+      if args.fast_path:
+        game_stats.observe_packed(output.game, output.needs_reset, env.last_step_info)
+      else:
+        game_stats.observe(output, env.last_step_info)
       elapsed = time.perf_counter() - stat_start
       if measuring:
         timings['stats_s'] += elapsed
@@ -156,6 +191,7 @@ def main():
       'compile': not args.no_compile,
       'batch_steps': args.batch_steps,
       'preembed_state': args.preembed_state,
+      'fast_path': args.fast_path,
       'platform': args.platform,
   }
   summary['timings_sec'] = dict(timings)
@@ -197,26 +233,42 @@ class GameStats:
 
   def observe(self, output, step_info: sim_env.SimStepInfo):
     game = output.gamestates[1]
+    self._observe_game(game, output.needs_reset, step_info)
+
+  def observe_packed(
+      self,
+      game: sim_env.Game,
+      needs_reset: np.ndarray,
+      step_info: sim_env.SimStepInfo,
+  ):
+    self._observe_game(game, needs_reset, step_info)
+
+  def _observe_game(
+      self,
+      game: sim_env.Game,
+      needs_reset: np.ndarray,
+      step_info: sim_env.SimStepInfo,
+  ):
     frame_id = step_info.terminal['frame_id']
     self.nan_state_count += int(
-        np.isnan(game.p0.x).sum()
-        + np.isnan(game.p0.y).sum()
-        + np.isnan(game.p2.x).sum()
-        + np.isnan(game.p2.y).sum()
+        np.isnan(game.p0.x[:self.batch_size]).sum()
+        + np.isnan(game.p0.y[:self.batch_size]).sum()
+        + np.isnan(game.p2.x[:self.batch_size]).sum()
+        + np.isnan(game.p2.y[:self.batch_size]).sum()
     )
     advanced = frame_id > self.last_frame_id
     self.stuck_frame_count += int(np.logical_not(advanced).sum())
     self.last_frame_id = frame_id.copy()
 
     current_percent = np.stack([
-        game.p0.percent.astype(np.float32),
-        game.p2.percent.astype(np.float32),
+        game.p0.percent[:self.batch_size].astype(np.float32),
+        game.p2.percent[:self.batch_size].astype(np.float32),
     ], axis=1)
     self.damage_taken += np.maximum(current_percent - self.prev_percent, 0.0)
     self.prev_percent = current_percent
     self.frames += 1
 
-    done_ids = np.flatnonzero(output.needs_reset)
+    done_ids = np.flatnonzero(needs_reset[:self.batch_size])
     for lane in done_ids:
       self._finish_lane(int(lane), game, step_info.terminal[int(lane)])
 
@@ -326,10 +378,18 @@ class _JaxDelayedAgent:
     dummy = eval_lib.dummy_sample_outputs(self.embed_controller, [batch_size])
     for _ in range(delay):
       self._output_queue.append(dummy)
+    self._controller_queue = deque()
+    for _ in range(delay):
+      self._controller_queue.append(dummy.controller_state)
 
   def step(self, game, needs_reset):
     self._output_queue.append(self._agent.step(game, needs_reset))
     return self._output_queue.popleft()
+
+  def step_controller_state(self, game, needs_reset):
+    self._controller_queue.append(
+        self._agent.step_controller_state(game, needs_reset))
+    return self._controller_queue.popleft()
 
 
 def _build_agent(args, state: dict, names):
@@ -416,6 +476,33 @@ def _count_invalid_actions(controllers) -> int:
       count += int(np.logical_not(np.isfinite(arr)).sum())
       count += int((arr < 0.0).sum() + (arr > 1.0).sum())
   return count
+
+
+def _count_invalid_encoded_actions(
+    controller: sim_env.Controller,
+    *,
+    axis_spacing: int,
+    shoulder_spacing: int,
+) -> int:
+  count = 0
+  for arr, limit in (
+      (controller.main_stick.x, axis_spacing),
+      (controller.main_stick.y, axis_spacing),
+      (controller.c_stick.x, axis_spacing),
+      (controller.c_stick.y, axis_spacing),
+      (controller.shoulder, shoulder_spacing),
+  ):
+    values = np.asarray(arr)
+    count += int((values < 0).sum() + (values > limit).sum())
+  return count
+
+
+def _default_controller_spacing(state: dict) -> tuple[int, int]:
+  config = state['config']['embed']['controller']
+  if config.get('type', 'default') != 'default':
+    raise ValueError('--fast-path currently supports the default controller embedding only')
+  default = config.get('default', config)
+  return int(default['axis_spacing']), int(default['shoulder_spacing'])
 
 
 def _should_continue(args, completed_games: int, total_steps: int) -> bool:
