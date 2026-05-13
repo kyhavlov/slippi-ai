@@ -1,7 +1,9 @@
 import argparse
 import copy
+import dataclasses
 import json
 import multiprocessing as mp
+import pickle
 import time
 import traceback
 from collections import defaultdict, deque
@@ -44,6 +46,21 @@ def main():
   parser.add_argument('--profile-learner', action='store_true')
   parser.add_argument('--learning-rate', type=float, default=None,
                       help='Override checkpoint learner learning rate.')
+  parser.add_argument('--policy-gradient-weight', type=float, default=None)
+  parser.add_argument('--kl-teacher-weight', type=float, default=None)
+  parser.add_argument('--value-cost', type=float, default=None)
+  parser.add_argument('--reward-halflife', type=float, default=None)
+  parser.add_argument('--reward-damage-ratio', type=float, default=None)
+  parser.add_argument('--reward-stalling-penalty', type=float, default=None)
+  parser.add_argument('--reward-stalling-threshold', type=float, default=None)
+  parser.add_argument('--reward-approaching-factor', type=float, default=None)
+  parser.add_argument('--reward-ledge-grab-penalty', type=float, default=None)
+  parser.add_argument('--reward-zelda-penalty', type=float, default=None)
+  parser.add_argument('--ppo-beta', type=float, default=None)
+  parser.add_argument('--ppo-epsilon', type=float, default=None)
+  parser.add_argument('--ppo-max-mean-actor-kl', type=float, default=None)
+  parser.add_argument('--optimizer-burnin-epochs', type=int, default=None)
+  parser.add_argument('--value-burnin-epochs', type=int, default=None)
   parser.add_argument(
       '--learner-param-dtype',
       choices=('float32', 'bfloat16'),
@@ -54,6 +71,9 @@ def main():
   parser.add_argument('--sample-temperature', type=float, default=1.0)
   parser.add_argument('--barrier-timeout', type=float, default=900.0)
   parser.add_argument('--print-every', type=int, default=1)
+  parser.add_argument('--save-path', default='')
+  parser.add_argument('--save-every', type=int, default=0)
+  parser.add_argument('--log-jsonl', default='')
   args = parser.parse_args()
 
   model_path = Path(args.model_path)
@@ -63,6 +83,12 @@ def main():
     raise ValueError('--workers and --batch-size must be positive')
   if args.rollout_length <= 0 or args.ppo_batches < 0 or args.updates <= 0:
     raise ValueError('--rollout-length and --updates must be positive')
+  save_path = Path(args.save_path) if args.save_path else None
+  log_path = Path(args.log_jsonl) if args.log_jsonl else None
+  if save_path is not None:
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+  if log_path is not None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
   state = eval_lib.load_state(path=str(model_path))
   total_batch = args.workers * args.batch_size
@@ -119,6 +145,21 @@ def main():
         learner_minibatch_scan_size=args.learner_minibatch_scan_size,
         offload_minibatch_outputs=args.offload_minibatch_outputs,
         learning_rate=args.learning_rate,
+        policy_gradient_weight=args.policy_gradient_weight,
+        kl_teacher_weight=args.kl_teacher_weight,
+        value_cost=args.value_cost,
+        reward_halflife=args.reward_halflife,
+        reward_damage_ratio=args.reward_damage_ratio,
+        reward_stalling_penalty=args.reward_stalling_penalty,
+        reward_stalling_threshold=args.reward_stalling_threshold,
+        reward_approaching_factor=args.reward_approaching_factor,
+        reward_ledge_grab_penalty=args.reward_ledge_grab_penalty,
+        reward_zelda_penalty=args.reward_zelda_penalty,
+        ppo_beta=args.ppo_beta,
+        ppo_epsilon=args.ppo_epsilon,
+        ppo_max_mean_actor_kl=args.ppo_max_mean_actor_kl,
+        optimizer_burnin_epochs=args.optimizer_burnin_epochs,
+        value_burnin_epochs=args.value_burnin_epochs,
         sample_temperature=args.sample_temperature,
         learner_param_dtype=args.learner_param_dtype,
     )
@@ -128,7 +169,10 @@ def main():
           f'--rollout-length must be greater than policy delay '
           f'{actor._policy.delay}, got {args.rollout_length}')
     learner_state = learner.initial_state(total_packed)
-    action_queue = deque(
+    env_action_queue = deque(
+        [_to_numpy_tree(actor._policy.controller_head.dummy_sample_outputs([total_packed]))
+         for _ in range(actor._policy.delay)])
+    learner_action_queue = deque(
         [_to_numpy_tree(actor._policy.controller_head.dummy_sample_outputs([total_packed]))
          for _ in range(actor._policy.delay + 1)])
 
@@ -150,13 +194,17 @@ def main():
         measured_start = time.perf_counter()
 
       trajectories = []
+      update_timings = defaultdict(float)
+      update_counters = defaultdict(int)
+      update_start = time.perf_counter()
       for batch_index in range(ppo_batches):
         rollout_start = time.perf_counter()
         trajectory, rollout_stats = _collect_trajectory(
             actor=actor,
             packed=packed,
             action=action,
-            action_queue=action_queue,
+            env_action_queue=env_action_queue,
+            learner_action_queue=learner_action_queue,
             action_barrier=action_barrier,
             obs_barrier=obs_barrier,
             step_counters=step_counters,
@@ -169,6 +217,11 @@ def main():
         )
         rollout_done = time.perf_counter()
         trajectories.append(trajectory)
+        for key, value in rollout_stats['timings_sec'].items():
+          update_timings[key] += value
+        for key, value in rollout_stats['counters'].items():
+          update_counters[key] += value
+        update_timings['trajectory_collect_total_s'] += rollout_done - rollout_start
         if measuring:
           for key, value in rollout_stats['timings_sec'].items():
             timings[key] += value
@@ -185,10 +238,30 @@ def main():
           profile=args.profile_learner and measuring)
       _block_until_ready((learner_state, last_metrics))
       learner_done = time.perf_counter()
+      update_timings['learner_ppo_s'] += learner_done - learner_start
+      update_timings['update_total_s'] += learner_done - update_start
 
       if measuring:
         timings['learner_ppo_s'] += learner_done - learner_start
         measured_updates += 1
+
+      step_number = int(state.get('step', 0)) + update_index + 1
+      if log_path is not None:
+        _append_jsonl(log_path, {
+            'update': step_number,
+            'phase': 'measure' if measuring else 'warmup',
+            'env_steps': total_batch * args.rollout_length * ppo_batches,
+            'player_frames': total_packed * args.rollout_length * ppo_batches,
+            'timings_sec': dict(update_timings),
+            'counters': dict(update_counters),
+            'metrics': _jsonable_metrics(last_metrics),
+        })
+      if save_path is not None and args.save_every > 0 and step_number % args.save_every == 0:
+        _save_checkpoint(save_path.with_name(
+            f'{save_path.stem}_{step_number}{save_path.suffix}'),
+            learner=learner,
+            source_state=state,
+            step=step_number)
 
       if args.print_every and (update_index + 1) % args.print_every == 0:
         phase = 'measure' if measuring else 'warmup'
@@ -229,6 +302,16 @@ def main():
             'warmup_updates': args.warmup_updates,
             'policy_delay': actor._policy.delay,
             'learning_rate': learner._config.learning_rate,
+            'policy_gradient_weight': learner._config.policy_gradient_weight,
+            'kl_teacher_weight': learner._config.kl_teacher_weight,
+            'value_cost': learner._config.value_cost,
+            'reward_halflife': learner._config.reward_halflife,
+            'reward': dataclasses.asdict(learner._config.reward),
+            'ppo_beta': learner._config.ppo.beta,
+            'ppo_epsilon': learner._config.ppo.epsilon,
+            'ppo_max_mean_actor_kl': learner._config.ppo.max_mean_actor_kl,
+            'optimizer_burnin_epochs': learner._config.optimizer_burnin_epochs,
+            'value_burnin_epochs': learner._config.value_burnin_epochs,
             'learner_param_dtype': args.learner_param_dtype,
             'measured_elapsed_sec': measured_elapsed,
             'measured_updates': measured_updates,
@@ -245,6 +328,9 @@ def main():
         'worker_results': worker_results,
         'last_metrics': _jsonable_metrics(last_metrics),
     }
+    if save_path is not None:
+      _save_checkpoint(save_path, learner=learner, source_state=state,
+                       step=int(state.get('step', 0)) + total_updates)
     print(json.dumps(summary, indent=2, sort_keys=True))
   except BaseException:
     stop_event.set()
@@ -275,6 +361,21 @@ def _build_learner_and_actor(
     learner_minibatch_scan_size: int,
     offload_minibatch_outputs: bool,
     learning_rate: float | None,
+    policy_gradient_weight: float | None = None,
+    kl_teacher_weight: float | None = None,
+    value_cost: float | None = None,
+    reward_halflife: float | None = None,
+    reward_damage_ratio: float | None = None,
+    reward_stalling_penalty: float | None = None,
+    reward_stalling_threshold: float | None = None,
+    reward_approaching_factor: float | None = None,
+    reward_ledge_grab_penalty: float | None = None,
+    reward_zelda_penalty: float | None = None,
+    ppo_beta: float | None = None,
+    ppo_epsilon: float | None = None,
+    ppo_max_mean_actor_kl: float | None = None,
+    optimizer_burnin_epochs: int | None = None,
+    value_burnin_epochs: int | None = None,
     sample_temperature: float,
     learner_param_dtype: str = 'float32',
 ):
@@ -306,6 +407,36 @@ def _build_learner_and_actor(
     learner_config.ppo.num_epochs = ppo_epochs
   if learning_rate is not None:
     learner_config.learning_rate = learning_rate
+  if policy_gradient_weight is not None:
+    learner_config.policy_gradient_weight = policy_gradient_weight
+  if kl_teacher_weight is not None:
+    learner_config.kl_teacher_weight = kl_teacher_weight
+  if value_cost is not None:
+    learner_config.value_cost = value_cost
+  if reward_halflife is not None:
+    learner_config.reward_halflife = reward_halflife
+  if reward_damage_ratio is not None:
+    learner_config.reward.damage_ratio = reward_damage_ratio
+  if reward_stalling_penalty is not None:
+    learner_config.reward.stalling_penalty = reward_stalling_penalty
+  if reward_stalling_threshold is not None:
+    learner_config.reward.stalling_threshold = reward_stalling_threshold
+  if reward_approaching_factor is not None:
+    learner_config.reward.approaching_factor = reward_approaching_factor
+  if reward_ledge_grab_penalty is not None:
+    learner_config.reward.ledge_grab_penalty = reward_ledge_grab_penalty
+  if reward_zelda_penalty is not None:
+    learner_config.reward.zelda_penalty = reward_zelda_penalty
+  if ppo_beta is not None:
+    learner_config.ppo.beta = ppo_beta
+  if ppo_epsilon is not None:
+    learner_config.ppo.epsilon = ppo_epsilon
+  if ppo_max_mean_actor_kl is not None:
+    learner_config.ppo.max_mean_actor_kl = ppo_max_mean_actor_kl
+  if optimizer_burnin_epochs is not None:
+    learner_config.optimizer_burnin_epochs = optimizer_burnin_epochs
+  if value_burnin_epochs is not None:
+    learner_config.value_burnin_epochs = value_burnin_epochs
   learner_config.ppo.minibatch_size = learner_minibatch_size
   learner_config.ppo.minibatch_scan_size = learner_minibatch_scan_size
   learner_config.ppo.offload_minibatch_outputs = offload_minibatch_outputs
@@ -356,7 +487,8 @@ def _collect_trajectory(
     actor: jax_agents.BasicAgent,
     packed,
     action,
-    action_queue: deque,
+    env_action_queue: deque,
+    learner_action_queue: deque,
     action_barrier,
     obs_barrier,
     step_counters,
@@ -383,9 +515,10 @@ def _collect_trajectory(
     policy_start = time.perf_counter()
     sample_outputs = _to_numpy_tree(actor.step(packed.game, packed.needs_reset))
     policy_done = time.perf_counter()
-    action_queue.append(sample_outputs)
-    delayed_output = action_queue.popleft()
-    actions.append(delayed_output)
+    env_action_queue.append(sample_outputs)
+    delayed_output = env_action_queue.popleft()
+    learner_action_queue.append(sample_outputs)
+    actions.append(learner_action_queue.popleft())
 
     invalid = benchmark_sim_mp._copy_controller(
         action, delayed_output.controller_state, controller_spacing)
@@ -414,14 +547,14 @@ def _collect_trajectory(
   final_state_start = time.perf_counter()
   states.append(_to_numpy_tree(packed.game))
   resets.append(np.asarray(packed.needs_reset, dtype=np.bool_).copy())
-  actions.append(action_queue[0])
+  actions.append(learner_action_queue[0])
   trajectory = _build_trajectory(
       actor=actor,
       states=states,
       actions=actions,
       resets=resets,
       initial_state=initial_state,
-      delayed_actions=list(action_queue)[1:],
+      delayed_actions=list(learner_action_queue)[1:],
       name_code=name_code,
       rollout_length=rollout_length,
       total_batch=total_batch,
@@ -473,6 +606,31 @@ def _block_until_ready(value):
     elif isinstance(leaf, np.ndarray):
       # NumPy arrays may wrap pending jax.copy_to_host_async results.
       np.asarray(leaf)
+
+
+def _save_checkpoint(
+    path: Path,
+    *,
+    learner: learner_lib.Learner,
+    source_state: dict,
+    step: int,
+):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  combined_state = dict(
+      state=learner.get_state(),
+      config=source_state['config'],
+      name_map=source_state['name_map'],
+      step=int(step),
+      rl_config=dict(learner=dataclasses.asdict(learner._config)),
+  )
+  with open(path, 'wb') as f:
+    pickle.dump(combined_state, f)
+
+
+def _append_jsonl(path: Path, row: dict):
+  with open(path, 'a') as f:
+    f.write(json.dumps(row, sort_keys=True))
+    f.write('\n')
 
 
 def _jsonable_metrics(metrics):

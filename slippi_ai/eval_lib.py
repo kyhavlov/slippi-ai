@@ -438,6 +438,7 @@ class JaxDelayedAgent:
       raise ValueError('async_inference is not supported with platform="jax"')
     if jit_compile:
       logging.info('Ignoring jit_compile=True for JAX inference; JAX uses jit.')
+    agent_kwargs.pop('run_on_cpu', None)
     unsupported = set(agent_kwargs)
     if unsupported:
       raise ValueError(
@@ -703,7 +704,7 @@ def get_name_code(state: dict, name: str) -> int:
 def get_name_from_rl_state(state: dict) -> Optional[list[str]]:
   # For RL, we know the name that was used during training.
   # TODO: unify self-train and train-two
-  if 'rl_config' in state:  # self-train aka rl/run.py
+  if 'rl_config' in state and 'agent' in state['rl_config']:  # self-train aka rl/run.py
     name = state['rl_config']['agent']['name']
   elif 'agent_config' in state:  # rl/train_two.py
     name = state['agent_config']['name']

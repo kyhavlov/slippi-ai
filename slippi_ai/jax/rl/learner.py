@@ -171,6 +171,10 @@ def concat_learner_states(states: list[LearnerState]) -> LearnerState:
   )
 
 
+def stack_trees(trees: list[tp.Any]):
+  return jax.tree.map(lambda *xs: jnp.stack(xs), *trees)
+
+
 def summarize_policy_metrics(metrics_list: list[dict]) -> dict:
   if not metrics_list:
     return {}
@@ -195,6 +199,14 @@ def summarize_policy_metrics_jax(metrics: dict) -> dict:
       )
       for key, value in metrics.items()
   }
+
+
+def summarize_policy_array(value: Array) -> dict:
+  return dict(
+      mean=jnp.mean(value),
+      min=jnp.min(value),
+      max=jnp.max(value),
+  )
 
 
 def summarize_policy_metric_summaries(metrics_list: list[dict]) -> dict:
@@ -314,6 +326,11 @@ class Learner(nnx.Module):
     self.jit_ppo_stacked_minibatch_train_and_eval = jax_utils.cached_partial(
         jit_ppo_stacked_minibatch_train_and_eval, self)
 
+    jit_ppo_chunked_minibatch_train_and_eval = nnx.jit(
+        Learner.ppo_chunked_minibatch_train_and_eval)
+    self.jit_ppo_chunked_minibatch_train_and_eval = jax_utils.cached_partial(
+        jit_ppo_chunked_minibatch_train_and_eval, self)
+
   def initial_state(
       self, batch_size: int, rngs: tp.Optional[nnx.Rngs] = None,
   ) -> LearnerState:
@@ -426,6 +443,73 @@ class Learner(nnx.Module):
     )
     return loss, metrics
 
+  def _policy_loss_and_metric_summary(
+      self,
+      policy: Policy,
+      outputs: LearnerOutputs,
+      trajectory: Trajectory,
+  ) -> tuple[Array, dict]:
+    delay = self.policy.delay  # D
+    remove_first = lambda t: t[delay:] if delay > 0 else t
+    remove_last = lambda t: t[:t.shape[0] - delay] if delay > 0 else t
+
+    advantages = jax.lax.stop_gradient(outputs.value.advantages[delay:])
+
+    policy_frames = data.Frames(
+        state_action=data.StateAction(
+            state=jax.tree.map(remove_last, trajectory.states),
+            action=jax.tree.map(remove_first, trajectory.actions.controller_state),
+            name=remove_last(trajectory.name),
+        ),
+        is_resetting=remove_last(trajectory.is_resetting),
+        reward=remove_first(trajectory.rewards),
+    )
+
+    actor_outputs = utils.map_single_structure(
+        lambda t: t[1 + delay:], trajectory.actions)
+    actor_logits = actor_outputs.logits
+    actor_log_probs = jax.lax.stop_gradient(
+        self._get_log_prob(actor_logits, actor_outputs.controller_state))
+
+    policy_outputs = policy.unroll(policy_frames, trajectory.initial_state)
+    new_logits = policy_outputs.distances.logits
+    new_log_probs = policy_outputs.log_probs
+
+    teacher_logits = jax.tree.map(
+        remove_last, outputs.teacher.distances.logits)
+    teacher_kl = self._compute_kl(new_logits, teacher_logits)
+    actor_kl = self._compute_kl(actor_logits, new_logits)
+    reverse_teacher_kl = self._compute_kl(teacher_logits, new_logits)
+    entropy = self._compute_entropy(new_logits)
+
+    log_rhos = new_log_probs - actor_log_probs
+    rhos = jnp.exp(log_rhos)
+
+    eps = self._config.ppo.epsilon
+    clipped_log_rhos = jnp.clip(log_rhos, -eps, eps)
+    clipped_rhos = jnp.exp(clipped_log_rhos)
+
+    ppo_objective = jnp.minimum(rhos * advantages, clipped_rhos * advantages)
+
+    weighted_loss = (
+        - self._config.policy_gradient_weight * ppo_objective
+        + self._config.ppo.beta * actor_kl
+        + self._config.kl_teacher_weight * teacher_kl
+        + self._config.reverse_kl_teacher_weight * reverse_teacher_kl
+        - self._config.entropy_weight * entropy
+    )
+    loss = jnp.mean(weighted_loss)
+
+    metrics = dict(
+        total_loss=summarize_policy_array(loss),
+        ppo_objective=summarize_policy_array(ppo_objective),
+        teacher_kl=summarize_policy_array(teacher_kl),
+        entropy=summarize_policy_array(entropy),
+        actor_kl=summarize_policy_array(actor_kl),
+        reverse_teacher_kl=summarize_policy_array(reverse_teacher_kl),
+    )
+    return loss, metrics
+
   def _unroll_teacher_and_vf(
       self,
       trajectory: Trajectory,
@@ -523,8 +607,7 @@ class Learner(nnx.Module):
   ) -> tp.Tuple[tp.Any, dict]:
     """Like ppo_grads, but returns scalar metric summaries for minibatching."""
     def policy_loss_fn(policy: Policy):
-      loss, metrics = self._policy_loss_and_metrics(policy, outputs, trajectory)
-      return loss, summarize_policy_metrics_jax(metrics)
+      return self._policy_loss_and_metric_summary(policy, outputs, trajectory)
 
     grads, metrics = jax_utils.grad_with_aux(policy_loss_fn)(self.policy)
     return grads, metrics
@@ -543,8 +626,9 @@ class Learner(nnx.Module):
       outputs: LearnerOutputs,
       trajectory: Trajectory,
   ) -> dict:
-    return summarize_policy_metrics_jax(
-        self.ppo_metrics(outputs, trajectory))
+    _, metrics = self._policy_loss_and_metric_summary(
+        self.policy, outputs, trajectory)
+    return metrics
 
   def ppo_epoch(
       self,
@@ -802,6 +886,113 @@ class Learner(nnx.Module):
     )
     return train_metrics, final_metrics
 
+  def ppo_chunked_minibatch_train_and_eval(
+      self,
+      learner_outputs: LearnerOutputs,
+      trajectories: Trajectory,
+  ) -> tuple[dict, dict]:
+    """Apply one PPO update and post-update eval over stacked chunks.
+
+    `learner_outputs` and `trajectories` are shaped
+    [num_chunks, minibatches_per_chunk, ...]. Keeping both the gradient pass and
+    post-update metrics in one compiled call avoids Python dispatch and repeated
+    host/device restacking between minibatch chunks.
+    """
+    first_outputs = jax.tree.map(lambda t: t[0, 0], learner_outputs)
+    first_trajectory = jax.tree.map(lambda t: t[0, 0], trajectories)
+    grad_shapes, _ = nnx.eval_shape(
+        Learner.ppo_grads_summary, self, first_outputs, first_trajectory)
+    zero_grads = jax.tree.map(jnp.zeros_like, grad_shapes)
+
+    @nnx.scan(
+        in_axes=(None, 0, 0, nnx.Carry),
+        out_axes=(0, nnx.Carry),
+    )
+    def grad_scan(
+        learner: Learner,
+        learner_outputs: LearnerOutputs,
+        trajectory: Trajectory,
+        grads_acc: jax_utils.Grads,
+    ) -> tuple[dict, jax_utils.Grads]:
+      chunk_grads, chunk_metrics = learner.ppo_stacked_minibatch_grads(
+          learner_outputs, trajectory)
+      new_grads_acc = jax.tree.map(jnp.add, grads_acc, chunk_grads)
+      return chunk_metrics, new_grads_acc
+
+    train_metrics, grads_sum = grad_scan(
+        self, learner_outputs, trajectories, zero_grads)
+    total_minibatches = (
+        trajectories.rewards.shape[0] * trajectories.rewards.shape[1])
+    grads = jax.tree.map(lambda g: g / total_minibatches, grads_sum)
+    self.policy_optimizer.update(self.policy, grads)
+
+    grads_dict = nnx.to_pure_dict(grads)
+    grad_norms = jax.tree.map(jnp.linalg.norm, grads_dict)
+    max_grad_norm = jax.tree.reduce(jnp.maximum, grad_norms)
+    train_metrics = summarize_stacked_policy_metric_summaries(train_metrics)
+    train_metrics['grads'] = dict(
+        norms=grad_norms,
+        max_norm=max_grad_norm,
+    )
+
+    @nnx.scan(
+        in_axes=(None, 0, 0),
+        out_axes=0,
+    )
+    def eval_scan(
+        learner: Learner,
+        learner_outputs: LearnerOutputs,
+        trajectory: Trajectory,
+    ) -> dict:
+      return learner.ppo_stacked_minibatch_metrics(
+          learner_outputs, trajectory)
+
+    final_metrics = eval_scan(self, learner_outputs, trajectories)
+    final_metrics = summarize_stacked_policy_metric_summaries(final_metrics)
+    final_metrics['grads'] = dict(
+        norms={},
+        max_norm=jnp.array(0.0),
+    )
+    return train_metrics, final_metrics
+
+  def build_equal_minibatch_chunks(
+      self,
+      learner_outputs: list[list[tuple[int, int, LearnerOutputs]]],
+      trajectories: list[Trajectory],
+      profile: dict | None = None,
+  ) -> tuple[LearnerOutputs, Trajectory, int] | None:
+    """Stack uniform minibatches into [chunk, scan, ...] trees if possible."""
+    scan_size = max(1, self._config.ppo.minibatch_scan_size)
+    minibatch_size = self._config.ppo.minibatch_size
+    records = []
+    for output_slices, trajectory in zip(learner_outputs, trajectories):
+      batch_size = trajectory_batch_size(trajectory)
+      if not output_slices or output_slices[-1][1] != batch_size:
+        return None
+      for start, end, outputs in output_slices:
+        if end - start != minibatch_size:
+          return None
+        records.append((outputs, slice_trajectory(trajectory, start, end)))
+
+    if not records or len(records) % scan_size:
+      return None
+
+    stack_start = time.perf_counter()
+    output_chunks = []
+    trajectory_chunks = []
+    for start in range(0, len(records), scan_size):
+      chunk = records[start:start + scan_size]
+      output_chunks.append(stack_trees([outputs for outputs, _ in chunk]))
+      trajectory_chunks.append(stack_trees([trajectory for _, trajectory in chunk]))
+    chunked_outputs = stack_trees(output_chunks)
+    chunked_trajectories = stack_trees(trajectory_chunks)
+    block_until_ready((chunked_outputs, chunked_trajectories))
+    if profile is not None:
+      profile['ppo_chunk_stack_s'] += time.perf_counter() - stack_start
+      profile['ppo_chunks'] += len(output_chunks)
+      profile['ppo_chunked_minibatches'] += len(records)
+    return chunked_outputs, chunked_trajectories, len(records)
+
   def unroll_trajectory_minibatched(
       self,
       trajectory: Trajectory,
@@ -973,42 +1164,32 @@ class Learner(nnx.Module):
 
     # PPO epochs with gradient updates.
     per_epoch_metrics = []
-    if (
-        use_minibatches
-        and num_epochs == 1
-        and len(trajectories) == 1
-        and len(learner_outputs) == 1
-        and len(learner_outputs[0]) <= self._config.ppo.minibatch_scan_size
-        and len({end - start for start, end, _ in learner_outputs[0]}) == 1
-    ):
+    chunked_minibatches = None
+    if use_minibatches and num_epochs == 1:
+      chunked_minibatches = self.build_equal_minibatch_chunks(
+          learner_outputs, trajectories, profile=profile_timings)
+
+    if chunked_minibatches is not None:
       fuse_start = time.perf_counter()
-      output_slices = learner_outputs[0]
-      stacked_outputs = jax.tree.map(
-          lambda *xs: jnp.stack(xs),
-          *[outputs for _, _, outputs in output_slices])
-      stacked_trajectories = jax.tree.map(
-          lambda *xs: jnp.stack(xs),
-          *[
-              slice_trajectory(trajectories[0], start, end)
-              for start, end, _ in output_slices
-          ])
+      stacked_outputs, stacked_trajectories, minibatch_count = chunked_minibatches
       epoch_metrics, final_metrics = (
-          self.jit_ppo_stacked_minibatch_train_and_eval(
+          self.jit_ppo_chunked_minibatch_train_and_eval(
               stacked_outputs, stacked_trajectories))
       if profile_timings is not None:
         block_until_ready((epoch_metrics, final_metrics))
         elapsed = time.perf_counter() - fuse_start
-        profile_timings['ppo_fused_train_eval_s'] += elapsed
+        profile_timings['ppo_chunked_train_eval_s'] += elapsed
         profile_timings['ppo_train_epoch_s'] += elapsed
         profile_timings['final_eval_total_s'] += 0.0
         profile_timings['ppo_train_epochs'] += 1
-        profile_timings['ppo_grad_minibatches'] += len(output_slices)
-        profile_timings['ppo_eval_minibatches'] += len(output_slices)
-        profile_timings['ppo_grad_chunks'] += 1
-        profile_timings['ppo_eval_chunks'] += 1
-        frame_count = sum(
-            (end - start) * (trajectories[0].rewards.shape[0] - self.policy.delay)
-            for start, end, _ in output_slices)
+        profile_timings['ppo_grad_minibatches'] += minibatch_count
+        profile_timings['ppo_eval_minibatches'] += minibatch_count
+        profile_timings['ppo_grad_chunks'] += stacked_trajectories.rewards.shape[0]
+        profile_timings['ppo_eval_chunks'] += stacked_trajectories.rewards.shape[0]
+        frame_count = (
+            minibatch_count
+            * self._config.ppo.minibatch_size
+            * (trajectories[0].rewards.shape[0] - self.policy.delay))
         profile_timings['ppo_grad_frames'] += frame_count
         profile_timings['ppo_eval_frames'] += frame_count
       per_epoch_metrics.append(epoch_metrics)
@@ -1065,6 +1246,7 @@ class Learner(nnx.Module):
     # state under an incompatible `optimizers` tuple. Restore the model weights
     # and keep the freshly initialized JAX optimizer state in that case.
     state_dict = dict(state_dict)
+    state_dict.pop('step', None)
     if 'policy' in state_dict and not isinstance(state_dict['policy'], dict):
       policy_state = tf_checkpoint.convert_policy_params(
           self.policy, state_dict.pop('policy'))

@@ -33,7 +33,10 @@ _SIM_TO_MELEE_STAGE = {
     int(melee_sim.Stage.BATTLEFIELD): melee.Stage.BATTLEFIELD.value,
     int(melee_sim.Stage.FINAL_DESTINATION): melee.Stage.FINAL_DESTINATION.value,
 }
-SUPPORTED_STAGES = tuple(_MELEE_TO_SIM_STAGE.keys())
+SUPPORTED_STAGES = tuple(
+    stage for stage in _MELEE_TO_SIM_STAGE
+    if stage is not melee.Stage.FOUNTAIN_OF_DREAMS
+)
 
 _TERMINAL_DTYPE = np.dtype(
     [
@@ -77,6 +80,7 @@ class SimBatchedEnvironment:
       *,
       length: int = 128,
       stage: melee.Stage | tp.Sequence[melee.Stage] = melee.Stage.FINAL_DESTINATION,
+      character_pairs: tp.Sequence[tuple[melee.Character, melee.Character]] | None = None,
       max_frame_id: int = -1,
       data_dir: str | None = None,
       include_controller_state: bool = True,
@@ -91,6 +95,8 @@ class SimBatchedEnvironment:
     if self._ports != _SUPPORTED_PORTS:
       raise ValueError('SimBatchedEnvironment currently supports ports 1 and 2.')
     self._stage_by_env = _normalize_stages(stage, self._num_envs)
+    self._character_pairs = _normalize_character_pairs(
+        character_pairs, self._players, self._num_envs)
     self._max_frame_id = int(max_frame_id)
     self._include_controller_state = bool(include_controller_state)
     self.num_steps = 1
@@ -257,18 +263,17 @@ class SimBatchedEnvironment:
       self._env.reset_cursor()
 
   def _configure_all_matches(self):
-    players = [
-        melee_sim.PlayerConfig(character=_character_id(self._players[1])),
-        melee_sim.PlayerConfig(character=_character_id(self._players[2])),
-    ]
     self._env.configure_matches(
         self._buffers,
         [
             melee_sim.MatchConfig(
                 stage=_MELEE_TO_SIM_STAGE[stage],
-                players=tuple(players),
+                players=(
+                    melee_sim.PlayerConfig(character=int(char_pair[0].value)),
+                    melee_sim.PlayerConfig(character=int(char_pair[1].value)),
+                ),
             )
-            for stage in self._stage_by_env
+            for stage, char_pair in zip(self._stage_by_env, self._character_pairs)
         ],
     )
 
@@ -330,6 +335,17 @@ def supported_stages() -> tuple[melee.Stage, ...]:
   return SUPPORTED_STAGES
 
 
+def balanced_fox_falco_pairs(
+    num_envs: int,
+    offset: int = 0,
+) -> tuple[tuple[melee.Character, melee.Character], ...]:
+  pairs = (
+      (melee.Character.FOX, melee.Character.FALCO),
+      (melee.Character.FALCO, melee.Character.FOX),
+  )
+  return tuple(pairs[(int(offset) + i) % len(pairs)] for i in range(int(num_envs)))
+
+
 def make_packed_game_builder(
     batch_size: int,
     *,
@@ -387,6 +403,35 @@ def _normalize_stages(stage: melee.Stage | tp.Sequence[melee.Stage], num_envs: i
     if item not in _MELEE_TO_SIM_STAGE:
       raise ValueError(f'SimBatchedEnvironment currently supports {SUPPORTED_STAGES}.')
   return np.asarray(stages, dtype=object)
+
+
+def _normalize_character_pairs(
+    character_pairs: tp.Sequence[tuple[melee.Character, melee.Character]] | None,
+    players: tp.Mapping[int, dolphin.Player],
+    num_envs: int,
+) -> tuple[tuple[melee.Character, melee.Character], ...]:
+  if character_pairs is None:
+    pair = (
+        _character_enum(players[1]),
+        _character_enum(players[2]),
+    )
+    return tuple(pair for _ in range(num_envs))
+
+  pairs = tuple(
+      (_coerce_character(pair[0]), _coerce_character(pair[1]))
+      for pair in character_pairs
+  )
+  if len(pairs) != num_envs:
+    raise ValueError(f'character_pairs sequence must have length num_envs={num_envs}')
+  return pairs
+
+
+def _character_enum(player: dolphin.Player) -> melee.Character:
+  return _coerce_character(getattr(player, 'character', melee.Character.FOX))
+
+
+def _coerce_character(character) -> melee.Character:
+  return character if isinstance(character, melee.Character) else melee.Character(character)
 
 
 def _slots_by_source(slots: np.ndarray) -> dict[int, np.ndarray]:

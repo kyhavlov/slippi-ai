@@ -261,7 +261,11 @@ def load_policy_from_tf_state(
     param_dtype: str = 'float32',
 ) -> policies.Policy:
   policy = policy_from_tf_config(state['config'])
-  params = convert_policy_params(policy, state['state']['policy'])
+  policy_state = state['state']['policy']
+  if isinstance(policy_state, dict):
+    params = policy_state
+  else:
+    params = convert_policy_params(policy, policy_state)
   params = cast_floating_state(params, param_dtype)
   jax_utils.set_module_state(policy, params)
   set_compute_dtype(policy, param_dtype)

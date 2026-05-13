@@ -93,6 +93,40 @@ class SimEnvTest(unittest.TestCase):
     finally:
       env.stop()
 
+  def test_default_supported_stage_pool_excludes_fountain(self):
+    self.assertNotIn(melee.Stage.FOUNTAIN_OF_DREAMS, sim_env.supported_stages())
+
+  def test_per_env_character_pairs(self):
+    pairs = sim_env.balanced_fox_falco_pairs(4)
+    env = sim_env.SimBatchedEnvironment(
+        num_envs=4,
+        length=8,
+        character_pairs=pairs,
+    )
+    try:
+      state = env.current_packed_state(
+          needs_reset=np.ones(4, dtype=np.bool_))
+      self.assertEqual(
+          state.game.p0.character[:4].tolist(),
+          [
+              melee.Character.FOX.value,
+              melee.Character.FALCO.value,
+              melee.Character.FOX.value,
+              melee.Character.FALCO.value,
+          ],
+      )
+      self.assertEqual(
+          state.game.p0.character[4:].tolist(),
+          [
+              melee.Character.FALCO.value,
+              melee.Character.FOX.value,
+              melee.Character.FALCO.value,
+              melee.Character.FOX.value,
+          ],
+      )
+    finally:
+      env.stop()
+
   def test_max_frame_terminal_is_reported_separately(self):
     env = sim_env.SimBatchedEnvironment(num_envs=2, length=128, max_frame_id=0)
     try:

@@ -19,7 +19,12 @@ def main():
   parser.add_argument('--model-path', default='models/rl_doubles_v27_11000.pkl')
   parser.add_argument('--batch-size', type=int, default=8)
   parser.add_argument('--rollout-length', type=int, default=32)
+  parser.add_argument('--ppo-batches', type=int, default=1)
   parser.add_argument('--minibatch-size', type=int, default=4)
+  parser.add_argument(
+      '--compare-minibatch-paths',
+      action='store_true',
+      help='Compare fused minibatch PPO against the non-fused minibatch path.')
   parser.add_argument(
       '--learner-param-dtype',
       choices=('float32', 'bfloat16'),
@@ -35,28 +40,34 @@ def main():
     raise FileNotFoundError(model_path)
   if args.rollout_length <= 21:
     raise ValueError('--rollout-length must exceed the policy delay')
-  if args.batch_size <= 0 or args.minibatch_size < 0:
+  if args.batch_size <= 0 or args.ppo_batches <= 0 or args.minibatch_size < 0:
     raise ValueError('--batch-size must be positive and --minibatch-size nonnegative')
   total_packed = args.batch_size * 2
   if args.minibatch_size > 0 and total_packed % args.minibatch_size:
     raise ValueError('--minibatch-size must divide batch_size * 2')
 
   state = eval_lib.load_state(path=str(model_path))
-  trajectory = _collect_one_trajectory(
+  trajectories = _collect_trajectories(
       state=state,
       batch_size=args.batch_size,
       rollout_length=args.rollout_length,
+      ppo_batches=args.ppo_batches,
       length=args.length,
       barrier_timeout=args.barrier_timeout,
   )
 
+  fallback_scan_size = (
+      args.ppo_batches * total_packed // args.minibatch_size + 1
+      if args.minibatch_size > 0 else 1)
+  full_minibatch_size = args.minibatch_size if args.compare_minibatch_paths else 0
+  full_scan_size = fallback_scan_size if args.compare_minibatch_paths else 1
   full, _, _ = benchmark_jax_sim_rl._build_learner_and_actor(
       state=state,
       batch_size=total_packed,
-      ppo_batches=1,
+      ppo_batches=args.ppo_batches,
       ppo_epochs=1,
-      learner_minibatch_size=0,
-      learner_minibatch_scan_size=1,
+      learner_minibatch_size=full_minibatch_size,
+      learner_minibatch_scan_size=full_scan_size,
       offload_minibatch_outputs=False,
       learning_rate=None,
       sample_temperature=1.0,
@@ -65,7 +76,7 @@ def main():
   mini, _, _ = benchmark_jax_sim_rl._build_learner_and_actor(
       state=state,
       batch_size=total_packed,
-      ppo_batches=1,
+      ppo_batches=args.ppo_batches,
       ppo_epochs=1,
       learner_minibatch_size=args.minibatch_size,
       learner_minibatch_scan_size=4,
@@ -79,8 +90,8 @@ def main():
   initial_mini = mini.initial_state(total_packed)
   step = int(state.get('step', 0))
 
-  full_state, full_metrics = full.ppo([trajectory], initial_full, step=step)
-  mini_state, mini_metrics = mini.ppo([trajectory], initial_mini, step=step)
+  full_state, full_metrics = full.ppo(trajectories, initial_full, step=step)
+  mini_state, mini_metrics = mini.ppo(trajectories, initial_mini, step=step)
   _block_until_ready((full_state, mini_state, full_metrics, mini_metrics))
 
   state_diff = _max_tree_diff(full.get_state(), mini.get_state())
@@ -103,7 +114,9 @@ def main():
       'batch_size': args.batch_size,
       'total_player_batch_size': total_packed,
       'rollout_length': args.rollout_length,
+      'ppo_batches': args.ppo_batches,
       'minibatch_size': args.minibatch_size,
+      'compare_minibatch_paths': args.compare_minibatch_paths,
       'learner_param_dtype': args.learner_param_dtype,
   }
   print(json.dumps(result, indent=2, sort_keys=True))
@@ -111,11 +124,12 @@ def main():
     raise SystemExit(1)
 
 
-def _collect_one_trajectory(
+def _collect_trajectories(
     *,
     state: dict,
     batch_size: int,
     rollout_length: int,
+    ppo_batches: int,
     length: int,
     barrier_timeout: float,
 ):
@@ -172,35 +186,43 @@ def _collect_one_trajectory(
         learner_param_dtype='float32',
     )
     del learner
-    action_queue = deque(
+    env_action_queue = deque(
+        [benchmark_jax_sim_rl._to_numpy_tree(
+            actor._policy.controller_head.dummy_sample_outputs([total_packed]))
+         for _ in range(actor._policy.delay)])
+    learner_action_queue = deque(
         [benchmark_jax_sim_rl._to_numpy_tree(
             actor._policy.controller_head.dummy_sample_outputs([total_packed]))
          for _ in range(actor._policy.delay + 1)])
 
     benchmark_sim_mp._barrier_wait(
         obs_barrier, barrier_timeout, 'initial observations')
-    trajectory, _ = benchmark_jax_sim_rl._collect_trajectory(
-        actor=actor,
-        packed=packed,
-        action=action,
-        action_queue=action_queue,
-        action_barrier=action_barrier,
-        obs_barrier=obs_barrier,
-        step_counters=step_counters,
-        workers=1,
-        total_batch=batch_size,
-        rollout_length=rollout_length,
-        controller_spacing=spacing,
-        name_code=name_code,
-        barrier_timeout=barrier_timeout,
-    )
+    trajectories = []
+    for _ in range(ppo_batches):
+      trajectory, _ = benchmark_jax_sim_rl._collect_trajectory(
+          actor=actor,
+          packed=packed,
+          action=action,
+          env_action_queue=env_action_queue,
+          learner_action_queue=learner_action_queue,
+          action_barrier=action_barrier,
+          obs_barrier=obs_barrier,
+          step_counters=step_counters,
+          workers=1,
+          total_batch=batch_size,
+          rollout_length=rollout_length,
+          controller_spacing=spacing,
+          name_code=name_code,
+          barrier_timeout=barrier_timeout,
+      )
+      trajectories.append(trajectory)
     stop_event.set()
     action_barrier.abort()
     result_queue.get(timeout=30.0)
     process.join(timeout=10.0)
     if process.exitcode != 0:
       raise RuntimeError(f'worker exited with {process.exitcode}')
-    return trajectory
+    return trajectories
   except BaseException:
     stop_event.set()
     try:

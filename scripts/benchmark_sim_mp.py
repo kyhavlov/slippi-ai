@@ -286,6 +286,7 @@ def _worker_main(
         },
         length=length,
         stage=_cycle_stages(batch_size, offset),
+        character_pairs=sim_env.balanced_fox_falco_pairs(batch_size, offset),
         max_frame_id=max_game_frames - 123,
     )
     env_slice = slice(offset, offset + batch_size)
