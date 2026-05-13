@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
@@ -169,12 +170,12 @@ def main():
           f'--rollout-length must be greater than policy delay '
           f'{actor._policy.delay}, got {args.rollout_length}')
     learner_state = learner.initial_state(total_packed)
+    dummy_outputs = actor._policy.controller_head.dummy_sample_outputs([total_packed])
     env_action_queue = deque(
-        [_to_numpy_tree(actor._policy.controller_head.dummy_sample_outputs([total_packed]))
+        [_to_numpy_tree(dummy_outputs.controller_state)
          for _ in range(actor._policy.delay)])
     learner_action_queue = deque(
-        [_to_numpy_tree(actor._policy.controller_head.dummy_sample_outputs([total_packed]))
-         for _ in range(actor._policy.delay + 1)])
+        [_to_numpy_tree(dummy_outputs) for _ in range(actor._policy.delay + 1)])
 
     benchmark_sim_mp._barrier_wait(
         obs_barrier, args.barrier_timeout, 'initial observations')
@@ -513,15 +514,15 @@ def _collect_trajectory(
     state_done = time.perf_counter()
 
     policy_start = time.perf_counter()
-    sample_outputs = _to_numpy_tree(actor.step(packed.game, packed.needs_reset))
+    sample_outputs = actor.step_device(packed.game, packed.needs_reset)
     policy_done = time.perf_counter()
-    env_action_queue.append(sample_outputs)
-    delayed_output = env_action_queue.popleft()
+    env_action_queue.append(_to_numpy_tree(sample_outputs.controller_state))
+    delayed_controller = env_action_queue.popleft()
     learner_action_queue.append(sample_outputs)
     actions.append(learner_action_queue.popleft())
 
     invalid = benchmark_sim_mp._copy_controller(
-        action, delayed_output.controller_state, controller_spacing)
+        action, delayed_controller, controller_spacing)
     action_done = time.perf_counter()
     benchmark_sim_mp._barrier_wait(
         action_barrier, barrier_timeout, 'action release')
@@ -587,7 +588,7 @@ def _build_trajectory(
           np.asarray(name_code, dtype=np.int32),
           [rollout_length + 1, total_batch * 2],
       ).copy(),
-      actions=utils.batch_nest_nt(actions),
+      actions=_batch_nest_jax(actions),
       rewards=np.zeros((rollout_length, total_batch * 2), dtype=np.float32),
       is_resetting=np.stack(resets, axis=0),
       initial_state=initial_state,
@@ -597,6 +598,10 @@ def _build_trajectory(
 
 def _to_numpy_tree(value):
   return utils.map_single_structure(lambda x: np.asarray(x).copy(), value)
+
+
+def _batch_nest_jax(nests):
+  return utils.map_nt(lambda *xs: jnp.stack(xs), *nests)
 
 
 def _block_until_ready(value):

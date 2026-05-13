@@ -182,6 +182,17 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
       needs_reset: agents.BoolArray,
   ) -> SampleOutputs[ControllerType]:
     """Doesn't take into account delay."""
+    sample_outputs = self.step_device(game, needs_reset)
+
+    # Convert to numpy?
+    return jax.copy_to_host_async(sample_outputs)
+
+  def step_device(
+      self,
+      game: Game,
+      needs_reset: agents.BoolArray,
+  ) -> SampleOutputs[ControllerType]:
+    """Sample an action and leave the full output tree on device."""
     game = self._policy.network.encode_game(game)
     # Keep hidden state and prev_controller on device.
     sample_fn = self._jitted_sample if self._compile else self._sample
@@ -190,9 +201,7 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
 
     # Use donate_argnums?
     self._prev_controller = sample_outputs.controller_state
-
-    # Convert to numpy?
-    return jax.copy_to_host_async(sample_outputs)
+    return sample_outputs
 
   def step_controller_state(
       self,

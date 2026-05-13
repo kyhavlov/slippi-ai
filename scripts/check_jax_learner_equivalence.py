@@ -186,13 +186,12 @@ def _collect_trajectories(
         learner_param_dtype='float32',
     )
     del learner
+    dummy_outputs = actor._policy.controller_head.dummy_sample_outputs([total_packed])
     env_action_queue = deque(
-        [benchmark_jax_sim_rl._to_numpy_tree(
-            actor._policy.controller_head.dummy_sample_outputs([total_packed]))
+        [benchmark_jax_sim_rl._to_numpy_tree(dummy_outputs.controller_state)
          for _ in range(actor._policy.delay)])
     learner_action_queue = deque(
-        [benchmark_jax_sim_rl._to_numpy_tree(
-            actor._policy.controller_head.dummy_sample_outputs([total_packed]))
+        [benchmark_jax_sim_rl._to_numpy_tree(dummy_outputs)
          for _ in range(actor._policy.delay + 1)])
 
     benchmark_sim_mp._barrier_wait(
