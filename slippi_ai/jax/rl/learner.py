@@ -213,6 +213,34 @@ def split_trajectory_minibatches(
   )
 
 
+def split_learner_state_minibatches(
+    state: LearnerState,
+    minibatch_size: int,
+) -> LearnerState | None:
+  leaves = jax.tree.leaves(state)
+  if not leaves:
+    return state
+  batch_size = int(leaves[0].shape[0])
+  if minibatch_size <= 0 or batch_size % minibatch_size:
+    return None
+  num_minibatches = batch_size // minibatch_size
+
+  def split_batch(t):
+    t = jnp.asarray(t)
+    shape = (num_minibatches, minibatch_size) + t.shape[1:]
+    return jnp.reshape(t, shape)
+
+  return jax.tree.map(split_batch, state)
+
+
+def merge_learner_state_minibatches(state: LearnerState) -> LearnerState:
+  return jax.tree.map(
+      lambda t: (
+          jnp.reshape(t, (t.shape[0] * t.shape[1],) + t.shape[2:])
+          if t.ndim >= 2 else t),
+      state)
+
+
 def group_record_axis(tree, scan_size: int):
   """Reshape leading record axis into [num_chunks, scan_size, ...]."""
   return jax.tree.map(
@@ -350,6 +378,11 @@ class Learner(nnx.Module):
 
     jit_unroll_grads = nnx.jit(Learner._unroll_teacher_and_vf_grads)
     self.unroll_value_grads = jax_utils.cached_partial(jit_unroll_grads, self)
+
+    jit_stacked_unroll_grads = nnx.jit(
+        Learner.unroll_stacked_minibatch_value_grads)
+    self.jit_unroll_stacked_minibatch_value_grads = (
+        jax_utils.cached_partial(jit_stacked_unroll_grads, self))
 
     jit_ppo_epoch = nnx.jit(
         Learner.ppo_epoch,
@@ -622,6 +655,30 @@ class Learner(nnx.Module):
         value=value_outputs,
     )
     return grads, outputs, final_state
+
+  def unroll_stacked_minibatch_value_grads(
+      self,
+      trajectories: Trajectory,
+      initial_states: LearnerState,
+  ) -> tuple[jax_utils.Grads, LearnerOutputs, LearnerState]:
+    """Unroll teacher/value and sum value grads over stacked minibatches."""
+    @nnx.scan(
+        in_axes=(None, 0, 0),
+        out_axes=(0, 0, 0),
+    )
+    def scan_fn(
+        learner: Learner,
+        trajectory: Trajectory,
+        initial_state: LearnerState,
+    ) -> tuple[LearnerOutputs, LearnerState, jax_utils.Grads]:
+      value_grads, outputs, final_state = (
+          learner._unroll_teacher_and_vf_grads(trajectory, initial_state))
+      return outputs, final_state, value_grads
+
+    outputs, final_states, value_grads = scan_fn(
+        self, trajectories, initial_states)
+    value_grads_sum = jax.tree.map(lambda g: jnp.sum(g, axis=0), value_grads)
+    return value_grads_sum, outputs, final_states
 
   def ppo_grads(
       self,
@@ -1058,6 +1115,12 @@ class Learner(nnx.Module):
       train_value_function: bool,
       profile: dict | None = None,
   ) -> tuple[list[tuple[int, int, LearnerOutputs]], LearnerState]:
+    if train_value_function:
+      fast_result = self.unroll_trajectory_equal_minibatches(
+          trajectory, initial_state, profile=profile)
+      if fast_result is not None:
+        return fast_result
+
     output_slices = []
     final_states = []
     value_grads_sum = None
@@ -1127,6 +1190,56 @@ class Learner(nnx.Module):
       if profile is not None:
         block_until_ready(self.value_function)
         profile['value_optimizer_s'] += time.perf_counter() - opt_start
+    return output_slices, final_state
+
+  def unroll_trajectory_equal_minibatches(
+      self,
+      trajectory: Trajectory,
+      initial_state: LearnerState,
+      profile: dict | None = None,
+  ) -> tuple[list[tuple[int, int, LearnerOutputs]], LearnerState] | None:
+    """Fast path for equal contiguous minibatches."""
+    minibatch_size = self._config.ppo.minibatch_size
+    trajectory_minibatches = split_trajectory_minibatches(
+        trajectory, minibatch_size)
+    state_minibatches = split_learner_state_minibatches(
+        initial_state, minibatch_size)
+    if trajectory_minibatches is None or state_minibatches is None:
+      return None
+
+    batch_size = trajectory_batch_size(trajectory)
+    num_minibatches = batch_size // minibatch_size
+    unroll_start = time.perf_counter()
+    value_grads_sum, outputs, final_states = (
+        self.jit_unroll_stacked_minibatch_value_grads(
+            trajectory_minibatches, state_minibatches))
+    if profile is not None:
+      block_until_ready((value_grads_sum, outputs, final_states))
+      profile['teacher_value_unroll_s'] += time.perf_counter() - unroll_start
+      profile['teacher_value_minibatches'] += num_minibatches
+      profile['teacher_value_chunks'] += 1
+      profile['teacher_value_frames'] += batch_size * trajectory.rewards.shape[0]
+
+    output_slices = [
+        (
+            i * minibatch_size,
+            (i + 1) * minibatch_size,
+            jax.tree.map(lambda t, i=i: t[i], outputs),
+        )
+        for i in range(num_minibatches)
+    ]
+    final_state = merge_learner_state_minibatches(final_states)
+
+    average_start = time.perf_counter()
+    value_grads = jax.tree.map(lambda g: g / num_minibatches, value_grads_sum)
+    if profile is not None:
+      block_until_ready(value_grads)
+      profile['value_grad_average_s'] += time.perf_counter() - average_start
+    opt_start = time.perf_counter()
+    self.value_optimizer.update(self.value_function, value_grads)
+    if profile is not None:
+      block_until_ready(self.value_function)
+      profile['value_optimizer_s'] += time.perf_counter() - opt_start
     return output_slices, final_state
 
   def ppo(
