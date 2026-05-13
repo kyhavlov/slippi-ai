@@ -175,6 +175,52 @@ def stack_trees(trees: list[tp.Any]):
   return jax.tree.map(lambda *xs: jnp.stack(xs), *trees)
 
 
+def concat_trees(trees: list[tp.Any], axis: int = 0):
+  return jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=axis), *trees)
+
+
+def split_trajectory_minibatches(
+    trajectory: Trajectory,
+    minibatch_size: int,
+) -> Trajectory | None:
+  """Reshape a trajectory batch into contiguous equal-size minibatches."""
+  batch_size = trajectory_batch_size(trajectory)
+  if minibatch_size <= 0 or batch_size % minibatch_size:
+    return None
+  num_minibatches = batch_size // minibatch_size
+
+  def split_time_batch(t):
+    t = jnp.asarray(t)
+    shape = (t.shape[0], num_minibatches, minibatch_size) + t.shape[2:]
+    return jnp.swapaxes(jnp.reshape(t, shape), 0, 1)
+
+  def split_batch(t):
+    t = jnp.asarray(t)
+    shape = (num_minibatches, minibatch_size) + t.shape[1:]
+    return jnp.reshape(t, shape)
+
+  return Trajectory(
+      states=jax.tree.map(split_time_batch, trajectory.states),
+      name=split_time_batch(trajectory.name),
+      actions=jax.tree.map(split_time_batch, trajectory.actions),
+      rewards=split_time_batch(trajectory.rewards),
+      is_resetting=split_time_batch(trajectory.is_resetting),
+      initial_state=jax.tree.map(split_batch, trajectory.initial_state),
+      delayed_actions=[
+          jax.tree.map(split_batch, action)
+          for action in trajectory.delayed_actions
+      ],
+  )
+
+
+def group_record_axis(tree, scan_size: int):
+  """Reshape leading record axis into [num_chunks, scan_size, ...]."""
+  return jax.tree.map(
+      lambda t: jnp.reshape(
+          t, (t.shape[0] // scan_size, scan_size) + t.shape[1:]),
+      tree)
+
+
 def summarize_policy_metrics(metrics_list: list[dict]) -> dict:
   if not metrics_list:
     return {}
@@ -964,34 +1010,45 @@ class Learner(nnx.Module):
     """Stack uniform minibatches into [chunk, scan, ...] trees if possible."""
     scan_size = max(1, self._config.ppo.minibatch_scan_size)
     minibatch_size = self._config.ppo.minibatch_size
-    records = []
+    output_records = []
+    trajectory_records = []
     for output_slices, trajectory in zip(learner_outputs, trajectories):
       batch_size = trajectory_batch_size(trajectory)
       if not output_slices or output_slices[-1][1] != batch_size:
         return None
+      if batch_size % minibatch_size:
+        return None
+      split_trajectory = split_trajectory_minibatches(
+          trajectory, minibatch_size)
+      if split_trajectory is None:
+        return None
       for start, end, outputs in output_slices:
         if end - start != minibatch_size:
           return None
-        records.append((outputs, slice_trajectory(trajectory, start, end)))
+        output_records.append(outputs)
+      trajectory_records.append(split_trajectory)
 
-    if not records or len(records) % scan_size:
+    record_count = len(output_records)
+    if not output_records or record_count % scan_size:
       return None
 
     stack_start = time.perf_counter()
-    output_chunks = []
-    trajectory_chunks = []
-    for start in range(0, len(records), scan_size):
-      chunk = records[start:start + scan_size]
-      output_chunks.append(stack_trees([outputs for outputs, _ in chunk]))
-      trajectory_chunks.append(stack_trees([trajectory for _, trajectory in chunk]))
-    chunked_outputs = stack_trees(output_chunks)
-    chunked_trajectories = stack_trees(trajectory_chunks)
+    output_stack_start = time.perf_counter()
+    output_records = stack_trees(output_records)
+    if profile is not None:
+      profile['ppo_output_stack_s'] += time.perf_counter() - output_stack_start
+    trajectory_stack_start = time.perf_counter()
+    trajectory_records = concat_trees(trajectory_records, axis=0)
+    if profile is not None:
+      profile['ppo_trajectory_stack_s'] += time.perf_counter() - trajectory_stack_start
+    chunked_outputs = group_record_axis(output_records, scan_size)
+    chunked_trajectories = group_record_axis(trajectory_records, scan_size)
     block_until_ready((chunked_outputs, chunked_trajectories))
     if profile is not None:
       profile['ppo_chunk_stack_s'] += time.perf_counter() - stack_start
-      profile['ppo_chunks'] += len(output_chunks)
-      profile['ppo_chunked_minibatches'] += len(records)
-    return chunked_outputs, chunked_trajectories, len(records)
+      profile['ppo_chunks'] += record_count // scan_size
+      profile['ppo_chunked_minibatches'] += record_count
+    return chunked_outputs, chunked_trajectories, record_count
 
   def unroll_trajectory_minibatched(
       self,
