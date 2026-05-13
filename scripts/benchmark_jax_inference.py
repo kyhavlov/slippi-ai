@@ -19,6 +19,10 @@ def main():
   parser.add_argument('--warmup-steps', type=int, default=50)
   parser.add_argument('--sample-temperature', type=float, default=1.0)
   parser.add_argument(
+      '--jax-param-dtype',
+      choices=('float32', 'bfloat16'),
+      default='float32')
+  parser.add_argument(
       '--mode',
       choices=('agent', 'agent-device', 'device-logits'),
       default='agent')
@@ -26,7 +30,8 @@ def main():
   args = parser.parse_args()
 
   state = eval_lib.load_state(path=args.model_path)
-  policy = tf_checkpoint.load_policy_from_tf_state(state)
+  policy = tf_checkpoint.load_policy_from_tf_state(
+      state, param_dtype=args.jax_param_dtype)
   name_code = _name_code(state, args.batch_size)
   agent = jax_agents.BasicAgent(
       policy=policy,
@@ -50,6 +55,7 @@ def main():
   result['warmup_steps'] = args.warmup_steps
   result['mode'] = args.mode
   result['pack_args'] = not args.no_pack_args
+  result['jax_param_dtype'] = args.jax_param_dtype
   print(json.dumps(result, indent=2, sort_keys=True))
 
 

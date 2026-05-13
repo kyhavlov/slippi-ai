@@ -427,6 +427,7 @@ class JaxDelayedAgent:
       sample_kwargs: dict = {},
       compile: bool = True,
       jit_compile: bool = False,
+      jax_param_dtype: str = 'float32',
       fake: bool = False,
       async_inference: bool = False,
       **agent_kwargs,
@@ -445,7 +446,8 @@ class JaxDelayedAgent:
     from slippi_ai.jax import agents as jax_agents
     from slippi_ai.jax import tf_checkpoint
 
-    policy = tf_checkpoint.load_policy_from_tf_state(state)
+    policy = tf_checkpoint.load_policy_from_tf_state(
+        state, param_dtype=jax_param_dtype)
 
     self._batch_steps = batch_steps
     self._input_queue = []
@@ -720,6 +722,7 @@ def build_delayed_agent(
     async_inference: bool = False,
     sample_temperature: float = 1.0,
     platform: str = 'tf',
+    jax_param_dtype: str = 'float32',
     **agent_kwargs,
 ) -> tp.Union[DelayedAgent, AsyncDelayedAgent, JaxDelayedAgent]:
   if isinstance(name, str) and not name.strip():
@@ -768,17 +771,22 @@ def build_delayed_agent(
       raise ValueError('async_inference is not supported with platform="jax"')
     agent_class = JaxDelayedAgent
   elif platform == 'tf':
+    if str(jax_param_dtype).lower() not in ('float32', 'fp32', 'f32'):
+      raise ValueError('jax_param_dtype is only supported with platform="jax"')
     agent_class = AsyncDelayedAgent if async_inference else DelayedAgent
   else:
     raise ValueError(f'Unknown inference platform: {platform}')
 
-  return agent_class(
+  kwargs = dict(
       state=state,
       name_code=name_code,
       console_delay=console_delay,
       sample_kwargs=dict(temperature=sample_temperature),
       **agent_kwargs,
   )
+  if platform == 'jax':
+    kwargs['jax_param_dtype'] = jax_param_dtype
+  return agent_class(**kwargs)
 
 class NameChangeMode(enum.Enum):
   FIXED = enum.auto()
@@ -940,6 +948,10 @@ BATCH_AGENT_FLAGS = dict(
     batch_steps=ff.Integer(0, 'Batch consecutive agent steps for inference.'),
     name=ff.String(nametags.DEFAULT_NAME, 'Name of the agent.'),
     platform=ff.Enum('tf', ('tf', 'jax'), 'Inference backend.'),
+    jax_param_dtype=ff.Enum(
+        'float32',
+        ('float32', 'bfloat16'),
+        'JAX-only floating parameter dtype for inference.'),
     # arg to build_delayed_agent
     async_inference=ff.Boolean(False, 'run agent asynchronously'),
     fake=ff.Boolean(False, 'Use fake agents.'),

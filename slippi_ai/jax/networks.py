@@ -31,6 +31,24 @@ def where_pytree(cond: Array, x, y):
   """Like jnp.where but broadcasts cond over pytree leaves."""
   return jax.tree.map(lambda a, b: jax_utils.where(cond, a, b), x, y)
 
+
+def cast_floating_tree(value, dtype):
+  if dtype is None:
+    return value
+  return jax.tree.map(
+      lambda x: x.astype(dtype)
+      if hasattr(x, 'dtype') and jnp.issubdtype(x.dtype, jnp.floating)
+      else x,
+      value)
+
+
+def first_floating_dtype(value):
+  for leaf in jax.tree.leaves(value):
+    if hasattr(leaf, 'dtype') and jnp.issubdtype(leaf.dtype, jnp.floating):
+      return leaf.dtype
+  return None
+
+
 InputTree = tp.TypeVar('InputTree', bound=Inputs)
 OutputTree = tp.TypeVar('OutputTree', bound=Outputs)
 OutputTree2 = tp.TypeVar('OutputTree2', bound=Outputs)
@@ -224,14 +242,18 @@ class RecurrentWrapper(Network[Array, Array]):
     else:
       batch_shape = tuple(batch_size)
     input_shape = batch_shape + (self.input_size,)
-    return self._core.initialize_carry(input_shape, rngs)
+    state = self._core.initialize_carry(input_shape, rngs)
+    return cast_floating_tree(state, first_floating_dtype(nnx.state(self._core)))
 
   def step(self, inputs, prev_state):
     # flax's RNNCells have the arguments reversed
+    state_dtype = first_floating_dtype(prev_state)
     core = self._core
     if self._remat:
       core = nnx.remat(self._core, prevent_cse=False)
     next_state, output = core(prev_state, inputs)
+    output = cast_floating_tree(output, state_dtype)
+    next_state = cast_floating_tree(next_state, state_dtype)
     return output, next_state
 
 class FFWWrapper(Network[InputTree, OutputTree]):
@@ -788,6 +810,10 @@ class SimpleEmbedNetwork(StateActionNetwork[Action]):
     self._input_preprocessor = input_preprocessor
     self._network = network
     self._remat = remat
+    self._compute_dtype = None
+
+  def set_compute_dtype(self, dtype):
+    self._compute_dtype = dtype
 
   @property
   def output_size(self) -> int:
@@ -797,7 +823,8 @@ class SimpleEmbedNetwork(StateActionNetwork[Action]):
     return self._embed_module.dummy(shape)
 
   def initial_state(self, batch_size: Shape, rngs: nnx.Rngs) -> RecurrentState:
-    return self._network.initial_state(batch_size, rngs)
+    state = self._network.initial_state(batch_size, rngs)
+    return cast_floating_tree(state, self._compute_dtype)
 
   def encode(self, state_action: StateAction[S, Controller]) -> StateAction[S, Action]:
     return self._embed_module.encode(state_action)
@@ -812,6 +839,7 @@ class SimpleEmbedNetwork(StateActionNetwork[Action]):
       embedded = self._embed_module(state_action)
     if self._input_preprocessor is not None:
       embedded = self._input_preprocessor(embedded)
+    embedded = cast_floating_tree(embedded, self._compute_dtype)
     return embedded
 
   def step(

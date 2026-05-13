@@ -7,7 +7,7 @@ from flax import nnx
 from melee.enums import Action
 
 from slippi_ai import data, types, utils
-from slippi_ai.jax import embed, networks, jax_utils, rl_lib
+from slippi_ai.jax import embed, networks, jax_utils, opponent_pooling, rl_lib
 from slippi_ai.jax.networks import RecurrentState
 
 Array = jax.Array
@@ -35,12 +35,14 @@ class ValueFunction(nnx.Module):
       network_config: dict,
       num_names: int,
       embed_config: embed.EmbedConfig,
+      opponent_pooling_config: opponent_pooling.OpponentPoolingConfig | None = None,
   ):
     self.network = networks.build_embed_network(
         rngs=rngs,
         embed_config=embed_config,
         num_names=num_names,
         network_config=network_config,
+        opponent_pooling=opponent_pooling_config,
     )
     self.value_head = nnx.Linear(self.network.output_size, 1, rngs=rngs)
 
@@ -64,17 +66,18 @@ class ValueFunction(nnx.Module):
       discount_on_death: Discount factor to use when either player *respawns*.
         The reward for KOs comes on the frame of death, which precedes respawn.
     """
-    rewards = frames.reward
+    rewards = jnp.asarray(frames.reward, jnp.float32)
 
     inputs = utils.map_nt(lambda t: t[:-1], frames.state_action)
     last_input = utils.map_nt(lambda t: t[-1], frames.state_action)
     outputs, final_state = self.network.unroll(
         inputs, frames.is_resetting[:-1], initial_state)
 
-    values = jnp.squeeze(self.value_head(outputs), -1)
+    values = jnp.asarray(jnp.squeeze(self.value_head(outputs), -1), jnp.float32)
     last_output, _ = self.network.step_with_reset(
         last_input, frames.is_resetting[-1], final_state)
-    last_value = jnp.squeeze(self.value_head(last_output), -1)
+    last_value = jnp.asarray(
+        jnp.squeeze(self.value_head(last_output), -1), jnp.float32)
     discounts = jnp.full_like(rewards, discount)
 
     if discount_on_death is not None:

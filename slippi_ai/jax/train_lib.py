@@ -33,6 +33,7 @@ from slippi_ai.jax import(
     networks,
     jax_utils, saving,
     learner as learner_lib,
+    opponent_pooling as opponent_pooling_lib,
     value_function as vf_lib,
 )
 
@@ -171,6 +172,8 @@ _field = utils.field
 class ValueFunctionConfig:
   separate_network_config: bool = True
   network: dict = _field(networks.default_network_config)
+  opponent_pooling: opponent_pooling_lib.OpponentPoolingConfig = _field(
+      opponent_pooling_lib.OpponentPoolingConfig)
 
 
 @dataclasses.dataclass
@@ -201,6 +204,7 @@ def value_function_from_config(
       network_config=network_config,
       num_names=config.max_names,
       embed_config=config.embed,
+      opponent_pooling_config=vf_config.opponent_pooling,
   )
 
 
