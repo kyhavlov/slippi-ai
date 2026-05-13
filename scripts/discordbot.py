@@ -305,6 +305,42 @@ def configure_tensorflow_gpu_limit(memory_limit_mb: Optional[int]):
     )
 
 
+def build_discord_player_order(
+    my_port: int,
+    present_ports: List[int],
+    teammate_port: Optional[int],
+) -> Tuple[int, int, int, int]:
+    all_ports = (1, 2, 3, 4)
+    present = [int(p) for p in present_ports]
+    if my_port not in present:
+        raise ValueError(f'my_port {my_port} not in present_ports {present}')
+    if teammate_port is not None and teammate_port not in present:
+        raise ValueError(
+            f'teammate_port {teammate_port} not in present_ports {present}')
+
+    opponents = [
+        p for p in all_ports
+        if p in present and p != my_port and p != teammate_port
+    ]
+    missing = [p for p in all_ports if p not in present]
+
+    if teammate_port is None:
+        # In a 3-player lobby without a teammate, keep p1 empty and place
+        # the two humans into opponent slots p2/p3.
+        ordered = [my_port]
+        if missing:
+            ordered.append(missing[0])
+        ordered.extend(opponents)
+    else:
+        ordered = [my_port, teammate_port]
+        ordered.extend(opponents)
+
+    for port in all_ports:
+        if port not in ordered:
+            ordered.append(port)
+    return tuple(ordered)
+
+
 class FinalizedDelayBuffer:
     """Publishes exact delayed frames once netplay has finalized them."""
 
@@ -1180,11 +1216,11 @@ class DoublesSession:
         else:
             self._no_teammate_signatures.pop(logical_port, None)
 
-        known_order = [int(my_port)]
-        if teammate_port is not None and teammate_port not in known_order:
-            known_order.append(teammate_port)
-        player_order = tuple(known_order)
-        player_order += tuple(p for p in (1, 2, 3, 4) if p not in player_order)
+        player_order = build_discord_player_order(
+            int(my_port),
+            [int(port) for port in gamestate.players],
+            teammate_port,
+        )
         self._player_orders[logical_port] = player_order
         self._teammate_ports[logical_port] = teammate_port
         signature = (int(my_port), teammate_port, player_order)

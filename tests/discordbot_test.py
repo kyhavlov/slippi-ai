@@ -180,6 +180,27 @@ class DiscordAutocompleteHelperTest(unittest.TestCase):
     self.assertEqual([(choice.name, choice.value) for choice in choices], [('Marth', 'MARTH')])
 
 
+class DiscordPlayerOrderTest(unittest.TestCase):
+
+  def test_three_player_lobby_without_teammate_keeps_p1_empty(self):
+    order = discordbot.build_discord_player_order(
+        my_port=2,
+        present_ports=[2, 3, 4],
+        teammate_port=None,
+    )
+
+    self.assertEqual(order, (2, 1, 3, 4))
+
+  def test_three_player_lobby_with_teammate_puts_human_opponent_after_team(self):
+    order = discordbot.build_discord_player_order(
+        my_port=2,
+        present_ports=[1, 2, 3],
+        teammate_port=3,
+    )
+
+    self.assertEqual(order, (2, 3, 1, 4))
+
+
 class FakeEmbedController:
 
   def decode(self, controller_state):
