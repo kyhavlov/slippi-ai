@@ -75,6 +75,15 @@ def main():
   parser.add_argument('--save-path', default='')
   parser.add_argument('--save-every', type=int, default=0)
   parser.add_argument('--log-jsonl', default='')
+  parser.add_argument(
+      '--jax-trace-dir',
+      default='',
+      help='If set, capture a JAX profiler trace around one measured learner update.')
+  parser.add_argument(
+      '--jax-trace-measured-index',
+      type=int,
+      default=0,
+      help='Zero-based measured update index to trace when --jax-trace-dir is set.')
   args = parser.parse_args()
 
   model_path = Path(args.model_path)
@@ -86,10 +95,13 @@ def main():
     raise ValueError('--rollout-length and --updates must be positive')
   save_path = Path(args.save_path) if args.save_path else None
   log_path = Path(args.log_jsonl) if args.log_jsonl else None
+  trace_path = Path(args.jax_trace_dir) if args.jax_trace_dir else None
   if save_path is not None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
   if log_path is not None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+  if trace_path is not None:
+    trace_path.mkdir(parents=True, exist_ok=True)
 
   state = eval_lib.load_state(path=str(model_path))
   total_batch = args.workers * args.batch_size
@@ -195,10 +207,23 @@ def main():
         measured_start = time.perf_counter()
 
       trajectories = []
+      phase_times = None
+      if log_path is not None:
+        phase_times = {
+            'update_start_perf': time.perf_counter(),
+            'update_start_unix_ns': time.time_ns(),
+            'rollout_batches': [],
+        }
       update_timings = defaultdict(float)
       update_counters = defaultdict(int)
       update_start = time.perf_counter()
       for batch_index in range(ppo_batches):
+        if phase_times is not None:
+          rollout_phase = {
+              'batch_index': batch_index,
+              'start_perf': time.perf_counter(),
+              'start_unix_ns': time.time_ns(),
+          }
         rollout_start = time.perf_counter()
         trajectory, rollout_stats = _collect_trajectory(
             actor=actor,
@@ -217,6 +242,10 @@ def main():
             barrier_timeout=args.barrier_timeout,
         )
         rollout_done = time.perf_counter()
+        if phase_times is not None:
+          rollout_phase['end_perf'] = time.perf_counter()
+          rollout_phase['end_unix_ns'] = time.time_ns()
+          phase_times['rollout_batches'].append(rollout_phase)
         trajectories.append(trajectory)
         for key, value in rollout_stats['timings_sec'].items():
           update_timings[key] += value
@@ -231,22 +260,49 @@ def main():
           timings['trajectory_collect_total_s'] += rollout_done - rollout_start
           measured_rollout_steps += args.rollout_length
 
+      step_number = int(state.get('step', 0)) + update_index + 1
+      trace_this_update = (
+          trace_path is not None
+          and measuring
+          and measured_updates == args.jax_trace_measured_index)
       learner_start = time.perf_counter()
-      learner_state, last_metrics = learner.ppo(
-          trajectories,
-          learner_state,
-          step=int(state.get('step', 0)) + update_index,
-          profile=args.profile_learner and measuring)
-      _block_until_ready((learner_state, last_metrics))
+      if phase_times is not None:
+        phase_times['learner_start_perf'] = learner_start
+        phase_times['learner_start_unix_ns'] = time.time_ns()
+      if trace_this_update:
+        jax.profiler.start_trace(str(trace_path))
+        try:
+          with jax.profiler.StepTraceAnnotation(
+              'learner_ppo', step_num=step_number):
+            learner_state, last_metrics = learner.ppo(
+                trajectories,
+                learner_state,
+                step=int(state.get('step', 0)) + update_index,
+                profile=args.profile_learner and measuring)
+            _block_until_ready((learner_state, last_metrics))
+        finally:
+          jax.profiler.stop_trace()
+      else:
+        learner_state, last_metrics = learner.ppo(
+            trajectories,
+            learner_state,
+            step=int(state.get('step', 0)) + update_index,
+            profile=args.profile_learner and measuring)
+        _block_until_ready((learner_state, last_metrics))
       learner_done = time.perf_counter()
+      if phase_times is not None:
+        phase_times['learner_end_perf'] = learner_done
+        phase_times['learner_end_unix_ns'] = time.time_ns()
       update_timings['learner_ppo_s'] += learner_done - learner_start
       update_timings['update_total_s'] += learner_done - update_start
+      if phase_times is not None:
+        phase_times['update_end_perf'] = time.perf_counter()
+        phase_times['update_end_unix_ns'] = time.time_ns()
 
       if measuring:
         timings['learner_ppo_s'] += learner_done - learner_start
         measured_updates += 1
 
-      step_number = int(state.get('step', 0)) + update_index + 1
       if log_path is not None:
         _append_jsonl(log_path, {
             'update': step_number,
@@ -254,6 +310,7 @@ def main():
             'env_steps': total_batch * args.rollout_length * ppo_batches,
             'player_frames': total_packed * args.rollout_length * ppo_batches,
             'timings_sec': dict(update_timings),
+            'phase_times': phase_times,
             'counters': dict(update_counters),
             'metrics': _jsonable_metrics(last_metrics),
         })
