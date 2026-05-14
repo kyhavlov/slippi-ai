@@ -41,6 +41,15 @@ class ControllerHead(nnx.Module, controller_heads.ControllerHead[ControllerType]
   ) -> DistanceOutputs[ControllerType]:
     """A struct of distances (generally, negative log probs)."""
 
+  def logits(
+      self,
+      inputs: Array,
+      prev_controller_state: ControllerType,
+      target_controller_state: ControllerType,
+  ) -> ControllerType:
+    return self.distance(
+        inputs, prev_controller_state, target_controller_state).logits
+
   @classmethod
   @abc.abstractmethod
   def default_config(cls) -> dict[str, tp.Any]:
@@ -114,6 +123,10 @@ class Independent(ControllerHead[ControllerType]):
     distance = self.embed_controller.map(
         lambda e, l, t: e.distance(l, t), logits, target_controller_state)
     return DistanceOutputs(distance=distance, logits=logits)
+
+  def logits(self, inputs, prev_controller_state, target_controller_state):
+    del target_controller_state
+    return self.controller_prediction(inputs, prev_controller_state)
 
 
 class AutoRegressiveComponent(nnx.Module):
@@ -195,6 +208,18 @@ class AutoRegressiveComponent(nnx.Module):
     residual = residual + self._decoder_update(target_raw)
     return residual, DistanceOutputs(distance=distance, logits=logits)
 
+  def logits(
+      self,
+      residual: Array,
+      prev_raw: Array,
+      target_raw: Array,
+  ) -> tp.Tuple[Array, Array]:
+    prev_embedding = self.embedder(prev_raw)
+    input_ = jnp.concatenate([residual, prev_embedding], axis=-1)
+    logits = self._encoder(input_)
+    residual = residual + self._decoder_update(target_raw)
+    return residual, logits
+
 
 class AutoRegressive(ControllerHead[ControllerType]):
   """Samples components sequentially conditioned on past samples."""
@@ -269,6 +294,20 @@ class AutoRegressive(ControllerHead[ControllerType]):
         distance=self.embed_controller.unflatten(iter(distances)),
         logits=self.embed_controller.unflatten(iter(logits)),
     )
+
+  def logits(self, inputs, prev_controller_state, target_controller_state):
+    residual = self.to_residual(inputs)
+    prev_controller_flat = list(self.embed_controller.flatten(prev_controller_state))
+    target_controller_flat = list(self.embed_controller.flatten(target_controller_state))
+
+    logits = []
+    for res_block, prev, target in zip(
+        self.res_blocks, prev_controller_flat, target_controller_flat):
+      logits_fn = jax_utils.remat_method(res_block.logits) if self.remat else res_block.logits
+      residual, component_logits = logits_fn(residual, prev, target)
+      logits.append(component_logits)
+
+    return self.embed_controller.unflatten(iter(logits))
 
 CONSTRUCTORS: dict[str, type[ControllerHead]] = dict(
     independent=Independent,

@@ -27,6 +27,11 @@ class UnrollOutputs(tp.NamedTuple, tp.Generic[S, ControllerType]):
   metrics: dict  # mixed
 
 
+class LogitUnrollOutputs(tp.NamedTuple, tp.Generic[ControllerType]):
+  logits: ControllerType
+  final_state: RecurrentState
+
+
 class UnrollWithOutputs(tp.NamedTuple, tp.Generic[S, ControllerType]):
   imitation_loss: Array  # [T, B]
   distances: DistanceOutputs[ControllerType]  # Struct of [T, B]
@@ -110,6 +115,22 @@ class Policy(nnx.Module, tp.Generic[ControllerType]):
         distances=distance_outputs,
         final_state=final_state,
         metrics=metrics)
+
+  def unroll_logits(
+      self,
+      frames: data.Frames[S, ControllerType],
+      initial_state: RecurrentState,
+  ) -> LogitUnrollOutputs[ControllerType]:
+    inputs = utils.map_nt(lambda t: t[:-1], frames.state_action)
+    outputs, final_state = self.network.unroll(
+        inputs, frames.is_resetting[:-1], initial_state)
+
+    action = frames.state_action.action
+    prev_action = jax.tree.map(lambda t: t[:-1], action)
+    next_action = jax.tree.map(lambda t: t[1:], action)
+    logits = self._controller_head.logits(outputs, prev_action, next_action)
+
+    return LogitUnrollOutputs(logits=logits, final_state=final_state)
 
   def imitation_loss(
       self,

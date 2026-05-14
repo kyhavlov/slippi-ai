@@ -10,8 +10,10 @@ import numpy as np
 
 from scripts import benchmark_jax_sim_rl
 from scripts import benchmark_sim_mp
+from slippi_ai import data
 from slippi_ai import eval_lib
 from slippi_ai import sim_env
+from slippi_ai import utils
 
 
 def main():
@@ -21,10 +23,15 @@ def main():
   parser.add_argument('--rollout-length', type=int, default=32)
   parser.add_argument('--ppo-batches', type=int, default=1)
   parser.add_argument('--minibatch-size', type=int, default=4)
+  parser.add_argument('--minibatch-scan-size', type=int, default=4)
   parser.add_argument(
       '--compare-minibatch-paths',
       action='store_true',
       help='Compare fused minibatch PPO against the non-fused minibatch path.')
+  parser.add_argument(
+      '--check-controller-math',
+      action='store_true',
+      help='Compare fast controller reducers against reference embedding math.')
   parser.add_argument(
       '--learner-param-dtype',
       choices=('float32', 'bfloat16'),
@@ -79,7 +86,7 @@ def main():
       ppo_batches=args.ppo_batches,
       ppo_epochs=1,
       learner_minibatch_size=args.minibatch_size,
-      learner_minibatch_scan_size=4,
+      learner_minibatch_scan_size=args.minibatch_scan_size,
       offload_minibatch_outputs=False,
       learning_rate=None,
       sample_temperature=1.0,
@@ -89,6 +96,11 @@ def main():
   initial_full = full.initial_state(total_packed)
   initial_mini = mini.initial_state(total_packed)
   step = int(state.get('step', 0))
+
+  controller_math_diff = None
+  if args.check_controller_math:
+    controller_math_diff = _check_controller_math(
+        mini, trajectories[0], initial_mini)
 
   full_state, full_metrics = full.ppo(trajectories, initial_full, step=step)
   mini_state, mini_metrics = mini.ppo(trajectories, initial_mini, step=step)
@@ -102,6 +114,8 @@ def main():
       hidden_diff['max_abs_diff'],
       metrics_diff['max_abs_diff'],
   )
+  if controller_math_diff is not None:
+    max_diff = max(max_diff, controller_math_diff['max_abs_diff'])
   passed = max_diff <= args.atol
   result = {
       'passed': passed,
@@ -109,6 +123,7 @@ def main():
       'state_diff': state_diff,
       'hidden_diff': hidden_diff,
       'metrics_diff': metrics_diff,
+      'controller_math_diff': controller_math_diff,
       'atol': args.atol,
       'rtol': args.rtol,
       'batch_size': args.batch_size,
@@ -116,7 +131,9 @@ def main():
       'rollout_length': args.rollout_length,
       'ppo_batches': args.ppo_batches,
       'minibatch_size': args.minibatch_size,
+      'minibatch_scan_size': args.minibatch_scan_size,
       'compare_minibatch_paths': args.compare_minibatch_paths,
+      'check_controller_math': args.check_controller_math,
       'learner_param_dtype': args.learner_param_dtype,
   }
   print(json.dumps(result, indent=2, sort_keys=True))
@@ -247,6 +264,74 @@ def _block_until_ready(value):
       leaf.block_until_ready()
     elif isinstance(leaf, np.ndarray):
       np.asarray(leaf)
+
+
+def _check_controller_math(learner, trajectory, initial_state):
+  delay = learner.policy.delay
+  remove_first = lambda t: t[delay:] if delay > 0 else t
+  remove_last = lambda t: t[:t.shape[0] - delay] if delay > 0 else t
+
+  outputs, _ = learner._unroll_teacher_and_vf(
+      trajectory, initial_state, train_value_function=False)
+  actor_outputs = utils.map_single_structure(
+      lambda t: t[1 + delay:], trajectory.actions)
+  policy_frames = data.Frames(
+      state_action=data.StateAction(
+          state=jax.tree.map(remove_last, trajectory.states),
+          action=jax.tree.map(remove_first, trajectory.actions.controller_state),
+          name=remove_last(trajectory.name),
+      ),
+      is_resetting=remove_last(trajectory.is_resetting),
+      reward=remove_first(trajectory.rewards),
+  )
+  policy_outputs = learner.policy.unroll(policy_frames, trajectory.initial_state)
+  logit_outputs = learner.policy.unroll_logits(
+      policy_frames, trajectory.initial_state)
+
+  new_logits = logit_outputs.logits
+  actor_logits = actor_outputs.logits
+  teacher_logits = jax.tree.map(remove_last, outputs.teacher.logits)
+  target_action = actor_outputs.controller_state
+
+  comparisons = {
+      'policy_logits': _max_tree_diff(policy_outputs.distances.logits, new_logits),
+      'new_log_prob': _max_tree_diff(
+          learner._get_log_prob_reference(new_logits, target_action),
+          learner._get_log_prob(new_logits, target_action),
+      ),
+      'new_log_prob_vs_unroll': _max_tree_diff(
+          policy_outputs.log_probs,
+          learner._get_log_prob(new_logits, target_action),
+      ),
+      'actor_log_prob': _max_tree_diff(
+          learner._get_log_prob_reference(actor_logits, target_action),
+          learner._get_log_prob(actor_logits, target_action),
+      ),
+      'entropy': _max_tree_diff(
+          learner._compute_entropy_reference(new_logits),
+          learner._compute_entropy(new_logits),
+      ),
+      'actor_kl': _max_tree_diff(
+          learner._compute_kl_reference(actor_logits, new_logits),
+          learner._compute_kl(actor_logits, new_logits),
+      ),
+      'teacher_kl': _max_tree_diff(
+          learner._compute_kl_reference(new_logits, teacher_logits),
+          learner._compute_kl(new_logits, teacher_logits),
+      ),
+      'reverse_teacher_kl': _max_tree_diff(
+          learner._compute_kl_reference(teacher_logits, new_logits),
+          learner._compute_kl(teacher_logits, new_logits),
+      ),
+  }
+  _block_until_ready(comparisons)
+  max_abs = max(v['max_abs_diff'] for v in comparisons.values())
+  max_rel = max(v['max_rel_diff'] for v in comparisons.values())
+  return {
+      'max_abs_diff': max_abs,
+      'max_rel_diff': max_rel,
+      'comparisons': comparisons,
+  }
 
 
 def _tree_leaves(tree):
