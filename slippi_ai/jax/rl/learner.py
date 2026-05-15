@@ -33,6 +33,8 @@ class PPOConfig:
   epsilon: float = 1e-2
   beta: float = 0
   max_mean_actor_kl: float = 1e-4
+  post_update_eval_interval: int = 0
+  revert_on_post_update_actor_kl: bool = False
 
 
 @dataclasses.dataclass
@@ -102,13 +104,42 @@ def get_delayed_frames(trajectory: Trajectory) -> data.Frames:
   return data.Frames(state_action, trajectory.is_resetting, trajectory.rewards)
 
 
+def reset_frame_actions(
+    frames: data.Frames,
+    dummy_action,
+) -> data.Frames:
+  """Reset previous-action inputs on reset frames.
+
+  `StateAction.action` is the controller from the previous frame. At runtime
+  BasicAgent replaces that previous action with the dummy controller whenever a
+  lane resets before sampling. Learner unrolls must do the same for network
+  inputs without rewriting `Trajectory.actions`, which also stores old-policy
+  logits/actions used by PPO.
+  """
+  reset = jnp.asarray(frames.is_resetting, dtype=jnp.bool_)
+
+  def select(action_leaf, dummy_leaf):
+    action_leaf = jnp.asarray(action_leaf)
+    lane_reset = reset
+    while lane_reset.ndim < action_leaf.ndim:
+      lane_reset = lane_reset[..., None]
+    return jnp.where(lane_reset, jnp.asarray(dummy_leaf), action_leaf)
+
+  action = jax.tree.map(select, frames.state_action.action, dummy_action)
+  state_action = data.StateAction(
+      state=frames.state_action.state,
+      action=action,
+      name=frames.state_action.name,
+  )
+  return data.Frames(state_action, frames.is_resetting, frames.reward)
+
+
 def update_rewards(
     trajectory: Trajectory,
     reward_config: reward_lib.RewardConfig,
 ) -> Trajectory:
   rewards = reward_lib.compute_rewards(
       trajectory.states, **dataclasses.asdict(reward_config))
-  rewards = np.where(trajectory.is_resetting[1:], 0.0, rewards)
   return trajectory._replace(rewards=rewards)
 
 
@@ -290,6 +321,53 @@ def summarize_policy_array(value: Array) -> dict:
   )
 
 
+def _broadcast_policy_mask(mask: Array, value: Array) -> Array:
+  mask = jnp.asarray(mask, dtype=jnp.bool_)
+  while mask.ndim < value.ndim:
+    mask = mask[..., None]
+  return mask
+
+
+def masked_policy_mean(value: Array, mask: Array) -> Array:
+  value = jnp.asarray(value)
+  mask = _broadcast_policy_mask(mask, value)
+  count = jnp.maximum(jnp.sum(mask), 1)
+  return jnp.sum(jnp.where(mask, value, 0.0)) / count
+
+
+def mask_policy_array(value: Array, mask: Array) -> Array:
+  value = jnp.asarray(value)
+  return jnp.where(_broadcast_policy_mask(mask, value), value, 0.0)
+
+
+def summarize_policy_array_masked(value: Array, mask: Array) -> dict:
+  value = jnp.asarray(value)
+  mask = _broadcast_policy_mask(mask, value)
+  any_valid = jnp.any(mask)
+  masked = jnp.where(mask, value, 0.0)
+  return dict(
+      mean=masked_policy_mean(value, mask),
+      min=jnp.where(any_valid, jnp.min(jnp.where(mask, value, jnp.inf)), 0.0),
+      max=jnp.where(any_valid, jnp.max(jnp.where(mask, value, -jnp.inf)), 0.0),
+  )
+
+
+def valid_policy_step_mask(is_resetting: Array, delay: int) -> Array:
+  # A policy sample from state[t] is executed after the observation delay. If a
+  # reset occurs in [t + 1, t + D], that delayed controller is discarded before
+  # it reaches the game. A reset at t + D + 1 is the terminal state after the
+  # action was applied, so that sample is still valid.
+  is_resetting = jnp.asarray(is_resetting, dtype=jnp.bool_)
+  out_len = is_resetting.shape[0] - delay - 1
+  invalid = jnp.zeros_like(is_resetting[1 + delay:])
+  for offset in range(delay):
+    invalid = jnp.logical_or(
+        invalid,
+        is_resetting[1 + offset:1 + offset + out_len],
+    )
+  return jnp.logical_not(invalid)
+
+
 def summarize_policy_metric_summaries(metrics_list: list[dict]) -> dict:
   if not metrics_list:
     return {}
@@ -396,10 +474,16 @@ class Learner(nnx.Module):
     self.jit_unroll_ppo_batch_stacked_minibatch_value_grads = (
         jax_utils.cached_partial(jit_ppo_batch_unroll, self))
 
-    jit_equal_minibatch_update = nnx.jit(
-        Learner.ppo_equal_minibatch_update)
-    self.jit_ppo_equal_minibatch_update = jax_utils.cached_partial(
-        jit_equal_minibatch_update, self)
+    jit_equal_minibatch_update_train_and_eval = nnx.jit(
+        Learner.ppo_equal_minibatch_update_train_and_eval)
+    self.jit_ppo_equal_minibatch_update_train_and_eval = (
+        jax_utils.cached_partial(
+            jit_equal_minibatch_update_train_and_eval, self))
+
+    jit_equal_minibatch_update_train = nnx.jit(
+        Learner.ppo_equal_minibatch_update_train)
+    self.jit_ppo_equal_minibatch_update_train = jax_utils.cached_partial(
+        jit_equal_minibatch_update_train, self)
 
     jit_ppo_epoch = nnx.jit(
         Learner.ppo_epoch,
@@ -426,6 +510,11 @@ class Learner(nnx.Module):
         Learner.ppo_chunked_minibatch_train_and_eval)
     self.jit_ppo_chunked_minibatch_train_and_eval = jax_utils.cached_partial(
         jit_ppo_chunked_minibatch_train_and_eval, self)
+
+    jit_ppo_chunked_minibatch_train = nnx.jit(
+        Learner.ppo_chunked_minibatch_train)
+    self.jit_ppo_chunked_minibatch_train = jax_utils.cached_partial(
+        jit_ppo_chunked_minibatch_train, self)
 
   def initial_state(
       self, batch_size: int, rngs: tp.Optional[nnx.Rngs] = None,
@@ -546,6 +635,138 @@ class Learner(nnx.Module):
     return self._controller_reduce(
         self._controller_embedding, self._leaf_log_prob, logits, action)
 
+  def _sum_controller_terms(self, values: list[tuple[Array, ...]]):
+    return tuple(
+        functools.reduce(jnp.add, terms)
+        for terms in zip(*values))
+
+  def _controller_policy_terms_reduce(
+      self,
+      embedding: embed.Embedding,
+      new_logits,
+      actor_logits,
+      teacher_logits,
+      action,
+  ) -> tuple[Array, Array, Array, Array, Array, Array]:
+    if isinstance(embedding, embed.CompoundEmbedding):
+      return self._controller_policy_terms_reduce(
+          embedding._embed_mid, new_logits, actor_logits, teacher_logits, action)
+    if isinstance(embedding, embed.StructEmbedding):
+      values = [
+          self._controller_policy_terms_reduce(
+              child,
+              embedding.getter(new_logits, key),
+              embedding.getter(actor_logits, key),
+              embedding.getter(teacher_logits, key),
+              embedding.getter(action, key),
+          )
+          for key, child in embedding.embedding
+      ]
+      return self._sum_controller_terms(values)
+    return self._leaf_policy_terms(
+        embedding, new_logits, actor_logits, teacher_logits, action)
+
+  def _leaf_policy_terms(
+      self,
+      embedding: embed.Embedding,
+      new_logits,
+      actor_logits,
+      teacher_logits,
+      action,
+  ) -> tuple[Array, Array, Array, Array, Array, Array]:
+    if isinstance(embedding, embed.BoolEmbedding):
+      new_logits = jnp.squeeze(new_logits, axis=-1)
+      actor_logits = jnp.squeeze(actor_logits, axis=-1)
+      teacher_logits = jnp.squeeze(teacher_logits, axis=-1)
+
+      new_log_p1 = -jax.nn.softplus(-new_logits)
+      new_log_p0 = -jax.nn.softplus(new_logits)
+      actor_log_p1 = -jax.nn.softplus(-actor_logits)
+      actor_log_p0 = -jax.nn.softplus(actor_logits)
+      teacher_log_p1 = -jax.nn.softplus(-teacher_logits)
+      teacher_log_p0 = -jax.nn.softplus(teacher_logits)
+
+      new_p1 = jax.nn.sigmoid(new_logits)
+      new_p0 = 1.0 - new_p1
+      actor_p1 = jax.nn.sigmoid(actor_logits)
+      actor_p0 = 1.0 - actor_p1
+      teacher_p1 = jax.nn.sigmoid(teacher_logits)
+      teacher_p0 = 1.0 - teacher_p1
+
+      new_log_prob = jnp.where(action, new_log_p1, new_log_p0)
+      actor_log_prob = jnp.where(action, actor_log_p1, actor_log_p0)
+      teacher_kl = (
+          new_p1 * (new_log_p1 - teacher_log_p1)
+          + new_p0 * (new_log_p0 - teacher_log_p0))
+      actor_kl = (
+          actor_p1 * (actor_log_p1 - new_log_p1)
+          + actor_p0 * (actor_log_p0 - new_log_p0))
+      reverse_teacher_kl = (
+          teacher_p1 * (teacher_log_p1 - new_log_p1)
+          + teacher_p0 * (teacher_log_p0 - new_log_p0))
+      entropy = -(new_p1 * new_log_p1 + new_p0 * new_log_p0)
+      return (
+          actor_log_prob,
+          new_log_prob,
+          teacher_kl,
+          actor_kl,
+          reverse_teacher_kl,
+          entropy,
+      )
+
+    if isinstance(embedding, embed.OneHotEmbedding):
+      new_log_probs = jax.nn.log_softmax(new_logits, axis=-1)
+      actor_log_probs = jax.nn.log_softmax(actor_logits, axis=-1)
+      teacher_log_probs = jax.nn.log_softmax(teacher_logits, axis=-1)
+      new_probs = jnp.exp(new_log_probs)
+      actor_probs = jnp.exp(actor_log_probs)
+      teacher_probs = jnp.exp(teacher_log_probs)
+      action_indices = jnp.expand_dims(action.astype(jnp.int32), axis=-1)
+
+      new_log_prob = jnp.take_along_axis(
+          new_log_probs, action_indices, axis=-1).squeeze(axis=-1)
+      actor_log_prob = jnp.take_along_axis(
+          actor_log_probs, action_indices, axis=-1).squeeze(axis=-1)
+      teacher_kl = jnp.sum(
+          new_probs * (new_log_probs - teacher_log_probs), axis=-1)
+      actor_kl = jnp.sum(
+          actor_probs * (actor_log_probs - new_log_probs), axis=-1)
+      reverse_teacher_kl = jnp.sum(
+          teacher_probs * (teacher_log_probs - new_log_probs), axis=-1)
+      entropy = -jnp.sum(new_probs * new_log_probs, axis=-1)
+      return (
+          actor_log_prob,
+          new_log_prob,
+          teacher_kl,
+          actor_kl,
+          reverse_teacher_kl,
+          entropy,
+      )
+
+    return (
+        self._leaf_log_prob(embedding, actor_logits, action),
+        self._leaf_log_prob(embedding, new_logits, action),
+        self._leaf_kl(embedding, new_logits, teacher_logits),
+        self._leaf_kl(embedding, actor_logits, new_logits),
+        self._leaf_kl(embedding, teacher_logits, new_logits),
+        self._leaf_entropy(embedding, new_logits),
+    )
+
+  def _controller_policy_terms(
+      self,
+      new_logits,
+      actor_logits,
+      teacher_logits,
+      action,
+  ) -> tuple[Array, Array, Array, Array, Array, Array]:
+    return self._controller_policy_terms_reduce(
+        self._controller_embedding,
+        new_logits,
+        actor_logits,
+        teacher_logits,
+        action,
+    )
+
   def _policy_loss_and_metrics(
       self,
       policy: Policy,
@@ -569,18 +790,18 @@ class Learner(nnx.Module):
         is_resetting=remove_last(trajectory.is_resetting),
         reward=remove_first(trajectory.rewards),
     )
+    policy_frames = reset_frame_actions(
+        policy_frames,
+        policy.controller_head.dummy_controller(policy_frames.is_resetting.shape),
+    )
 
     # Actor (old policy) logits and log probs for steps [D+1, U+1].
     actor_outputs = utils.map_single_structure(
         lambda t: t[1 + delay:], trajectory.actions)
     actor_logits = actor_outputs.logits
-    actor_log_probs = jax.lax.stop_gradient(
-        self._get_log_prob(actor_logits, actor_outputs.controller_state))
 
     policy_outputs = policy.unroll_logits(policy_frames, trajectory.initial_state)
     new_logits = policy_outputs.logits
-    new_log_probs = self._get_log_prob(
-        new_logits, actor_outputs.controller_state)
 
     # Teacher logits: [D, U+D] -> truncate last D -> [D, U].
     # Note: no stop_gradient needed since teacher has no trainable variables.
@@ -588,12 +809,17 @@ class Learner(nnx.Module):
     # KL divergences are computed over full output distribution, not just
     # sampled action. Forward KL to teacher incentivizes refining human
     # actions over covering all of them.
-    teacher_kl = self._compute_kl(new_logits, teacher_logits)
-    # KL of old actor from new policy: used for monitoring / reverting bad
-    # updates.
-    actor_kl = self._compute_kl(actor_logits, new_logits)
-    reverse_teacher_kl = self._compute_kl(teacher_logits, new_logits)
-    entropy = self._compute_entropy(new_logits)
+    (
+        actor_log_probs,
+        new_log_probs,
+        teacher_kl,
+        actor_kl,
+        reverse_teacher_kl,
+        entropy,
+    ) = self._controller_policy_terms(
+        new_logits, actor_logits, teacher_logits, actor_outputs.controller_state)
+    actor_log_probs = jax.lax.stop_gradient(actor_log_probs)
+    valid_steps = valid_policy_step_mask(trajectory.is_resetting, delay)
 
     # PPO clipped objective.
     log_rhos = new_log_probs - actor_log_probs
@@ -605,21 +831,22 @@ class Learner(nnx.Module):
 
     ppo_objective = jnp.minimum(rhos * advantages, clipped_rhos * advantages)
 
-    loss = jnp.mean(
+    weighted_loss = (
         - self._config.policy_gradient_weight * ppo_objective
         + self._config.ppo.beta * actor_kl
         + self._config.kl_teacher_weight * teacher_kl
         + self._config.reverse_kl_teacher_weight * reverse_teacher_kl
         - self._config.entropy_weight * entropy
     )
+    loss = masked_policy_mean(weighted_loss, valid_steps)
 
     metrics = dict(
         total_loss=loss,
-        ppo_objective=ppo_objective,
-        teacher_kl=teacher_kl,
-        entropy=entropy,
-        actor_kl=actor_kl,
-        reverse_teacher_kl=reverse_teacher_kl,
+        ppo_objective=mask_policy_array(ppo_objective, valid_steps),
+        teacher_kl=mask_policy_array(teacher_kl, valid_steps),
+        entropy=mask_policy_array(entropy, valid_steps),
+        actor_kl=mask_policy_array(actor_kl, valid_steps),
+        reverse_teacher_kl=mask_policy_array(reverse_teacher_kl, valid_steps),
     )
     return loss, metrics
 
@@ -644,23 +871,30 @@ class Learner(nnx.Module):
         is_resetting=remove_last(trajectory.is_resetting),
         reward=remove_first(trajectory.rewards),
     )
+    policy_frames = reset_frame_actions(
+        policy_frames,
+        policy.controller_head.dummy_controller(policy_frames.is_resetting.shape),
+    )
 
     actor_outputs = utils.map_single_structure(
         lambda t: t[1 + delay:], trajectory.actions)
     actor_logits = actor_outputs.logits
-    actor_log_probs = jax.lax.stop_gradient(
-        self._get_log_prob(actor_logits, actor_outputs.controller_state))
 
     policy_outputs = policy.unroll_logits(policy_frames, trajectory.initial_state)
     new_logits = policy_outputs.logits
-    new_log_probs = self._get_log_prob(
-        new_logits, actor_outputs.controller_state)
 
     teacher_logits = jax.tree.map(remove_last, outputs.teacher.logits)
-    teacher_kl = self._compute_kl(new_logits, teacher_logits)
-    actor_kl = self._compute_kl(actor_logits, new_logits)
-    reverse_teacher_kl = self._compute_kl(teacher_logits, new_logits)
-    entropy = self._compute_entropy(new_logits)
+    (
+        actor_log_probs,
+        new_log_probs,
+        teacher_kl,
+        actor_kl,
+        reverse_teacher_kl,
+        entropy,
+    ) = self._controller_policy_terms(
+        new_logits, actor_logits, teacher_logits, actor_outputs.controller_state)
+    actor_log_probs = jax.lax.stop_gradient(actor_log_probs)
+    valid_steps = valid_policy_step_mask(trajectory.is_resetting, delay)
 
     log_rhos = new_log_probs - actor_log_probs
     rhos = jnp.exp(log_rhos)
@@ -678,15 +912,17 @@ class Learner(nnx.Module):
         + self._config.reverse_kl_teacher_weight * reverse_teacher_kl
         - self._config.entropy_weight * entropy
     )
-    loss = jnp.mean(weighted_loss)
+    loss = masked_policy_mean(weighted_loss, valid_steps)
 
     metrics = dict(
-        total_loss=summarize_policy_array(loss),
-        ppo_objective=summarize_policy_array(ppo_objective),
-        teacher_kl=summarize_policy_array(teacher_kl),
-        entropy=summarize_policy_array(entropy),
-        actor_kl=summarize_policy_array(actor_kl),
-        reverse_teacher_kl=summarize_policy_array(reverse_teacher_kl),
+        total_loss=summarize_policy_array_masked(weighted_loss, valid_steps),
+        ppo_objective=summarize_policy_array_masked(
+            ppo_objective, valid_steps),
+        teacher_kl=summarize_policy_array_masked(teacher_kl, valid_steps),
+        entropy=summarize_policy_array_masked(entropy, valid_steps),
+        actor_kl=summarize_policy_array_masked(actor_kl, valid_steps),
+        reverse_teacher_kl=summarize_policy_array_masked(
+            reverse_teacher_kl, valid_steps),
     )
     return loss, metrics
 
@@ -698,11 +934,21 @@ class Learner(nnx.Module):
       train_value_function: bool = False,
   ):
     teacher_frames = get_delayed_frames(trajectory)
+    teacher_frames = reset_frame_actions(
+        teacher_frames,
+        self.teacher.controller_head.dummy_controller(
+            teacher_frames.is_resetting.shape),
+    )
     teacher_outputs = self.teacher.unroll_logits(
         teacher_frames, initial_state.teacher)
 
     # Run value function (with or without gradient update).
     value_frames = get_frames(trajectory)
+    value_frames = reset_frame_actions(
+        value_frames,
+        self.policy.controller_head.dummy_controller(
+            value_frames.is_resetting.shape),
+    )
 
     if train_value_function:
       def value_loss_fn(vf: vf_lib.ValueFunction):
@@ -734,10 +980,20 @@ class Learner(nnx.Module):
   ):
     """Unroll teacher and compute value-function grads without applying them."""
     teacher_frames = get_delayed_frames(trajectory)
+    teacher_frames = reset_frame_actions(
+        teacher_frames,
+        self.teacher.controller_head.dummy_controller(
+            teacher_frames.is_resetting.shape),
+    )
     teacher_outputs = self.teacher.unroll_logits(
         teacher_frames, initial_state.teacher)
 
     value_frames = get_frames(trajectory)
+    value_frames = reset_frame_actions(
+        value_frames,
+        self.policy.controller_head.dummy_controller(
+            value_frames.is_resetting.shape),
+    )
 
     def value_loss_fn(vf: vf_lib.ValueFunction):
       outputs, final_state = vf.loss(
@@ -1194,7 +1450,51 @@ class Learner(nnx.Module):
     )
     return train_metrics, final_metrics
 
-  def ppo_equal_minibatch_update(
+  def ppo_chunked_minibatch_train(
+      self,
+      learner_outputs: LearnerOutputs,
+      trajectories: Trajectory,
+  ) -> dict:
+    """Apply one PPO update over stacked chunks without post-update eval."""
+    first_outputs = jax.tree.map(lambda t: t[0, 0], learner_outputs)
+    first_trajectory = jax.tree.map(lambda t: t[0, 0], trajectories)
+    grad_shapes, _ = nnx.eval_shape(
+        Learner.ppo_grads_summary, self, first_outputs, first_trajectory)
+    zero_grads = jax.tree.map(jnp.zeros_like, grad_shapes)
+
+    @nnx.scan(
+        in_axes=(None, 0, 0, nnx.Carry),
+        out_axes=(0, nnx.Carry),
+    )
+    def grad_scan(
+        learner: Learner,
+        learner_outputs: LearnerOutputs,
+        trajectory: Trajectory,
+        grads_acc: jax_utils.Grads,
+    ) -> tuple[dict, jax_utils.Grads]:
+      chunk_grads, chunk_metrics = learner.ppo_stacked_minibatch_grads(
+          learner_outputs, trajectory)
+      new_grads_acc = jax.tree.map(jnp.add, grads_acc, chunk_grads)
+      return chunk_metrics, new_grads_acc
+
+    train_metrics, grads_sum = grad_scan(
+        self, learner_outputs, trajectories, zero_grads)
+    total_minibatches = (
+        trajectories.rewards.shape[0] * trajectories.rewards.shape[1])
+    grads = jax.tree.map(lambda g: g / total_minibatches, grads_sum)
+    self.policy_optimizer.update(self.policy, grads)
+
+    grads_dict = nnx.to_pure_dict(grads)
+    grad_norms = jax.tree.map(jnp.linalg.norm, grads_dict)
+    max_grad_norm = jax.tree.reduce(jnp.maximum, grad_norms)
+    train_metrics = summarize_stacked_policy_metric_summaries(train_metrics)
+    train_metrics['grads'] = dict(
+        norms=grad_norms,
+        max_norm=max_grad_norm,
+    )
+    return train_metrics
+
+  def ppo_equal_minibatch_update_train_and_eval(
       self,
       trajectories: Trajectory,
       initial_state: LearnerState,
@@ -1214,6 +1514,27 @@ class Learner(nnx.Module):
     train_metrics, final_metrics = self.ppo_chunked_minibatch_train_and_eval(
         chunked_outputs, chunked_trajectories)
     return hidden_state, value_metrics, train_metrics, final_metrics
+
+  def ppo_equal_minibatch_update_train(
+      self,
+      trajectories: Trajectory,
+      initial_state: LearnerState,
+  ) -> tuple[LearnerState, dict, dict]:
+    """Run teacher/value and PPO train pass for stacked equal minibatches."""
+    learner_outputs, hidden_state = (
+        self.unroll_ppo_batch_stacked_minibatch_value_grads(
+            trajectories, initial_state))
+    value_metrics = utils.map_nt(
+        lambda x: jnp.mean(x), learner_outputs.value.metrics)
+
+    scan_size = self._config.ppo.minibatch_scan_size
+    flat_outputs = flatten_batch_minibatch_axes(learner_outputs)
+    flat_trajectories = flatten_batch_minibatch_axes(trajectories)
+    chunked_outputs = group_record_axis(flat_outputs, scan_size)
+    chunked_trajectories = group_record_axis(flat_trajectories, scan_size)
+    train_metrics = self.ppo_chunked_minibatch_train(
+        chunked_outputs, chunked_trajectories)
+    return hidden_state, value_metrics, train_metrics
 
   def build_equal_minibatch_chunks(
       self,
@@ -1468,8 +1789,10 @@ class Learner(nnx.Module):
       self,
       trajectories: list[Trajectory],
       initial_state: LearnerState,
+      *,
+      evaluate_post_update: bool,
       profile: dict | None = None,
-  ) -> tuple[LearnerState, dict, dict, dict, int] | None:
+  ) -> tuple[LearnerState, dict, dict, dict, int, bool] | None:
     """Fast path for a full equal-minibatch PPO update."""
     if len(trajectories) < 2:
       return None
@@ -1501,12 +1824,21 @@ class Learner(nnx.Module):
       profile['equal_minibatch_stack_s'] += time.perf_counter() - stack_start
 
     update_start = time.perf_counter()
-    hidden_state, value_metrics, epoch_metrics, final_metrics = (
-        self.jit_ppo_equal_minibatch_update(
-            stacked_trajectories, initial_state))
+    if evaluate_post_update:
+      hidden_state, value_metrics, epoch_metrics, final_metrics = (
+          self.jit_ppo_equal_minibatch_update_train_and_eval(
+              stacked_trajectories, initial_state))
+      ready = (hidden_state, value_metrics, epoch_metrics, final_metrics)
+      post_update_evaluated = True
+    else:
+      hidden_state, value_metrics, epoch_metrics = (
+          self.jit_ppo_equal_minibatch_update_train(
+              stacked_trajectories, initial_state))
+      final_metrics = epoch_metrics
+      ready = (hidden_state, value_metrics, epoch_metrics)
+      post_update_evaluated = False
     if profile is not None:
-      block_until_ready(
-          (hidden_state, value_metrics, epoch_metrics, final_metrics))
+      block_until_ready(ready)
       elapsed = time.perf_counter() - update_start
       profile['equal_minibatch_update_s'] += elapsed
       profile['teacher_value_batches'] += len(trajectories)
@@ -1515,17 +1847,23 @@ class Learner(nnx.Module):
           trajectory_batch_size(t) * t.rewards.shape[0] for t in trajectories)
       profile['ppo_train_epochs'] += 1
       profile['ppo_grad_minibatches'] += record_count
-      profile['ppo_eval_minibatches'] += record_count
       profile['ppo_grad_chunks'] += record_count // scan_size
-      profile['ppo_eval_chunks'] += record_count // scan_size
       frame_count = (
           record_count
           * minibatch_size
           * (trajectories[0].rewards.shape[0] - self.policy.delay))
       profile['ppo_grad_frames'] += frame_count
-      profile['ppo_eval_frames'] += frame_count
+      if post_update_evaluated:
+        profile['ppo_eval_minibatches'] += record_count
+        profile['ppo_eval_chunks'] += record_count // scan_size
+        profile['ppo_eval_frames'] += frame_count
     return (
-        hidden_state, value_metrics, epoch_metrics, final_metrics, record_count)
+        hidden_state,
+        value_metrics,
+        epoch_metrics,
+        final_metrics,
+        record_count,
+        post_update_evaluated)
 
   def ppo(
       self,
@@ -1533,6 +1871,7 @@ class Learner(nnx.Module):
       initial_state: LearnerState,
       step: int,
       jit: bool = True,
+      recompute_rewards: bool = True,
       profile: bool = False,
   ) -> tp.Tuple[LearnerState, dict]:
     """Multi-epoch PPO update.
@@ -1548,22 +1887,15 @@ class Learner(nnx.Module):
     assert len(trajectories) == self._config.ppo.num_batches
     profile_timings = defaultdict(float) if profile else None
 
-    # Compute rewards from game states.
-    reward_start = time.perf_counter()
-    trajectories = [
-        update_rewards(t, self._config.reward) for t in trajectories
-    ]
-    if profile_timings is not None:
-      profile_timings['reward_update_s'] += time.perf_counter() - reward_start
+    if recompute_rewards:
+      reward_start = time.perf_counter()
+      trajectories = [
+          update_rewards(t, self._config.reward) for t in trajectories
+      ]
+      if profile_timings is not None:
+        profile_timings['reward_update_s'] += time.perf_counter() - reward_start
 
     use_minibatches = self._config.ppo.minibatch_size > 0
-    # Checkpoint policy update state for potential actor-KL reversion.
-    checkpoint = dict(
-        policy=jax_utils.get_module_state(self.policy, to_numpy=False),
-        policy_optimizer=jax_utils.get_module_state(
-            self.policy_optimizer, to_numpy=False),
-    )
-
     if step < self._config.value_burnin_epochs:
       num_epochs = 0
     elif step < self._config.value_burnin_epochs + self._config.optimizer_burnin_epochs:
@@ -1576,8 +1908,24 @@ class Learner(nnx.Module):
     else:
       ppo_epoch = self.jit_ppo_epoch if jit else self.ppo_epoch
 
+    should_eval_post_update = (
+        self._config.ppo.post_update_eval_interval > 0
+        and step % self._config.ppo.post_update_eval_interval == 0)
+    should_checkpoint_for_revert = (
+        should_eval_post_update
+        and self._config.ppo.revert_on_post_update_actor_kl)
+    if should_checkpoint_for_revert:
+      checkpoint = dict(
+          policy=jax_utils.get_module_state(self.policy, to_numpy=False),
+          policy_optimizer=jax_utils.get_module_state(
+              self.policy_optimizer, to_numpy=False),
+      )
+    else:
+      checkpoint = None
+
     per_epoch_metrics = []
     ppo_already_ran = False
+    post_update_evaluated = False
 
     # Unroll teacher + value function, training value function.
     hidden_state = initial_state
@@ -1586,7 +1934,10 @@ class Learner(nnx.Module):
       fast_update = None
       if num_epochs == 1:
         fast_update = self.ppo_update_equal_minibatches(
-            trajectories, hidden_state, profile=profile_timings)
+            trajectories,
+            hidden_state,
+            evaluate_post_update=should_eval_post_update,
+            profile=profile_timings)
       if fast_update is not None:
         (
             hidden_state,
@@ -1594,6 +1945,7 @@ class Learner(nnx.Module):
             epoch_metrics,
             final_metrics,
             _,
+            post_update_evaluated,
         ) = fast_update
         per_epoch_metrics = [epoch_metrics]
         ppo_already_ran = True
@@ -1654,26 +2006,38 @@ class Learner(nnx.Module):
     elif chunked_minibatches is not None:
       fuse_start = time.perf_counter()
       stacked_outputs, stacked_trajectories, minibatch_count = chunked_minibatches
-      epoch_metrics, final_metrics = (
-          self.jit_ppo_chunked_minibatch_train_and_eval(
-              stacked_outputs, stacked_trajectories))
+      if should_eval_post_update:
+        epoch_metrics, final_metrics = (
+            self.jit_ppo_chunked_minibatch_train_and_eval(
+                stacked_outputs, stacked_trajectories))
+        post_update_evaluated = True
+        ready = (epoch_metrics, final_metrics)
+      else:
+        epoch_metrics = self.jit_ppo_chunked_minibatch_train(
+            stacked_outputs, stacked_trajectories)
+        final_metrics = epoch_metrics
+        ready = epoch_metrics
       if profile_timings is not None:
-        block_until_ready((epoch_metrics, final_metrics))
+        block_until_ready(ready)
         elapsed = time.perf_counter() - fuse_start
-        profile_timings['ppo_chunked_train_eval_s'] += elapsed
+        if post_update_evaluated:
+          profile_timings['ppo_chunked_train_eval_s'] += elapsed
+        else:
+          profile_timings['ppo_chunked_train_s'] += elapsed
         profile_timings['ppo_train_epoch_s'] += elapsed
         profile_timings['final_eval_total_s'] += 0.0
         profile_timings['ppo_train_epochs'] += 1
         profile_timings['ppo_grad_minibatches'] += minibatch_count
-        profile_timings['ppo_eval_minibatches'] += minibatch_count
         profile_timings['ppo_grad_chunks'] += stacked_trajectories.rewards.shape[0]
-        profile_timings['ppo_eval_chunks'] += stacked_trajectories.rewards.shape[0]
         frame_count = (
             minibatch_count
             * self._config.ppo.minibatch_size
             * (trajectories[0].rewards.shape[0] - self.policy.delay))
         profile_timings['ppo_grad_frames'] += frame_count
-        profile_timings['ppo_eval_frames'] += frame_count
+        if post_update_evaluated:
+          profile_timings['ppo_eval_minibatches'] += minibatch_count
+          profile_timings['ppo_eval_chunks'] += stacked_trajectories.rewards.shape[0]
+          profile_timings['ppo_eval_frames'] += frame_count
       per_epoch_metrics.append(epoch_metrics)
     else:
       for _ in range(num_epochs):
@@ -1689,21 +2053,29 @@ class Learner(nnx.Module):
           profile_timings['ppo_train_epochs'] += 1
         per_epoch_metrics.append(epoch_metrics)
 
-      # Final eval epoch (no gradient update) to measure post-update KL.
-      eval_start = time.perf_counter()
-      if use_minibatches:
-        final_metrics = ppo_epoch(
-            learner_outputs, trajectories, train=False, profile=profile_timings)
+      if should_eval_post_update or not per_epoch_metrics:
+        # Final eval epoch (no gradient update) to measure exact post-update KL.
+        eval_start = time.perf_counter()
+        if use_minibatches:
+          final_metrics = ppo_epoch(
+              learner_outputs, trajectories, train=False,
+              profile=profile_timings)
+        else:
+          final_metrics = ppo_epoch(learner_outputs, trajectories, train=False)
+        if profile_timings is not None:
+          block_until_ready(final_metrics)
+          profile_timings['final_eval_total_s'] += time.perf_counter() - eval_start
+        post_update_evaluated = True
       else:
-        final_metrics = ppo_epoch(learner_outputs, trajectories, train=False)
-      if profile_timings is not None:
-        block_until_ready(final_metrics)
-        profile_timings['final_eval_total_s'] += time.perf_counter() - eval_start
-    per_epoch_metrics.append(final_metrics)
+        final_metrics = per_epoch_metrics[-1]
 
-    # Revert if the policy moved too far from the actor.
+    # Optional legacy rollback when exact post-update actor KL is evaluated.
     reverted = False
-    if final_metrics['actor_kl']['mean'] > self._config.ppo.max_mean_actor_kl:
+    if (
+        post_update_evaluated
+        and self._config.ppo.revert_on_post_update_actor_kl
+        and final_metrics['actor_kl']['mean'] > self._config.ppo.max_mean_actor_kl):
+      assert checkpoint is not None
       jax_utils.set_module_state(self.policy, checkpoint['policy'])
       jax_utils.set_module_state(
           self.policy_optimizer, checkpoint['policy_optimizer'])
@@ -1714,6 +2086,7 @@ class Learner(nnx.Module):
         post_update=final_metrics,
         value=value_metrics,
         reverted=reverted,
+        post_update_evaluated=post_update_evaluated,
     )
     if profile_timings is not None:
       metrics['profile_sec'] = dict(profile_timings)

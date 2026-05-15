@@ -22,11 +22,14 @@ def main():
   parser.add_argument('--batch-size', type=int, default=8)
   parser.add_argument('--rollout-length', type=int, default=32)
   parser.add_argument('--ppo-batches', type=int, default=1)
+  parser.add_argument('--matchup', choices=sim_env.SUPPORTED_MATCHUPS,
+                      default='fox-falco')
   parser.add_argument('--minibatch-size', type=int, default=4)
   parser.add_argument('--minibatch-scan-size', type=int, default=4)
   parser.add_argument(
       '--compare-minibatch-paths',
-      action='store_true',
+      action=argparse.BooleanOptionalAction,
+      default=True,
       help='Compare fused minibatch PPO against the non-fused minibatch path.')
   parser.add_argument(
       '--check-controller-math',
@@ -59,6 +62,7 @@ def main():
       batch_size=args.batch_size,
       rollout_length=args.rollout_length,
       ppo_batches=args.ppo_batches,
+      matchup=args.matchup,
       length=args.length,
       barrier_timeout=args.barrier_timeout,
   )
@@ -130,6 +134,7 @@ def main():
       'total_player_batch_size': total_packed,
       'rollout_length': args.rollout_length,
       'ppo_batches': args.ppo_batches,
+      'matchup': args.matchup,
       'minibatch_size': args.minibatch_size,
       'minibatch_scan_size': args.minibatch_scan_size,
       'compare_minibatch_paths': args.compare_minibatch_paths,
@@ -147,6 +152,7 @@ def _collect_trajectories(
     batch_size: int,
     rollout_length: int,
     ppo_batches: int,
+    matchup: str,
     length: int,
     barrier_timeout: float,
 ):
@@ -154,6 +160,9 @@ def _collect_trajectories(
   total_packed = batch_size * 2
   obs_owner = benchmark_sim_mp.SharedArrayOwner()
   packed = sim_env.make_packed_game_builder(batch_size, array_factory=obs_owner.array)
+  terminal_obs_owner = benchmark_sim_mp.SharedArrayOwner()
+  terminal_packed = sim_env.make_packed_game_builder(
+      batch_size, array_factory=terminal_obs_owner.array)
   action_owner = benchmark_sim_mp.SharedArrayOwner()
   action = benchmark_sim_mp._shared_encoded_controller(
       total_packed, action_owner.array)
@@ -177,7 +186,9 @@ def _collect_trajectories(
             28800,
             0,
             0,
+            matchup,
             obs_owner.specs,
+            terminal_obs_owner.specs,
             action_owner.specs,
             spacing,
             obs_barrier,
@@ -190,7 +201,7 @@ def _collect_trajectories(
     )
     process.start()
 
-    learner, actor, name_code = benchmark_jax_sim_rl._build_learner_and_actor(
+    collect_learner, actor, name_code = benchmark_jax_sim_rl._build_learner_and_actor(
         state=state,
         batch_size=total_packed,
         ppo_batches=1,
@@ -202,7 +213,6 @@ def _collect_trajectories(
         sample_temperature=1.0,
         learner_param_dtype='float32',
     )
-    del learner
     dummy_outputs = actor._policy.controller_head.dummy_sample_outputs([total_packed])
     env_action_queue = deque(
         [benchmark_jax_sim_rl._to_numpy_tree(dummy_outputs.controller_state)
@@ -218,9 +228,11 @@ def _collect_trajectories(
       trajectory, _ = benchmark_jax_sim_rl._collect_trajectory(
           actor=actor,
           packed=packed,
+          terminal_packed=terminal_packed,
           action=action,
           env_action_queue=env_action_queue,
           learner_action_queue=learner_action_queue,
+          dummy_outputs=dummy_outputs,
           action_barrier=action_barrier,
           obs_barrier=obs_barrier,
           step_counters=step_counters,
@@ -229,6 +241,7 @@ def _collect_trajectories(
           rollout_length=rollout_length,
           controller_spacing=spacing,
           name_code=name_code,
+          reward_config=collect_learner._config.reward,
           barrier_timeout=barrier_timeout,
       )
       trajectories.append(trajectory)
@@ -253,8 +266,10 @@ def _collect_trajectories(
     if process is not None:
       process.join(timeout=1.0)
     obs_owner.close()
+    terminal_obs_owner.close()
     action_owner.close()
     obs_owner.unlink()
+    terminal_obs_owner.unlink()
     action_owner.unlink()
 
 

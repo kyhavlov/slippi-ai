@@ -89,6 +89,8 @@ def main():
   parser.add_argument('--warmup-steps', type=int, default=100)
   parser.add_argument('--length', type=int, default=256)
   parser.add_argument('--max-game-frames', type=int, default=28800)
+  parser.add_argument('--matchup', choices=sim_env.SUPPORTED_MATCHUPS,
+                      default='fox-falco')
   parser.add_argument('--sample-temperature', type=float, default=1.0)
   parser.add_argument('--print-every', type=int, default=0)
   parser.add_argument('--barrier-timeout', type=float, default=60.0)
@@ -117,6 +119,7 @@ def main():
   action_barrier = ctx.Barrier(args.workers + 1)
   stop_event = ctx.Event()
   step_counters = ctx.Array('i', args.workers * 4, lock=False)
+  step_timings = ctx.Array('d', args.workers * 3, lock=False)
   result_queue = ctx.Queue()
   processes = []
 
@@ -134,13 +137,16 @@ def main():
               args.max_game_frames,
               args.fixed_steps,
               args.warmup_steps,
+              args.matchup,
               obs_owner.specs,
+              None,
               action_owner.specs,
               spacing,
               obs_barrier,
               action_barrier,
               stop_event,
               step_counters,
+              step_timings,
               args.barrier_timeout,
               result_queue,
           ),
@@ -180,12 +186,16 @@ def main():
       obs_done = time.perf_counter()
       done, stockout, timeout, max_frame = _sum_step_counters(
           step_counters, args.workers)
+      worker_step_s, worker_fill_s, _ = _sum_step_timings(
+          step_timings, args.workers)
 
       if measuring:
         timings['policy_submit_s'] += policy_done - policy_start
         timings['action_copy_s'] += action_done - policy_done
         timings['action_release_s'] += released_actions - action_done
         timings['obs_wait_s'] += obs_done - released_actions
+        timings['env_step_s'] += worker_step_s
+        timings['env_fill_s'] += worker_fill_s
         counters['invalid_actions'] += invalid
         counters['done'] += done
         counters['stockout'] += stockout
@@ -226,6 +236,7 @@ def main():
             'target_completed_games': args.completed_games,
             'warmup_steps': args.warmup_steps,
             'length': args.length,
+            'matchup': args.matchup,
             'completed_games': completed_games,
             'total_elapsed_sec': total_elapsed,
             'measured_elapsed_sec': measured_elapsed,
@@ -259,17 +270,25 @@ def _worker_main(
     max_game_frames: int,
     fixed_steps: int,
     warmup_steps: int,
+    matchup: str,
     obs_specs: list[SharedArraySpec],
+    terminal_obs_specs: list[SharedArraySpec] | None,
     action_specs: list[SharedArraySpec],
     controller_spacing: tuple[int, int],
     obs_barrier,
     action_barrier,
     stop_event,
     step_counters,
+    step_timings,
     barrier_timeout: float,
     result_queue,
+    active_worker_count=None,
+    measure_worker_steps=None,
 ):
   obs_attacher = SharedArrayAttacher(obs_specs)
+  terminal_obs_attacher = (
+      SharedArrayAttacher(terminal_obs_specs)
+      if terminal_obs_specs is not None else None)
   action_attacher = SharedArrayAttacher(action_specs)
   env = None
   try:
@@ -277,16 +296,24 @@ def _worker_main(
         total_batch,
         array_factory=obs_attacher.array,
     )
+    terminal_packed = (
+        sim_env.make_packed_game_builder(
+            total_batch,
+            array_factory=terminal_obs_attacher.array,
+        )
+        if terminal_obs_attacher is not None else None)
     action = _shared_encoded_controller(total_batch * 2, action_attacher.array)
+    p1_character, p2_character = sim_env.player_pair_for_matchup(matchup)
     env = sim_env.SimBatchedEnvironment(
         num_envs=batch_size,
         players={
-            1: dolphin.AI(melee.Character.FOX),
-            2: dolphin.AI(melee.Character.FALCO),
+            1: dolphin.AI(p1_character),
+            2: dolphin.AI(p2_character),
         },
         length=length,
         stage=_cycle_stages(batch_size, offset),
-        character_pairs=sim_env.balanced_fox_falco_pairs(batch_size, offset),
+        character_pairs=sim_env.character_pairs_for_matchup(
+            matchup, batch_size, offset),
         max_frame_id=max_game_frames - 123,
     )
     env_slice = slice(offset, offset + batch_size)
@@ -295,7 +322,17 @@ def _worker_main(
         env.buffers.gamestate_view[env.cursor],
         initial_reset,
         env_slice,
+        env._last_controllers,
+        controller_slice=slice(None),
     )
+    if terminal_packed is not None:
+      terminal_packed.fill_slice(
+          env.buffers.gamestate_view[env.cursor],
+          initial_reset,
+          env_slice,
+          env._last_controllers,
+          controller_slice=slice(None),
+      )
     _barrier_wait(obs_barrier, barrier_timeout, f'worker {worker_id} initial observations')
 
     timings = defaultdict(float)
@@ -312,7 +349,27 @@ def _worker_main(
         raise
       if stop_event.is_set():
         break
-      measuring = step >= warmup_steps
+      active = _worker_is_active(active_worker_count, worker_id)
+
+      if not active:
+        _write_step_counters(
+            step_counters,
+            worker_id,
+            0,
+            0,
+            0,
+        )
+        _write_step_timings(step_timings, worker_id, 0.0, 0.0, 0.0)
+        _barrier_wait(
+            obs_barrier,
+            barrier_timeout,
+            f'worker {worker_id} inactive observation release')
+        step += 1
+        continue
+
+      measuring = (
+          step >= warmup_steps
+          and _worker_measurement_enabled(measure_worker_steps))
 
       step_start = time.perf_counter()
       needs_reset, terminal = _step_with_global_actions(
@@ -323,14 +380,20 @@ def _worker_main(
           batch_size=batch_size,
           max_frame_id=max_game_frames - 123,
           controller_spacing=controller_spacing,
+          terminal_packed=terminal_packed,
+          terminal_env_slice=env_slice,
       )
       step_done = time.perf_counter()
       packed.fill_slice(
           env.buffers.gamestate_view[env.cursor],
           needs_reset,
           env_slice,
+          env._last_controllers,
+          controller_slice=slice(None),
       )
       fill_done = time.perf_counter()
+      step_s = step_done - step_start
+      fill_s = fill_done - step_done
       done_count = int(needs_reset.sum())
       stockout_count = int(terminal['stockout'].sum())
       timeout_count = int(terminal['max_frame_reached'].sum())
@@ -341,15 +404,23 @@ def _worker_main(
           stockout_count,
           timeout_count,
       )
+      _write_step_timings(
+          step_timings,
+          worker_id,
+          step_s,
+          fill_s,
+          0.0,
+      )
       _barrier_wait(obs_barrier, barrier_timeout, f'worker {worker_id} observation release')
       obs_done = time.perf_counter()
+      obs_release_s = obs_done - fill_done
 
       if measuring:
         frame_id = terminal['frame_id']
         advanced = np.logical_or(frame_id > last_frame_id, needs_reset)
-        timings['step_s'] += step_done - step_start
-        timings['fill_s'] += fill_done - step_done
-        timings['obs_release_s'] += obs_done - fill_done
+        timings['step_s'] += step_s
+        timings['fill_s'] += fill_s
+        timings['obs_release_s'] += obs_release_s
         counters['done'] += done_count
         counters['stockout'] += stockout_count
         counters['timeout'] += timeout_count
@@ -377,7 +448,21 @@ def _worker_main(
     if env is not None:
       env.stop()
     obs_attacher.close()
+    if terminal_obs_attacher is not None:
+      terminal_obs_attacher.close()
     action_attacher.close()
+
+
+def _worker_is_active(active_worker_count, worker_id: int) -> bool:
+  if active_worker_count is None:
+    return True
+  return int(worker_id) < int(active_worker_count.value)
+
+
+def _worker_measurement_enabled(measure_worker_steps) -> bool:
+  if measure_worker_steps is None:
+    return True
+  return bool(measure_worker_steps.value)
 
 
 def _step_with_global_actions(
@@ -389,6 +474,8 @@ def _step_with_global_actions(
     batch_size: int,
     max_frame_id: int,
     controller_spacing: tuple[int, int],
+    terminal_packed = None,
+    terminal_env_slice: slice | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
   env._ensure_cursor_room()
   if np.any(env._pending_reset):
@@ -415,13 +502,37 @@ def _step_with_global_actions(
       axis_spacing=axis_spacing,
       shoulder_spacing=shoulder_spacing,
   )
+  sim_env._copy_encoded_controller(
+      env._last_controllers[1],
+      action_controller,
+      source_slice=first,
+      axis_spacing=axis_spacing,
+      shoulder_spacing=shoulder_spacing,
+  )
+  sim_env._copy_encoded_controller(
+      env._last_controllers[2],
+      action_controller,
+      source_slice=second,
+      axis_spacing=axis_spacing,
+      shoulder_spacing=shoulder_spacing,
+  )
 
   step_t = env.cursor
   env._env.step(max_frame_id=max_frame_id)
   needs_reset = env.buffers.done[step_t].astype(np.bool_, copy=True)
-  env._pending_reset[:] = needs_reset
   terminal = sim_env.terminal_view(env.buffers)[step_t].copy()
   env._last_step_info = sim_env.SimStepInfo(terminal=terminal, step_t=step_t)
+  if terminal_packed is not None:
+    if terminal_env_slice is None:
+      raise ValueError('terminal_env_slice must be set with terminal_packed')
+    terminal_packed.fill_slice(
+        env.buffers.gamestate_view[step_t],
+        needs_reset,
+        terminal_env_slice,
+        env._last_controllers,
+        controller_slice=slice(None),
+    )
+  env._reset_finished_lanes_for_next_observation(needs_reset)
   return needs_reset, terminal
 
 
@@ -451,6 +562,19 @@ def _write_step_counters(
   counters[base + 3] = int(timeout)
 
 
+def _write_step_timings(
+    timings,
+    worker_id: int,
+    step_s: float,
+    fill_s: float,
+    obs_release_s: float,
+):
+  base = int(worker_id) * 3
+  timings[base] = float(step_s)
+  timings[base + 1] = float(fill_s)
+  timings[base + 2] = float(obs_release_s)
+
+
 def _sum_step_counters(counters, workers: int) -> tuple[int, int, int, int]:
   done = 0
   stockout = 0
@@ -463,6 +587,18 @@ def _sum_step_counters(counters, workers: int) -> tuple[int, int, int, int]:
     timeout += int(counters[base + 2])
     max_frame += int(counters[base + 3])
   return done, stockout, timeout, max_frame
+
+
+def _sum_step_timings(timings, workers: int) -> tuple[float, float, float]:
+  step_s = 0.0
+  fill_s = 0.0
+  obs_release_s = 0.0
+  for worker_id in range(workers):
+    base = worker_id * 3
+    step_s += float(timings[base])
+    fill_s += float(timings[base + 1])
+    obs_release_s += float(timings[base + 2])
+  return step_s, fill_s, obs_release_s
 
 
 def _should_stop(args, measured_steps: int, completed_games: int) -> bool:

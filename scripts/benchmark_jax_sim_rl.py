@@ -16,6 +16,7 @@ from flax import nnx
 
 from scripts import benchmark_sim_mp
 from slippi_ai import eval_lib
+from slippi_ai import reward as reward_lib
 from slippi_ai import sim_env
 from slippi_ai import utils
 from slippi_ai.evaluators import Trajectory
@@ -60,6 +61,8 @@ def main():
   parser.add_argument('--ppo-beta', type=float, default=None)
   parser.add_argument('--ppo-epsilon', type=float, default=None)
   parser.add_argument('--ppo-max-mean-actor-kl', type=float, default=None)
+  parser.add_argument('--post-update-eval-interval', type=int, default=None)
+  parser.add_argument('--revert-on-post-update-actor-kl', action='store_true')
   parser.add_argument('--optimizer-burnin-epochs', type=int, default=None)
   parser.add_argument('--value-burnin-epochs', type=int, default=None)
   parser.add_argument(
@@ -69,6 +72,15 @@ def main():
   parser.add_argument('--length', type=int, default=256,
                       help='Sim EnvBatch ring buffer length.')
   parser.add_argument('--max-game-frames', type=int, default=28800)
+  parser.add_argument(
+      '--initial-stagger-steps',
+      type=int,
+      default=0,
+      help=(
+          'Before training, activate one sim worker at a time and run this '
+          'many policy-driven sim steps between activations.'))
+  parser.add_argument('--matchup', choices=sim_env.SUPPORTED_MATCHUPS,
+                      default='fox-falco')
   parser.add_argument('--sample-temperature', type=float, default=1.0)
   parser.add_argument('--barrier-timeout', type=float, default=900.0)
   parser.add_argument('--print-every', type=int, default=1)
@@ -93,6 +105,8 @@ def main():
     raise ValueError('--workers and --batch-size must be positive')
   if args.rollout_length <= 0 or args.ppo_batches < 0 or args.updates <= 0:
     raise ValueError('--rollout-length and --updates must be positive')
+  if args.initial_stagger_steps < 0:
+    raise ValueError('--initial-stagger-steps must be non-negative')
   save_path = Path(args.save_path) if args.save_path else None
   log_path = Path(args.log_jsonl) if args.log_jsonl else None
   trace_path = Path(args.jax_trace_dir) if args.jax_trace_dir else None
@@ -110,6 +124,9 @@ def main():
 
   obs_owner = benchmark_sim_mp.SharedArrayOwner()
   packed = sim_env.make_packed_game_builder(total_batch, array_factory=obs_owner.array)
+  terminal_obs_owner = benchmark_sim_mp.SharedArrayOwner()
+  terminal_packed = sim_env.make_packed_game_builder(
+      total_batch, array_factory=terminal_obs_owner.array)
   action_owner = benchmark_sim_mp.SharedArrayOwner()
   action = benchmark_sim_mp._shared_encoded_controller(total_packed, action_owner.array)
   spacing = benchmark_sim_mp._default_controller_spacing(state)
@@ -118,6 +135,17 @@ def main():
   action_barrier = ctx.Barrier(args.workers + 1)
   stop_event = ctx.Event()
   step_counters = ctx.Array('i', args.workers * 4, lock=False)
+  step_timings = ctx.Array('d', args.workers * 3, lock=False)
+  active_worker_count = ctx.Value(
+      'i',
+      1 if args.initial_stagger_steps > 0 else args.workers,
+      lock=False,
+  )
+  measure_worker_steps = ctx.Value(
+      'b',
+      args.initial_stagger_steps == 0,
+      lock=False,
+  )
   result_queue = ctx.Queue()
   processes = []
 
@@ -135,15 +163,20 @@ def main():
               args.max_game_frames,
               0,
               0,
+              args.matchup,
               obs_owner.specs,
+              terminal_obs_owner.specs,
               action_owner.specs,
               spacing,
               obs_barrier,
               action_barrier,
               stop_event,
               step_counters,
+              step_timings,
               args.barrier_timeout,
               result_queue,
+              active_worker_count,
+              measure_worker_steps,
           ),
       )
       process.start()
@@ -171,6 +204,8 @@ def main():
         ppo_beta=args.ppo_beta,
         ppo_epsilon=args.ppo_epsilon,
         ppo_max_mean_actor_kl=args.ppo_max_mean_actor_kl,
+        post_update_eval_interval=args.post_update_eval_interval,
+        revert_on_post_update_actor_kl=args.revert_on_post_update_actor_kl,
         optimizer_burnin_epochs=args.optimizer_burnin_epochs,
         value_burnin_epochs=args.value_burnin_epochs,
         sample_temperature=args.sample_temperature,
@@ -191,13 +226,32 @@ def main():
 
     benchmark_sim_mp._barrier_wait(
         obs_barrier, args.barrier_timeout, 'initial observations')
+    initial_stagger = _run_initial_stagger_warmup(
+        actor=actor,
+        packed=packed,
+        action=action,
+        env_action_queue=env_action_queue,
+        learner_action_queue=learner_action_queue,
+        dummy_outputs=dummy_outputs,
+        active_worker_count=active_worker_count,
+        measure_worker_steps=measure_worker_steps,
+        action_barrier=action_barrier,
+        obs_barrier=obs_barrier,
+        step_counters=step_counters,
+        step_timings=step_timings,
+        workers=args.workers,
+        stagger_steps=args.initial_stagger_steps,
+        total_batch=total_batch,
+        controller_spacing=spacing,
+        barrier_timeout=args.barrier_timeout,
+        print_every=args.print_every,
+    )
 
     timings = defaultdict(float)
     counters = defaultdict(int)
     measured_updates = 0
     measured_rollout_steps = 0
     total_updates = args.warmup_updates + args.updates
-    total_start = time.perf_counter()
     measured_start = None
     last_metrics = None
 
@@ -228,17 +282,21 @@ def main():
         trajectory, rollout_stats = _collect_trajectory(
             actor=actor,
             packed=packed,
+            terminal_packed=terminal_packed,
             action=action,
             env_action_queue=env_action_queue,
             learner_action_queue=learner_action_queue,
+            dummy_outputs=dummy_outputs,
             action_barrier=action_barrier,
             obs_barrier=obs_barrier,
             step_counters=step_counters,
+            step_timings=step_timings,
             workers=args.workers,
             total_batch=total_batch,
             rollout_length=args.rollout_length,
             controller_spacing=spacing,
             name_code=name_code,
+            reward_config=learner._config.reward,
             barrier_timeout=args.barrier_timeout,
         )
         rollout_done = time.perf_counter()
@@ -278,6 +336,7 @@ def main():
                 trajectories,
                 learner_state,
                 step=int(state.get('step', 0)) + update_index,
+                recompute_rewards=False,
                 profile=args.profile_learner and measuring)
             _block_until_ready((learner_state, last_metrics))
         finally:
@@ -287,6 +346,7 @@ def main():
             trajectories,
             learner_state,
             step=int(state.get('step', 0)) + update_index,
+            recompute_rewards=False,
             profile=args.profile_learner and measuring)
         _block_until_ready((learner_state, last_metrics))
       learner_done = time.perf_counter()
@@ -303,12 +363,19 @@ def main():
         timings['learner_ppo_s'] += learner_done - learner_start
         measured_updates += 1
 
+      update_env_steps = total_batch * args.rollout_length
+      update_player_frames = total_packed * args.rollout_length
+      update_total_s = max(update_timings['update_total_s'], 1e-9)
+      timing_summary = _timing_summary(update_timings)
       if log_path is not None:
         _append_jsonl(log_path, {
             'update': step_number,
             'phase': 'measure' if measuring else 'warmup',
-            'env_steps': total_batch * args.rollout_length * ppo_batches,
-            'player_frames': total_packed * args.rollout_length * ppo_batches,
+            'env_steps': update_env_steps,
+            'player_frames': update_player_frames,
+            'env_steps_per_sec': update_env_steps / update_total_s,
+            'player_frames_per_sec': update_player_frames / update_total_s,
+            'timing_summary': timing_summary,
             'timings_sec': dict(update_timings),
             'phase_times': phase_times,
             'counters': dict(update_counters),
@@ -323,10 +390,11 @@ def main():
 
       if args.print_every and (update_index + 1) % args.print_every == 0:
         phase = 'measure' if measuring else 'warmup'
-        elapsed = time.perf_counter() - total_start
         print(
             f'update={update_index + 1}/{total_updates} phase={phase} '
-            f'env_steps_per_sec={total_batch * args.rollout_length * ppo_batches * (update_index + 1) / max(elapsed, 1e-9):.1f}',
+            f'env_steps_per_sec={update_env_steps / update_total_s:.1f} '
+            f'rollout_s={timing_summary["rollout_s"]:.3f} '
+            f'learner_s={timing_summary["learner_s"]:.3f}',
             flush=True,
         )
 
@@ -359,6 +427,9 @@ def main():
             'updates': args.updates,
             'warmup_updates': args.warmup_updates,
             'policy_delay': actor._policy.delay,
+            'initial_stagger_steps': args.initial_stagger_steps,
+            'initial_stagger': initial_stagger,
+            'matchup': args.matchup,
             'learning_rate': learner._config.learning_rate,
             'policy_gradient_weight': learner._config.policy_gradient_weight,
             'kl_teacher_weight': learner._config.kl_teacher_weight,
@@ -368,6 +439,10 @@ def main():
             'ppo_beta': learner._config.ppo.beta,
             'ppo_epsilon': learner._config.ppo.epsilon,
             'ppo_max_mean_actor_kl': learner._config.ppo.max_mean_actor_kl,
+            'post_update_eval_interval': (
+                learner._config.ppo.post_update_eval_interval),
+            'revert_on_post_update_actor_kl': (
+                learner._config.ppo.revert_on_post_update_actor_kl),
             'optimizer_burnin_epochs': learner._config.optimizer_burnin_epochs,
             'value_burnin_epochs': learner._config.value_burnin_epochs,
             'learner_param_dtype': args.learner_param_dtype,
@@ -404,8 +479,10 @@ def main():
         process.terminate()
       process.join(timeout=1.0)
     obs_owner.close()
+    terminal_obs_owner.close()
     action_owner.close()
     obs_owner.unlink()
+    terminal_obs_owner.unlink()
     action_owner.unlink()
 
 
@@ -432,6 +509,8 @@ def _build_learner_and_actor(
     ppo_beta: float | None = None,
     ppo_epsilon: float | None = None,
     ppo_max_mean_actor_kl: float | None = None,
+    post_update_eval_interval: int | None = None,
+    revert_on_post_update_actor_kl: bool = False,
     optimizer_burnin_epochs: int | None = None,
     value_burnin_epochs: int | None = None,
     sample_temperature: float,
@@ -491,6 +570,10 @@ def _build_learner_and_actor(
     learner_config.ppo.epsilon = ppo_epsilon
   if ppo_max_mean_actor_kl is not None:
     learner_config.ppo.max_mean_actor_kl = ppo_max_mean_actor_kl
+  if post_update_eval_interval is not None:
+    learner_config.ppo.post_update_eval_interval = post_update_eval_interval
+  if revert_on_post_update_actor_kl:
+    learner_config.ppo.revert_on_post_update_actor_kl = True
   if optimizer_burnin_epochs is not None:
     learner_config.optimizer_burnin_epochs = optimizer_burnin_epochs
   if value_burnin_epochs is not None:
@@ -540,24 +623,164 @@ def _name_code(state: dict, batch_size: int):
   )
 
 
-def _collect_trajectory(
+def _initial_stagger_total_steps(workers: int, stagger_steps: int) -> int:
+  if stagger_steps <= 0:
+    return 0
+  return int(workers) * int(stagger_steps)
+
+
+def _active_workers_for_stagger_step(
+    step: int,
+    workers: int,
+    stagger_steps: int,
+) -> int:
+  if stagger_steps <= 0:
+    return int(workers)
+  return min(int(workers), 1 + int(step) // int(stagger_steps))
+
+
+def _run_initial_stagger_warmup(
     *,
     actor: jax_agents.BasicAgent,
     packed,
     action,
     env_action_queue: deque,
     learner_action_queue: deque,
+    dummy_outputs,
+    active_worker_count,
+    measure_worker_steps,
     action_barrier,
     obs_barrier,
     step_counters,
+    step_timings,
+    workers: int,
+    stagger_steps: int,
+    total_batch: int,
+    controller_spacing: tuple[int, int],
+    barrier_timeout: float,
+    print_every: int,
+) -> dict:
+  total_steps = _initial_stagger_total_steps(workers, stagger_steps)
+  if total_steps == 0:
+    active_worker_count.value = workers
+    measure_worker_steps.value = True
+    return dict(steps=0, elapsed_sec=0.0, counters={}, timings_sec={})
+
+  measure_worker_steps.value = False
+  timings = defaultdict(float)
+  counters = defaultdict(int)
+  start = time.perf_counter()
+  report_every = max(1, int(print_every), int(stagger_steps))
+  active_env_steps = 0
+  for step in range(total_steps):
+    active = _active_workers_for_stagger_step(step, workers, stagger_steps)
+    active_worker_count.value = active
+    active_env_steps += active * (total_batch // workers)
+
+    reset_start = time.perf_counter()
+    reset_mask = np.asarray(packed.needs_reset, dtype=np.bool_)
+    if np.any(reset_mask):
+      _handle_reset_delay_queues(
+          env_action_queue=env_action_queue,
+          learner_action_queue=learner_action_queue,
+          dummy_outputs=dummy_outputs,
+          reset_mask=reset_mask,
+      )
+    reset_done = time.perf_counter()
+
+    policy_start = time.perf_counter()
+    sample_outputs = actor.step_device(packed.game, packed.needs_reset)
+    policy_done = time.perf_counter()
+    env_action_queue.append(_to_numpy_tree(sample_outputs.controller_state))
+    delayed_controller = env_action_queue.popleft()
+    learner_action_queue.append(sample_outputs)
+    learner_action_queue.popleft()
+
+    invalid = benchmark_sim_mp._copy_controller(
+        action, delayed_controller, controller_spacing)
+    action_done = time.perf_counter()
+    benchmark_sim_mp._barrier_wait(
+        action_barrier, barrier_timeout, 'stagger action release')
+    release_done = time.perf_counter()
+    benchmark_sim_mp._barrier_wait(
+        obs_barrier, barrier_timeout, 'stagger observation wait')
+    obs_done = time.perf_counter()
+
+    done, stockout, timeout, max_frame = benchmark_sim_mp._sum_step_counters(
+        step_counters, workers)
+    worker_step_s, worker_fill_s, _ = (
+        benchmark_sim_mp._sum_step_timings(step_timings, workers))
+    timings['reset_queue_s'] += reset_done - reset_start
+    timings['policy_sample_s'] += policy_done - policy_start
+    timings['action_copy_s'] += action_done - policy_done
+    timings['action_release_s'] += release_done - action_done
+    timings['obs_wait_s'] += obs_done - release_done
+    timings['env_step_s'] += worker_step_s
+    timings['env_fill_s'] += worker_fill_s
+    counters['invalid_actions'] += invalid
+    counters['done'] += done
+    counters['stockout'] += stockout
+    counters['timeout'] += timeout
+    counters['max_frame_reached'] += max_frame
+
+    if print_every and (step + 1) % report_every == 0:
+      elapsed = time.perf_counter() - start
+      print(
+          f'initial_stagger={step + 1}/{total_steps} '
+          f'active_workers={active}/{workers} '
+          f'env_steps_per_sec={active_env_steps / max(elapsed, 1e-9):.1f}',
+          flush=True,
+      )
+
+  active_worker_count.value = workers
+  measure_worker_steps.value = True
+  return dict(
+      steps=total_steps,
+      active_env_steps=active_env_steps,
+      elapsed_sec=time.perf_counter() - start,
+      counters=dict(counters),
+      timings_sec=dict(timings),
+      timing_summary=_timing_summary(timings),
+  )
+
+
+def _timing_summary(timings: dict) -> dict:
+  return {
+      'total_s': float(timings.get('update_total_s', 0.0)),
+      'rollout_s': float(timings.get('trajectory_collect_total_s', 0.0)),
+      'learner_s': float(timings.get('learner_ppo_s', 0.0)),
+      'agent_step_s': float(timings.get('policy_sample_s', 0.0)),
+      'env_step_s': float(timings.get('env_step_s', 0.0)),
+      'env_fill_s': float(timings.get('env_fill_s', 0.0)),
+      'obs_wait_s': float(timings.get('obs_wait_s', 0.0)),
+      'action_copy_s': float(timings.get('action_copy_s', 0.0)),
+      'action_release_s': float(timings.get('action_release_s', 0.0)),
+  }
+
+
+def _collect_trajectory(
+    *,
+    actor: jax_agents.BasicAgent,
+    packed,
+    terminal_packed,
+    action,
+    env_action_queue: deque,
+    learner_action_queue: deque,
+    dummy_outputs,
+    action_barrier,
+    obs_barrier,
+    step_counters,
+    step_timings,
     workers: int,
     total_batch: int,
     rollout_length: int,
     controller_spacing: tuple[int, int],
     name_code: np.ndarray,
+    reward_config: reward_lib.RewardConfig,
     barrier_timeout: float,
 ) -> tuple[Trajectory, dict]:
   states = []
+  rewards = []
   actions = []
   resets = []
   timings = defaultdict(float)
@@ -566,9 +789,19 @@ def _collect_trajectory(
 
   for _ in range(rollout_length):
     state_start = time.perf_counter()
-    states.append(_to_numpy_tree(packed.game))
+    actor_state = _to_numpy_tree(packed.game)
+    states.append(actor_state)
     resets.append(np.asarray(packed.needs_reset, dtype=np.bool_).copy())
     state_done = time.perf_counter()
+
+    reset_mask = np.asarray(packed.needs_reset, dtype=np.bool_)
+    if np.any(reset_mask):
+      _handle_reset_delay_queues(
+          env_action_queue=env_action_queue,
+          learner_action_queue=learner_action_queue,
+          dummy_outputs=dummy_outputs,
+          reset_mask=reset_mask,
+      )
 
     policy_start = time.perf_counter()
     sample_outputs = actor.step_device(packed.game, packed.needs_reset)
@@ -588,14 +821,33 @@ def _collect_trajectory(
         obs_barrier, barrier_timeout, 'observation wait')
     obs_done = time.perf_counter()
 
+    transition_state_start = time.perf_counter()
+    reward_next_state = _terminal_corrected_game(
+        reset_game=packed.game,
+        terminal_game=terminal_packed.game,
+        needs_reset=packed.needs_reset,
+    )
+    rewards.append(_transition_reward(
+        actor_state,
+        reward_next_state,
+        reward_config,
+    ))
+    transition_state_done = time.perf_counter()
+
     done, stockout, timeout, max_frame = benchmark_sim_mp._sum_step_counters(
         step_counters, workers)
+    worker_step_s, worker_fill_s, _ = (
+        benchmark_sim_mp._sum_step_timings(step_timings, workers))
 
     timings['state_copy_s'] += state_done - state_start
     timings['policy_sample_s'] += policy_done - policy_start
     timings['action_copy_s'] += action_done - policy_done
     timings['action_release_s'] += release_done - action_done
     timings['obs_wait_s'] += obs_done - release_done
+    timings['terminal_reward_state_s'] += (
+        transition_state_done - transition_state_start)
+    timings['env_step_s'] += worker_step_s
+    timings['env_fill_s'] += worker_fill_s
     counters['invalid_actions'] += invalid
     counters['done'] += done
     counters['stockout'] += stockout
@@ -609,6 +861,7 @@ def _collect_trajectory(
   trajectory = _build_trajectory(
       actor=actor,
       states=states,
+      rewards=rewards,
       actions=actions,
       resets=resets,
       initial_state=initial_state,
@@ -629,6 +882,7 @@ def _build_trajectory(
     *,
     actor: jax_agents.BasicAgent,
     states: list,
+    rewards: list,
     actions: list,
     resets: list[np.ndarray],
     initial_state,
@@ -646,15 +900,79 @@ def _build_trajectory(
           [rollout_length + 1, total_batch * 2],
       ).copy(),
       actions=_batch_nest_jax(actions),
-      rewards=np.zeros((rollout_length, total_batch * 2), dtype=np.float32),
+      rewards=np.stack(rewards, axis=0),
       is_resetting=np.stack(resets, axis=0),
       initial_state=initial_state,
       delayed_actions=delayed_actions,
   )
 
 
+def _transition_reward(state, next_state, reward_config: reward_lib.RewardConfig):
+  transition = utils.batch_nest_nt([state, _to_numpy_tree(next_state)])
+  return reward_lib.compute_rewards(
+      transition,
+      **dataclasses.asdict(reward_config))[0]
+
+
+def _terminal_corrected_game(*, reset_game, terminal_game, needs_reset):
+  needs_reset = np.asarray(needs_reset, dtype=np.bool_)
+
+  def select(reset_leaf, terminal_leaf):
+    reset = needs_reset
+    reset_leaf = np.asarray(reset_leaf)
+    while reset.ndim < reset_leaf.ndim:
+      reset = reset[..., None]
+    return np.where(reset, np.asarray(terminal_leaf), reset_leaf)
+
+  return utils.map_nt(select, reset_game, terminal_game)
+
+
 def _to_numpy_tree(value):
   return utils.map_single_structure(lambda x: np.asarray(x).copy(), value)
+
+
+def _reset_delay_queue_lanes(queue: deque, default, reset_mask: np.ndarray):
+  if not queue:
+    return
+  for index, value in enumerate(queue):
+    queue[index] = _reset_tree_lanes(value, default, reset_mask)
+
+
+def _handle_reset_delay_queues(
+    *,
+    env_action_queue: deque,
+    learner_action_queue: deque,
+    dummy_outputs,
+    reset_mask: np.ndarray,
+) -> None:
+  # Fresh games should not receive delayed controller inputs from the game that
+  # just ended. The learner queue is different: it contains historical actor
+  # outputs for frames already collected into the trajectory, so rewriting it
+  # corrupts PPO old-policy logits/actions around terminal boundaries.
+  _reset_delay_queue_lanes(
+      env_action_queue,
+      dummy_outputs.controller_state,
+      reset_mask,
+  )
+  _ = learner_action_queue
+
+
+def _reset_tree_lanes(value, default, reset_mask: np.ndarray):
+  reset_mask = np.asarray(reset_mask, dtype=np.bool_)
+
+  def reset_leaf(leaf, default_leaf):
+    if isinstance(leaf, np.ndarray):
+      reset = reset_mask
+      while reset.ndim < leaf.ndim:
+        reset = reset[..., None]
+      return np.where(reset, np.asarray(default_leaf), leaf)
+    leaf_array = jnp.asarray(leaf)
+    reset = jnp.asarray(reset_mask)
+    while reset.ndim < leaf_array.ndim:
+      reset = reset[..., None]
+    return jnp.where(reset, jnp.asarray(default_leaf), leaf_array)
+
+  return utils.map_nt(reset_leaf, value, default)
 
 
 def _batch_nest_jax(nests):
@@ -710,6 +1028,8 @@ def _jsonable_metrics(metrics):
       'value': _jsonable_leaf(metrics.get('value')),
       'profile_sec': _jsonable_leaf(metrics.get('profile_sec')),
       'reverted': bool(metrics.get('reverted', False)),
+      'post_update_evaluated': bool(
+          metrics.get('post_update_evaluated', False)),
   }
 
 
