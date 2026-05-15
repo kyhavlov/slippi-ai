@@ -12,6 +12,7 @@ from slippi_ai.controller_heads import (
     DistanceOutputs,
     ControllerType,
 )
+from slippi_ai.controller_lib import neutral_controller
 from slippi_ai import controller_heads
 
 from slippi_ai.jax import embed, jax_utils
@@ -66,11 +67,11 @@ class ControllerHead(nnx.Module, controller_heads.ControllerHead[ControllerType]
     """Determines how controllers are embedded (e.g. discretized)."""
 
   def dummy_controller(self, shape: tp.Sequence[int]) -> ControllerType:
-    return self.controller_embedding.dummy(shape)
+    return self.controller_embedding.from_state(neutral_controller(shape))
 
   def dummy_sample_outputs(self, shape: tp.Sequence[int]) -> SampleOutputs[ControllerType]:
     return SampleOutputs(
-        controller_state=self.controller_embedding.dummy(shape),
+        controller_state=self.dummy_controller(shape),
         logits=self.controller_embedding.dummy_embedding(shape),
     )
 

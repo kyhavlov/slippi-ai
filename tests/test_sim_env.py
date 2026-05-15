@@ -24,8 +24,13 @@ class SimEnvTest(unittest.TestCase):
       self.assertEqual(initial.needs_reset.shape, (3,))
       self.assertTrue(np.all(initial.gamestates[1].p1.is_dead))
       self.assertTrue(np.all(initial.gamestates[1].p3.is_dead))
+      self.assertTrue(np.all(initial.gamestates[1].p1.on_ground))
+      self.assertTrue(np.all(initial.gamestates[1].p1.facing))
+      self.assertTrue(np.all(initial.gamestates[1].p1.shield_strength == 60.0))
       self.assertTrue(np.all(initial.gamestates[1].p0.character == melee.Character.FOX.value))
       self.assertTrue(np.all(initial.gamestates[1].p2.character == melee.Character.FALCO.value))
+      self.assertTrue(np.all(initial.gamestates[1].p0.jumps_left == 1))
+      self.assertFalse(np.any(initial.gamestates[1].items.item_0.exists))
       self.assertTrue(np.all(initial.gamestates[2].p0.character == melee.Character.FALCO.value))
       self.assertTrue(np.all(initial.gamestates[2].p2.character == melee.Character.FOX.value))
 
@@ -61,6 +66,30 @@ class SimEnvTest(unittest.TestCase):
       self.assertFalse(reset.needs_reset[0])
       self.assertTrue(reset.needs_reset[1])
       self.assertEqual(reset.gamestates[1].p0.x.shape, (2,))
+    finally:
+      env.stop()
+
+  def test_partial_reset_clears_observed_previous_controllers(self):
+    env = sim_env.SimBatchedEnvironment(num_envs=2, length=8)
+    try:
+      controllers = {
+          1: sim_env.neutral_controllers(2),
+          2: sim_env.neutral_controllers(2),
+      }
+      controllers[1].main_stick.x[:] = [0.0, 1.0]
+      controllers[2].main_stick.x[:] = [0.25, 0.75]
+      env.step(controllers)
+
+      env.reset([1])
+      state = env.current_packed_state(
+          needs_reset=np.array([False, True], dtype=np.bool_))
+
+      self.assertTrue(np.allclose(state.game.p0.controller.main_stick.x, [
+          0.0,
+          0.5,
+          0.25,
+          0.5,
+      ]))
     finally:
       env.stop()
 
@@ -176,6 +205,58 @@ class SimEnvTest(unittest.TestCase):
       self.assertEqual(next_state.game.p0.x.shape, (4,))
     finally:
       env.stop()
+
+  def test_slot_adapter_matches_libmelee_visible_conventions(self):
+    slot = np.zeros(3, dtype=[
+        ('present', np.bool_),
+        ('stocks', np.uint8),
+        ('percent', np.float32),
+        ('facing', np.bool_),
+        ('pos_x', np.float32),
+        ('pos_y', np.float32),
+        ('action_id', np.uint16),
+        ('invulnerable', np.bool_),
+        ('char_id', np.uint8),
+        ('jumps_left', np.uint8),
+        ('shield_hp', np.float32),
+        ('on_ground', np.bool_),
+    ])
+    slot['present'] = True
+    slot['stocks'] = 4
+    slot['percent'] = [11.2, 11.8, 12.0]
+    slot['char_id'] = melee.Character.FOX.value
+    slot['jumps_left'] = [2, 2, 1]
+    slot['on_ground'] = [True, False, False]
+    slot['shield_hp'] = 60.0
+
+    player = sim_env._player_from_slot(slot, sim_env.neutral_controllers(3))
+
+    self.assertEqual(player.percent.tolist(), [11, 11, 12])
+    self.assertEqual(player.jumps_left.tolist(), [2, 1, 1])
+
+  def test_items_are_canonicalized_independent_of_backend_slot_order(self):
+    items = np.zeros((1, len(sim_env.Items._fields)), dtype=[
+        ('exists', np.bool_),
+        ('type', np.uint16),
+        ('state', np.uint8),
+        ('pos_x', np.float32),
+        ('pos_y', np.float32),
+    ])
+    items[0, :4]['exists'] = [True, True, True, False]
+    items[0, :4]['type'] = [74, 54, 74, 0]
+    items[0, :4]['state'] = [4, 0, 5, 0]
+    items[0, :4]['pos_x'] = [-54.0, -32.0, 60.0, 0.0]
+    items[0, :4]['pos_y'] = [20.0, 40.0, 20.0, 0.0]
+
+    out = sim_env._items_from_frame(items)
+
+    self.assertEqual(out.item_0.type.tolist(), [74])
+    self.assertEqual(out.item_0.x.tolist(), [-54.0])
+    self.assertEqual(out.item_1.type.tolist(), [74])
+    self.assertEqual(out.item_1.x.tolist(), [60.0])
+    self.assertEqual(out.item_2.type.tolist(), [54])
+    self.assertEqual(out.item_2.x.tolist(), [-32.0])
+    self.assertFalse(out.item_3.exists[0])
 
 def _neutral_encoded_controller(batch_size: int):
   shape = (int(batch_size),)

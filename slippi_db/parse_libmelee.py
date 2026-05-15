@@ -65,15 +65,56 @@ _EMPTY_ITEM = utils.map_nt(
     utils.reify_tuple_type(Item),
 )
 
+_CHARACTER_EMBEDDING_SIZE = (
+    max(c.value for c in melee.Character if c != melee.Character.UNKNOWN_CHARACTER) + 1)
+_ACTION_EMBEDDING_SIZE = max(a.value for a in melee.Action) + 1
+_ITEM_EMBEDDING_SIZE = 0xEC + 1
+_ITEM_STATE_EMBEDDING_SIZE = 11 + 1
+
+def _valid_embedding_id(value: int, size: int) -> int:
+  return value if 0 <= value < size else 0
+
+def get_items(game: melee.GameState) -> Items:
+  items = {}
+  projectiles = []
+  for order, projectile in enumerate(game.projectiles):
+    item_type = _valid_embedding_id(projectile.type.value, _ITEM_EMBEDDING_SIZE)
+    item_state = _valid_embedding_id(int(projectile.subtype), _ITEM_STATE_EMBEDDING_SIZE)
+    projectiles.append((item_type, order, item_state, projectile))
+  projectiles.sort(key=lambda item: (-item[0], item[1]))
+  for i, (item_type, _, item_state, projectile) in enumerate(projectiles[:len(Items._fields)]):
+    items[f'item_{i}'] = Item(
+        exists=np.bool_(True),
+        type=np.uint16(item_type),
+        state=np.uint8(item_state),
+        x=np.float32(projectile.position.x),
+        y=np.float32(projectile.position.y),
+    )
+  for i in range(len(items), len(Items._fields)):
+    items[f'item_{i}'] = _EMPTY_ITEM
+  return Items(**items)
+
+def get_randall(game: melee.GameState) -> Randall:
+  if game.stage is not melee.Stage.YOSHIS_STORY:
+    return Randall(x=np.float32(0.0), y=np.float32(0.0))
+  y, x_left, x_right = melee.randall_position(game.frame - 123)
+  return Randall(
+      x=np.float32((x_left + x_right) * 0.5),
+      y=np.float32(y),
+  )
+
 def get_player(player: melee.PlayerState) -> Player:
+  character = _valid_embedding_id(
+      player.character.value, _CHARACTER_EMBEDDING_SIZE)
+  action = _valid_embedding_id(player.action.value, _ACTION_EMBEDDING_SIZE)
   base = dict(
       percent=np.uint16(player.percent),
       facing=np.bool_(player.facing),
       x=np.float32(player.position.x),
       y=np.float32(player.position.y),
-      action=np.uint16(player.action.value),
+      action=np.uint16(action),
       invulnerable=np.bool_(player.invulnerable),
-      character=np.uint8(player.character.value),
+      character=np.uint8(character),
       jumps_left=np.uint8(player.jumps_left),
       shield_strength=np.float32(player.shield_strength),
       on_ground=np.bool_(player.on_ground),
@@ -84,15 +125,19 @@ def get_player(player: melee.PlayerState) -> Player:
 
   if player.nana is not None:
     nana_state = player.nana
+    nana_character = _valid_embedding_id(
+        nana_state.character.value, _CHARACTER_EMBEDDING_SIZE)
+    nana_action = _valid_embedding_id(
+        nana_state.action.value, _ACTION_EMBEDDING_SIZE)
     nana = Nana(
         exists=np.bool_(True),
         percent=np.uint16(nana_state.percent),
         facing=np.bool_(nana_state.facing),
         x=np.float32(nana_state.position.x),
         y=np.float32(nana_state.position.y),
-        action=np.uint16(nana_state.action.value),
+        action=np.uint16(nana_action),
         invulnerable=np.bool_(nana_state.invulnerable),
-        character=np.uint8(nana_state.character.value),
+        character=np.uint8(nana_character),
         jumps_left=np.uint8(nana_state.jumps_left),
         shield_strength=np.float32(nana_state.shield_strength),
         on_ground=np.bool_(nana_state.on_ground),
@@ -165,11 +210,8 @@ def get_game(
   return Game(
       stage=np.uint8(game.stage.value),
       randall_phase=np.float32(game.frame % 1200),
-      randall=Randall(
-          x=np.float32(0.0),
-          y=np.float32(0.0),
-      ),
-      items=Items(**{f'item_{i}': _EMPTY_ITEM for i in range(len(Items._fields))}),
+      randall=get_randall(game),
+      items=get_items(game),
       is_teams=not is_singles,
       **players,
   )

@@ -31,6 +31,21 @@ def _split_gates(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.
   return i, f, g, o
 
 
+def _set_opponent_context_params(
+    input_preprocessor: dict,
+    bias: np.ndarray,
+    kernel: np.ndarray,
+):
+  if '_process_set_context' in input_preprocessor:
+    context = input_preprocessor['_process_set_context']
+  elif '_query' in input_preprocessor:
+    context = input_preprocessor['_query']
+  else:
+    raise KeyError('opponent pooling context module not found')
+  context['layers'][0]['bias'] = np.asarray(bias)
+  context['layers'][0]['kernel'] = np.asarray(kernel)
+
+
 def jax_config_from_tf_config(config: dict) -> dict:
   """Return a JAX-compatible config dict for the current TF checkpoint format."""
   config = copy.deepcopy(config)
@@ -126,8 +141,11 @@ def convert_policy_params(
   # Opponent pooling.
   _set_path(params, 'network/_input_preprocessor/_opp_enc/layers/0/bias', tf_leaves[0])
   _set_path(params, 'network/_input_preprocessor/_opp_enc/layers/0/kernel', tf_leaves[1])
-  _set_path(params, 'network/_input_preprocessor/_process_set_context/layers/0/bias', tf_leaves[2])
-  _set_path(params, 'network/_input_preprocessor/_process_set_context/layers/0/kernel', tf_leaves[3])
+  _set_opponent_context_params(
+      params['network']['_input_preprocessor'],
+      tf_leaves[2],
+      tf_leaves[3],
+  )
 
   # Main recurrent stack encoder.
   _set_path(params, 'network/_network/_layers/0/_module/bias', tf_leaves[114])
@@ -187,8 +205,11 @@ def convert_value_function_params(
   # Opponent pooling.
   _set_path(params, 'network/_input_preprocessor/_opp_enc/layers/0/bias', tf_leaves[4])
   _set_path(params, 'network/_input_preprocessor/_opp_enc/layers/0/kernel', tf_leaves[5])
-  _set_path(params, 'network/_input_preprocessor/_process_set_context/layers/0/bias', tf_leaves[6])
-  _set_path(params, 'network/_input_preprocessor/_process_set_context/layers/0/kernel', tf_leaves[7])
+  _set_opponent_context_params(
+      params['network']['_input_preprocessor'],
+      tf_leaves[6],
+      tf_leaves[7],
+  )
 
   # Main recurrent stack encoder.
   _set_path(params, 'network/_network/_layers/0/_module/bias', tf_leaves[8])

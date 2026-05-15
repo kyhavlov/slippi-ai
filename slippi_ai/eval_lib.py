@@ -14,7 +14,7 @@ import melee
 from slippi_ai import (
   embed, policies, dolphin, saving, data, utils, tf_utils, nametags
 )
-from slippi_ai.controller_lib import send_controller
+from slippi_ai.controller_lib import neutral_controller, send_controller
 from slippi_ai.controller_heads import SampleOutputs
 from slippi_db.parse_libmelee import get_game
 
@@ -31,7 +31,7 @@ def dummy_sample_outputs(
     shape: tp.Sequence[int],
 ):
   return SampleOutputs(
-      controller_state=controller_embedding.dummy(shape),
+      controller_state=controller_embedding.from_state(neutral_controller(shape)),
       logits=controller_embedding.dummy_embedding(shape),
   )
 
@@ -91,7 +91,8 @@ class BasicAgent:
     # The controller_head may discretize certain components of the action.
     # Agents only work with the discretized action space; you will need
     # to call `decode` on the action before sending it to Dolphin.
-    default_controller = self._embed_controller.dummy([batch_size])
+    default_controller = self._embed_controller.from_state(
+        neutral_controller([batch_size]))
     self._prev_controller = default_controller
 
     def sample(
@@ -336,17 +337,9 @@ class DelayedAgent:
           f' policy delay ({policy.delay})')
 
     self.delay = policy.delay - console_delay
-    self._output_queue: utils.PeekableQueue[SampleOutputs] \
-      = utils.PeekableQueue()
-
     self.dummy_sample_outputs = dummy_sample_outputs(
         self.embed_controller, [batch_size])
-    for _ in range(self.delay):
-      self._output_queue.put(self.dummy_sample_outputs)
-
-    # Break circular references.
-    self.pop = self._output_queue.get
-    self.peek_n = self._output_queue.peek_n
+    self._reset_delay_queue()
 
     # TODO: put this in the BasicAgent?
     self.step_profiler = utils.Profiler(burnin=1)
@@ -382,8 +375,22 @@ class DelayedAgent:
     with self.step_profiler:
       return self._agent.step(game, needs_reset)
 
+  def _reset_delay_queue(self):
+    self._output_queue: utils.PeekableQueue[SampleOutputs] = utils.PeekableQueue()
+    for _ in range(self.delay):
+      self._output_queue.put(self.dummy_sample_outputs)
+    self.pop = self._output_queue.get
+    self.peek_n = self._output_queue.peek_n
+
+  def _reset_all_lanes_if_needed(self, needs_reset: np.ndarray):
+    if np.asarray(needs_reset).size and np.all(needs_reset):
+      self._input_queue = []
+      self._agent._prev_controller = self.dummy_sample_outputs.controller_state
+      self._reset_delay_queue()
+
   # Present the same interface as the async agent.
   def push(self, game: embed.Game, needs_reset: np.ndarray):
+    self._reset_all_lanes_if_needed(needs_reset)
     if self._batch_steps == 0:
       with self.step_profiler:
         sampled_controller = self._agent.step(game, needs_reset)
@@ -428,6 +435,7 @@ class JaxDelayedAgent:
       compile: bool = True,
       jit_compile: bool = False,
       jax_param_dtype: str = 'float32',
+      seed: int = 0,
       fake: bool = False,
       async_inference: bool = False,
       **agent_kwargs,
@@ -456,6 +464,7 @@ class JaxDelayedAgent:
         policy=policy,
         batch_size=batch_size,
         name_code=name_code,
+        seed=seed,
         sample_kwargs=sample_kwargs,
         compile=compile,
         pack_args=True,
@@ -474,11 +483,8 @@ class JaxDelayedAgent:
 
     self.dummy_sample_outputs = dummy_sample_outputs(
         self.embed_controller, [batch_size])
-    for _ in range(self.delay):
-      self._output_queue.put(self.dummy_sample_outputs)
+    self._reset_delay_queue()
 
-    self.pop = self._output_queue.get
-    self.peek_n = self._output_queue.peek_n
     self.step_profiler = utils.Profiler(burnin=1)
 
   @property
@@ -513,7 +519,21 @@ class JaxDelayedAgent:
     with self.step_profiler:
       return _sample_outputs_to_numpy(self._agent.step(game, needs_reset))
 
+  def _reset_delay_queue(self):
+    self._output_queue: utils.PeekableQueue[SampleOutputs] = utils.PeekableQueue()
+    for _ in range(self.delay):
+      self._output_queue.put(self.dummy_sample_outputs)
+    self.pop = self._output_queue.get
+    self.peek_n = self._output_queue.peek_n
+
+  def _reset_all_lanes_if_needed(self, needs_reset: np.ndarray):
+    if np.asarray(needs_reset).size and np.all(needs_reset):
+      self._input_queue = []
+      self._agent._prev_controller = self.dummy_sample_outputs.controller_state
+      self._reset_delay_queue()
+
   def push(self, game: embed.Game, needs_reset: np.ndarray):
+    self._reset_all_lanes_if_needed(needs_reset)
     if self._batch_steps == 0:
       with self.step_profiler:
         sampled_controller = self._agent.step(game, needs_reset)
@@ -843,6 +863,10 @@ class Agent:
     if not self.name_codes:
       self.name_codes = [0]
     self.name_index = 0
+
+    if agent_kwargs.get('platform') == 'jax' and 'seed' not in agent_kwargs:
+      # Keep same-policy Dolphin evals from sharing the exact sampling stream.
+      agent_kwargs['seed'] = self._port - 1
 
     self._agent = build_delayed_agent(state, batch_size=1, **agent_kwargs)
     # self._agent.warmup()

@@ -7,10 +7,23 @@ import numpy as np
 from flax import nnx
 
 from slippi_ai import utils, data, agents
+from slippi_ai.controller_lib import neutral_controller
 from slippi_ai.types import Game, S
 from slippi_ai.data import StateAction
 from slippi_ai.controller_heads import SampleOutputs, ControllerType
 from slippi_ai.jax import policies, jax_utils
+
+
+def _reset_tree_lanes(tree, defaults, needs_reset):
+  needs_reset = jnp.asarray(needs_reset, dtype=jnp.bool_)
+
+  def reset_leaf(value, default):
+    reset = needs_reset
+    while reset.ndim < value.ndim:
+      reset = reset[..., None]
+    return jnp.where(reset, default, value)
+
+  return jax.tree.map(reset_leaf, tree, defaults)
 
 
 class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
@@ -40,7 +53,8 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
     # The controller_head may discretize certain components of the action.
     # Agents only work with the discretized action space; you will need
     # to call `decode` on the action before sending it to Dolphin.
-    default_controller = self._policy.controller_head.dummy_controller([batch_size])
+    default_controller = self._policy.controller_head.controller_embedding.from_state(
+        neutral_controller([batch_size]))
     self._prev_controller = default_controller
 
     if rngs is None:
@@ -56,6 +70,11 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
     ) -> tuple[SampleOutputs[ControllerType], policies.RecurrentState]:
       # Note: sample outputs are discretized by the controller_head.
       game, needs_reset = state_and_reset
+      prev_action = _reset_tree_lanes(
+          prev_action,
+          policy.controller_head.dummy_controller(needs_reset.shape),
+          needs_reset,
+      )
       state_action = StateAction(
           state=game,
           action=prev_action,

@@ -37,6 +37,7 @@ SUPPORTED_STAGES = tuple(
     stage for stage in _MELEE_TO_SIM_STAGE
     if stage is not melee.Stage.FOUNTAIN_OF_DREAMS
 )
+SUPPORTED_MATCHUPS = ('fox-falco', 'fox-fox')
 
 _TERMINAL_DTYPE = np.dtype(
     [
@@ -84,6 +85,7 @@ class SimBatchedEnvironment:
       max_frame_id: int = -1,
       data_dir: str | None = None,
       include_controller_state: bool = True,
+      include_items: bool = True,
   ):
     self._num_envs = int(num_envs)
     self._length = int(length)
@@ -99,6 +101,7 @@ class SimBatchedEnvironment:
         character_pairs, self._players, self._num_envs)
     self._max_frame_id = int(max_frame_id)
     self._include_controller_state = bool(include_controller_state)
+    self._include_items = bool(include_items)
     self.num_steps = 1
 
     self._env = melee_sim.EnvBatch(
@@ -120,7 +123,10 @@ class SimBatchedEnvironment:
         terminal=np.zeros(self._num_envs, dtype=_TERMINAL_DTYPE),
         step_t=-1,
     )
-    self._packed = make_packed_game_builder(self._num_envs)
+    self._packed = make_packed_game_builder(
+        self._num_envs,
+        include_items=self._include_items,
+    )
     self._output_queue = collections.deque([
         self.current_state(needs_reset=np.ones(self._num_envs, dtype=np.bool_))
     ])
@@ -147,7 +153,7 @@ class SimBatchedEnvironment:
     """Return a [port1 batch, port2 batch] game view for batched policy calls."""
     needs_reset = np.zeros(self._num_envs, dtype=np.bool_) if needs_reset is None else needs_reset
     frame = self._buffers.gamestate_view[self._env.t]
-    self._packed.fill(frame, needs_reset)
+    self._packed.fill(frame, needs_reset, self._last_controllers)
     return PackedState(game=self._packed.game, needs_reset=self._packed.needs_reset)
 
   def reset(self, env_ids: tp.Sequence[int] | np.ndarray | None = None) -> EnvOutput:
@@ -160,6 +166,7 @@ class SimBatchedEnvironment:
     reset_mask[self._env.t, ids] = 1
     self._env.reset_masked()
     reset_mask[self._env.t, ids] = 0
+    self._reset_last_controllers(ids)
     needs_reset = np.zeros(self._num_envs, dtype=np.bool_)
     needs_reset[ids] = True
     return self.current_state(needs_reset=needs_reset)
@@ -206,15 +213,29 @@ class SimBatchedEnvironment:
         axis_spacing=axis_spacing,
         shoulder_spacing=shoulder_spacing,
     )
+    _copy_encoded_controller(
+        self._last_controllers[1],
+        controller_state,
+        source_slice=slice(0, self._num_envs),
+        axis_spacing=axis_spacing,
+        shoulder_spacing=shoulder_spacing,
+    )
+    _copy_encoded_controller(
+        self._last_controllers[2],
+        controller_state,
+        source_slice=slice(self._num_envs, 2 * self._num_envs),
+        axis_spacing=axis_spacing,
+        shoulder_spacing=shoulder_spacing,
+    )
 
     step_t = self._env.t
     self._env.step(max_frame_id=self._max_frame_id)
     needs_reset = self._buffers.done[step_t].astype(np.bool_, copy=True)
-    self._pending_reset[:] = needs_reset
     self._last_step_info = SimStepInfo(
         terminal=terminal_view(self._buffers)[step_t].copy(),
         step_t=step_t,
     )
+    self._reset_finished_lanes_for_next_observation(needs_reset)
     return needs_reset
 
   def multi_step(self, controllers: list[Controllers]) -> list[EnvOutput]:
@@ -251,16 +272,28 @@ class SimBatchedEnvironment:
     step_t = self._env.t
     self._env.step(max_frame_id=self._max_frame_id)
     needs_reset = self._buffers.done[step_t].astype(np.bool_, copy=True)
-    self._pending_reset[:] = needs_reset
     self._last_step_info = SimStepInfo(
         terminal=terminal_view(self._buffers)[step_t].copy(),
         step_t=step_t,
     )
+    self._reset_finished_lanes_for_next_observation(needs_reset)
     return self.current_state(needs_reset=needs_reset)
 
   def _ensure_cursor_room(self):
     if self._env.t >= self._length:
       self._env.reset_cursor()
+
+  def _reset_last_controllers(self, ids: np.ndarray):
+    if ids.size == 0:
+      return
+    neutral = neutral_controllers(ids.size)
+    for port in self._ports:
+      _copy_controller(self._last_controllers[port], neutral, ids, slice(None))
+
+  def _reset_finished_lanes_for_next_observation(self, needs_reset: np.ndarray):
+    self._pending_reset[:] = False
+    if np.any(needs_reset):
+      self.reset(np.flatnonzero(needs_reset))
 
   def _configure_all_matches(self):
     self._env.configure_matches(
@@ -300,7 +333,10 @@ class SimBatchedEnvironment:
             x=frame['stage']['randall']['x'].astype(np.float32, copy=True),
             y=frame['stage']['randall']['y'].astype(np.float32, copy=True),
         ),
-        items=_items_from_frame(frame['items']),
+        items=(
+            _items_from_frame(frame['items'])
+            if self._include_items
+            else _empty_items(self._num_envs)),
         is_teams=frame['is_teams'].astype(np.bool_, copy=True),
     )
 
@@ -346,13 +382,36 @@ def balanced_fox_falco_pairs(
   return tuple(pairs[(int(offset) + i) % len(pairs)] for i in range(int(num_envs)))
 
 
+def character_pairs_for_matchup(
+    matchup: str,
+    num_envs: int,
+    offset: int = 0,
+) -> tuple[tuple[melee.Character, melee.Character], ...]:
+  if matchup == 'fox-falco':
+    return balanced_fox_falco_pairs(num_envs, offset)
+  if matchup == 'fox-fox':
+    return tuple(
+        (melee.Character.FOX, melee.Character.FOX)
+        for _ in range(int(num_envs)))
+  raise ValueError(f'unsupported matchup {matchup!r}; expected {SUPPORTED_MATCHUPS}')
+
+
+def player_pair_for_matchup(matchup: str) -> tuple[melee.Character, melee.Character]:
+  return character_pairs_for_matchup(matchup, 1)[0]
+
+
 def make_packed_game_builder(
     batch_size: int,
     *,
     array_factory: ArrayFactory = np.zeros,
+    include_items: bool = True,
 ) -> '_PackedGameBuilder':
   """Create reusable packed policy-game buffers for `batch_size` envs."""
-  return _PackedGameBuilder(batch_size, array_factory=array_factory)
+  return _PackedGameBuilder(
+      batch_size,
+      array_factory=array_factory,
+      include_items=include_items,
+  )
 
 
 def _write_controller_action(action_frame: np.ndarray, controller: Controller, player_index: int):
@@ -385,6 +444,35 @@ def _write_encoded_controller_action(
   player['shoulder'][:] = np.asarray(controller.shoulder)[source_slice] * scale_shoulder
   for name in Buttons._fields:
     player['buttons'][name][:] = np.asarray(getattr(controller.buttons, name))[source_slice]
+
+
+def _copy_controller(dst: Controller, src: Controller, target: slice, source: slice):
+  dst.main_stick.x[target] = src.main_stick.x[source]
+  dst.main_stick.y[target] = src.main_stick.y[source]
+  dst.c_stick.x[target] = src.c_stick.x[source]
+  dst.c_stick.y[target] = src.c_stick.y[source]
+  dst.shoulder[target] = src.shoulder[source]
+  for name in Buttons._fields:
+    getattr(dst.buttons, name)[target] = getattr(src.buttons, name)[source]
+
+
+def _copy_encoded_controller(
+    dst: Controller,
+    src: Controller,
+    *,
+    source_slice: slice,
+    axis_spacing: int,
+    shoulder_spacing: int,
+):
+  scale_axis = np.float32(1.0 / float(axis_spacing))
+  scale_shoulder = np.float32(1.0 / float(shoulder_spacing))
+  dst.main_stick.x[:] = np.asarray(src.main_stick.x)[source_slice] * scale_axis
+  dst.main_stick.y[:] = np.asarray(src.main_stick.y)[source_slice] * scale_axis
+  dst.c_stick.x[:] = np.asarray(src.c_stick.x)[source_slice] * scale_axis
+  dst.c_stick.y[:] = np.asarray(src.c_stick.y)[source_slice] * scale_axis
+  dst.shoulder[:] = np.asarray(src.shoulder)[source_slice] * scale_shoulder
+  for name in Buttons._fields:
+    getattr(dst.buttons, name)[:] = np.asarray(getattr(src.buttons, name))[source_slice]
 
 
 def _character_id(player: dolphin.Player) -> int:
@@ -451,14 +539,14 @@ def _player_from_slot(slot: np.ndarray, controller: Controller) -> Player:
   present = slot['present'].astype(np.bool_, copy=False)
   stocks = slot['stocks'].astype(np.uint8, copy=True)
   return Player(
-      percent=np.rint(slot['percent']).clip(0, np.iinfo(np.uint16).max).astype(np.uint16),
+      percent=slot['percent'].clip(0, np.iinfo(np.uint16).max).astype(np.uint16),
       facing=slot['facing'].astype(np.bool_, copy=True),
       x=slot['pos_x'].astype(np.float32, copy=True),
       y=slot['pos_y'].astype(np.float32, copy=True),
       action=slot['action_id'].astype(np.uint16, copy=True),
       invulnerable=slot['invulnerable'].astype(np.bool_, copy=True),
       character=slot['char_id'].astype(np.uint8, copy=True),
-      jumps_left=slot['jumps_left'].astype(np.uint8, copy=True),
+      jumps_left=_libmelee_jumps_left(slot),
       shield_strength=slot['shield_hp'].astype(np.float32, copy=True),
       on_ground=slot['on_ground'].astype(np.bool_, copy=True),
       is_dead=np.logical_or(np.logical_not(present), stocks == 0),
@@ -476,15 +564,15 @@ def _empty_player(batch_size: int) -> Player:
   zeros_u8 = np.zeros(batch_size, dtype=np.uint8)
   return Player(
       percent=zeros_u16.copy(),
-      facing=zeros_bool.copy(),
+      facing=np.ones(batch_size, dtype=np.bool_),
       x=zeros_f32.copy(),
       y=zeros_f32.copy(),
       action=zeros_u16.copy(),
       invulnerable=zeros_bool.copy(),
       character=zeros_u8.copy(),
       jumps_left=zeros_u8.copy(),
-      shield_strength=zeros_f32.copy(),
-      on_ground=zeros_bool.copy(),
+      shield_strength=np.full(batch_size, 60.0, dtype=np.float32),
+      on_ground=np.ones(batch_size, dtype=np.bool_),
       is_dead=np.ones(batch_size, dtype=np.bool_),
       stocks_left=zeros_u8.copy(),
       controller=neutral_controllers(batch_size),
@@ -512,7 +600,15 @@ def _empty_nana(batch_size: int) -> Nana:
   )
 
 
+def _libmelee_jumps_left(slot: np.ndarray) -> np.ndarray:
+  raw = np.asarray(slot['jumps_left'], dtype=np.int16)
+  airborne_with_ground_jump_available = (np.asarray(slot['on_ground']) == 0) & (raw > 1)
+  values = np.where(airborne_with_ground_jump_available, raw - 1, raw)
+  return np.maximum(values, 0).astype(np.uint8)
+
+
 def _items_from_frame(items: np.ndarray) -> Items:
+  items = _canonical_items(items)
   return Items(**{
       f'item_{i}': Item(
           exists=items[:, i]['exists'].astype(np.bool_, copy=True),
@@ -520,6 +616,31 @@ def _items_from_frame(items: np.ndarray) -> Items:
           state=items[:, i]['state'].astype(np.uint8, copy=True),
           x=items[:, i]['pos_x'].astype(np.float32, copy=True),
           y=items[:, i]['pos_y'].astype(np.float32, copy=True),
+      )
+      for i in range(len(Items._fields))
+  })
+
+
+def _canonical_items(items: np.ndarray) -> np.ndarray:
+  exists_key = -items['exists'].astype(np.int16)
+  type_key = -items['type'].astype(np.int32)
+  index_key = np.broadcast_to(
+      np.arange(items.shape[1], dtype=np.int16),
+      items.shape,
+  )
+  order = np.lexsort((index_key, type_key, exists_key), axis=1)
+  return np.take_along_axis(items, order, axis=1)
+
+
+def _empty_items(batch_size: int) -> Items:
+  batch_size = int(batch_size)
+  return Items(**{
+      f'item_{i}': Item(
+          exists=np.zeros(batch_size, dtype=np.bool_),
+          type=np.zeros(batch_size, dtype=np.uint16),
+          state=np.zeros(batch_size, dtype=np.uint8),
+          x=np.zeros(batch_size, dtype=np.float32),
+          y=np.zeros(batch_size, dtype=np.float32),
       )
       for i in range(len(Items._fields))
   })
@@ -548,10 +669,12 @@ class _PackedGameBuilder:
       batch_size: int,
       *,
       array_factory: ArrayFactory = np.zeros,
+      include_items: bool = True,
   ):
     self.batch_size = int(batch_size)
     self.packed_size = self.batch_size * 2
     self._array_factory = array_factory
+    self._include_items = bool(include_items)
     self.needs_reset = _make_array(array_factory, self.packed_size, np.bool_)
     self._percent_tmp = np.zeros(self.batch_size, dtype=np.float32)
     self._p0_arrays = _player_arrays(self.packed_size, array_factory=array_factory)
@@ -564,12 +687,13 @@ class _PackedGameBuilder:
         f'item_{i}': Item(**arrays)
         for i, arrays in enumerate(self._item_arrays)
     })
-    controller = neutral_controllers(self.packed_size)
+    self._p0_controller = _controller_buffers(self.packed_size, array_factory)
+    self._p2_controller = _controller_buffers(self.packed_size, array_factory)
     empty_nana = _empty_nana(self.packed_size)
     self.game = Game(
-        p0=Player(**self._p0_arrays, controller=controller, nana=empty_nana),
+        p0=Player(**self._p0_arrays, controller=self._p0_controller, nana=empty_nana),
         p1=_empty_player(self.packed_size),
-        p2=Player(**self._p2_arrays, controller=controller, nana=empty_nana),
+        p2=Player(**self._p2_arrays, controller=self._p2_controller, nana=empty_nana),
         p3=_empty_player(self.packed_size),
         stage=_make_array(array_factory, self.packed_size, np.uint8),
         randall_phase=_make_array(array_factory, self.packed_size, np.float32),
@@ -581,14 +705,21 @@ class _PackedGameBuilder:
         is_teams=_make_array(array_factory, self.packed_size, np.bool_),
     )
 
-  def fill(self, frame: np.ndarray, needs_reset: np.ndarray):
-    self.fill_slice(frame, needs_reset, slice(0, self.batch_size))
+  def fill(
+      self,
+      frame: np.ndarray,
+      needs_reset: np.ndarray,
+      controllers: tp.Mapping[Port, Controller] | None = None,
+  ):
+    self.fill_slice(frame, needs_reset, slice(0, self.batch_size), controllers)
 
   def fill_slice(
       self,
       frame: np.ndarray,
       needs_reset: np.ndarray,
       env_slice: slice,
+      controllers: tp.Mapping[Port, Controller] | None = None,
+      controller_slice: slice | None = None,
   ):
     first = env_slice
     second = slice(
@@ -608,15 +739,21 @@ class _PackedGameBuilder:
     self._fill_player(self._p0_arrays, second, src1)
     self._fill_player(self._p2_arrays, first, src1)
     self._fill_player(self._p2_arrays, second, src0)
+    if controllers is not None:
+      source = env_slice if controller_slice is None else controller_slice
+      _copy_controller(self._p0_controller, controllers[1], first, source)
+      _copy_controller(self._p0_controller, controllers[2], second, source)
+      _copy_controller(self._p2_controller, controllers[2], first, source)
+      _copy_controller(self._p2_controller, controllers[1], second, source)
 
     self._fill_stage_like(frame, first)
     self._fill_stage_like(frame, second)
-    self._fill_items(frame['items'], first)
-    self._fill_items(frame['items'], second)
+    if self._include_items:
+      self._fill_items(frame['items'], first)
+      self._fill_items(frame['items'], second)
 
   def _fill_player(self, dst: dict[str, np.ndarray], target: slice, slot: np.ndarray):
-    np.rint(slot['percent'], out=self._percent_tmp)
-    np.clip(self._percent_tmp, 0, np.iinfo(np.uint16).max, out=self._percent_tmp)
+    np.clip(slot['percent'], 0, np.iinfo(np.uint16).max, out=self._percent_tmp)
     dst['percent'][target] = self._percent_tmp
     dst['facing'][target] = slot['facing']
     dst['x'][target] = slot['pos_x']
@@ -624,7 +761,7 @@ class _PackedGameBuilder:
     dst['action'][target] = slot['action_id']
     dst['invulnerable'][target] = slot['invulnerable']
     dst['character'][target] = slot['char_id']
-    dst['jumps_left'][target] = slot['jumps_left']
+    dst['jumps_left'][target] = _libmelee_jumps_left(slot)
     dst['shield_strength'][target] = slot['shield_hp']
     dst['on_ground'][target] = slot['on_ground']
     dst['stocks_left'][target] = slot['stocks']
@@ -644,6 +781,7 @@ class _PackedGameBuilder:
     self.game.is_teams[target] = frame['is_teams']
 
   def _fill_items(self, items: np.ndarray, target: slice):
+    items = _canonical_items(items)
     for i, arrays in enumerate(self._item_arrays):
       src = items[:, i]
       arrays['exists'][target] = src['exists']
@@ -674,6 +812,32 @@ def _player_arrays(
   }
   arrays['is_dead'][:] = True
   return arrays
+
+
+def _controller_buffers(
+    batch_size: int,
+    array_factory: ArrayFactory = np.zeros,
+) -> Controller:
+  controller = Controller(
+      main_stick=Stick(
+          x=_make_array(array_factory, batch_size, np.float32),
+          y=_make_array(array_factory, batch_size, np.float32),
+      ),
+      c_stick=Stick(
+          x=_make_array(array_factory, batch_size, np.float32),
+          y=_make_array(array_factory, batch_size, np.float32),
+      ),
+      shoulder=_make_array(array_factory, batch_size, np.float32),
+      buttons=Buttons(**{
+          name: _make_array(array_factory, batch_size, np.bool_)
+          for name in Buttons._fields
+      }),
+  )
+  controller.main_stick.x[:] = 0.5
+  controller.main_stick.y[:] = 0.5
+  controller.c_stick.x[:] = 0.5
+  controller.c_stick.y[:] = 0.5
+  return controller
 
 
 def _item_arrays(

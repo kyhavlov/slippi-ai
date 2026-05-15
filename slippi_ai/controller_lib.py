@@ -4,7 +4,7 @@ import numpy as np
 
 import melee
 
-from slippi_ai.types import Controller
+from slippi_ai.types import Buttons, Controller, Stick
 from slippi_ai import types
 
 # this will be the autoregressive order in embed.py
@@ -30,7 +30,25 @@ def send_controller(controller: melee.Controller, controller_state: Controller):
   c_stick = controller_state.c_stick
   controller.tilt_analog(melee.Button.BUTTON_C, c_stick.x, c_stick.y)
   controller.press_shoulder(melee.Button.BUTTON_L, controller_state.shoulder)
-  # flush the controller?
+
+
+def neutral_controller(shape) -> Controller:
+  shape = tuple(int(x) for x in shape)
+  return Controller(
+      main_stick=Stick(
+          x=np.full(shape, 0.5, dtype=np.float32),
+          y=np.full(shape, 0.5, dtype=np.float32),
+      ),
+      c_stick=Stick(
+          x=np.full(shape, 0.5, dtype=np.float32),
+          y=np.full(shape, 0.5, dtype=np.float32),
+      ),
+      shoulder=np.zeros(shape, dtype=np.float32),
+      buttons=Buttons(**{
+          name: np.zeros(shape, dtype=np.bool_)
+          for name in Buttons._fields
+      }),
+  )
 
 RawTrigger = int
 TRIGGER_DEADZONE = 43
