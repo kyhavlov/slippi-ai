@@ -164,7 +164,6 @@ def main():
               args.length,
               args.max_game_frames,
               0,
-              0,
               args.character_pool,
               obs_owner.specs,
               terminal_obs_owner.specs,

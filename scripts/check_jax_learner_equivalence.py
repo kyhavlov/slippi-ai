@@ -204,7 +204,6 @@ def _collect_trajectories(
             length,
             28800,
             0,
-            0,
             character_pool,
             obs_owner.specs,
             terminal_obs_owner.specs,

@@ -161,7 +161,6 @@ class SimBatchedEnvironment:
     }
     # The policy observes previous controller state. Keep these buffers live so
     # encoded-action rollout can update history without rebuilding Game trees.
-    self._pending_reset = np.zeros(self._num_envs, dtype=np.bool_)
     self._last_step_info = SimStepInfo(
         terminal=np.zeros(self._num_envs, dtype=_TERMINAL_DTYPE),
         step_t=-1,
@@ -240,9 +239,6 @@ class SimBatchedEnvironment:
   ) -> np.ndarray:
     """Step from encoded default-controller buckets shaped [p1 batch, p2 batch]."""
     self._ensure_cursor_room()
-    if np.any(self._pending_reset):
-      self.reset(np.flatnonzero(self._pending_reset))
-      self._pending_reset[:] = False
 
     action = self._buffers.controller_action_view[self._env.t]
     # Decode policy buckets straight into the native action ring, and mirror the
@@ -309,9 +305,6 @@ class SimBatchedEnvironment:
 
   def _advance(self, controllers: Controllers) -> EnvOutput:
     self._ensure_cursor_room()
-    if np.any(self._pending_reset):
-      self.reset(np.flatnonzero(self._pending_reset))
-      self._pending_reset[:] = False
 
     action = self._buffers.controller_action_view[self._env.t]
     for player_index, port in enumerate(self._ports):
@@ -341,7 +334,6 @@ class SimBatchedEnvironment:
       _copy_controller_slice(self._last_controllers[port], neutral, ids, slice(None))
 
   def _reset_finished_lanes_for_next_observation(self, needs_reset: np.ndarray):
-    self._pending_reset[:] = False
     if np.any(needs_reset):
       self.reset(np.flatnonzero(needs_reset))
 
@@ -762,7 +754,6 @@ class _GameBatchBuffers:
   ):
     self.batch_size = int(batch_size)
     self.num_players = self.batch_size * 2
-    self._array_factory = array_factory
     self._include_items = bool(include_items)
     self.needs_reset = _make_array(array_factory, self.num_players, np.bool_)
     self._percent_tmp = np.zeros(self.batch_size, dtype=np.float32)

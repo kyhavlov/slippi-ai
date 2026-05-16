@@ -97,7 +97,6 @@ def worker_main(
     offset: int,
     length: int,
     max_game_frames: int,
-    fixed_steps: int,
     warmup_steps: int,
     character_pool: str,
     obs_specs: list[SharedArraySpec],
@@ -192,6 +191,7 @@ def worker_main(
             0,
             0,
             0,
+            0,
         )
         write_step_timings(step_timings, worker_id, 0.0, 0.0, 0.0)
         barrier_wait(
@@ -236,6 +236,7 @@ def worker_main(
           worker_id,
           done_count,
           stockout_count,
+          timeout_count,
           timeout_count,
       )
       write_step_timings(
@@ -314,9 +315,6 @@ def step_worker_with_shared_actions(
 ) -> tuple[np.ndarray, np.ndarray]:
   """Consume shared [all p1 actions, all p2 actions], step, and refill output."""
   env._ensure_cursor_room()
-  if np.any(env._pending_reset):
-    env.reset(np.flatnonzero(env._pending_reset))
-    env._pending_reset[:] = False
 
   action = env.buffers.controller_action_view[env.cursor]
   first = slice(offset, offset + batch_size)
@@ -396,12 +394,13 @@ def write_step_counters(
     done: int,
     stockout: int,
     timeout: int,
+    max_frame: int,
 ):
   base = int(worker_id) * 4
   counters[base] = int(done)
   counters[base + 1] = int(stockout)
   counters[base + 2] = int(timeout)
-  counters[base + 3] = int(timeout)
+  counters[base + 3] = int(max_frame)
 
 
 def write_step_timings(

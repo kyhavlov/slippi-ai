@@ -320,6 +320,7 @@ def _worker_main(
           done_count,
           stockout_count,
           timeout_count,
+          timeout_count,
       )
       multiprocess_env.barrier_wait(
           obs_barrier, barrier_timeout, f'worker {worker_id} observation release')

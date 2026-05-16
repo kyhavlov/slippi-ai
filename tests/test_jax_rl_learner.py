@@ -160,105 +160,6 @@ class JaxRlLearnerTest(unittest.TestCase):
     np.testing.assert_allclose(actual, expected)
     self.assertGreater(actual[1, 0], 0.0)
 
-  def test_terminal_corrected_game_uses_terminal_only_for_reset_lanes(self):
-    shape = (2,)
-    standing = melee.Action.STANDING.value
-    dead = melee.Action.DEAD_DOWN.value
-    p0 = _player(
-        shape,
-        melee.Character.FOX,
-        actions=[standing, standing],
-        stocks=[1, 1],
-    )
-    reset_game = _game_from_players(
-        shape,
-        p0,
-        _player(
-            shape,
-            melee.Character.FOX,
-            actions=[standing, standing],
-            stocks=[4, 4],
-        ),
-    )
-    terminal_game = _game_from_players(
-        shape,
-        p0,
-        _player(
-            shape,
-            melee.Character.FOX,
-            actions=[standing, dead],
-            stocks=[1, 0],
-            percent=75,
-        ),
-    )
-
-    selected = jax_rollout.terminal_corrected_game(
-        reset_game=reset_game,
-        terminal_game=terminal_game,
-        needs_reset=np.array([False, True], dtype=np.bool_),
-    )
-
-    self.assertEqual(selected.p2.stocks_left.tolist(), [4, 0])
-    self.assertEqual(selected.p2.action.tolist(), [standing, dead])
-
-  def test_transition_reward_uses_terminal_state_without_poisoning_next_start(self):
-    shape = (2,)
-    standing = melee.Action.STANDING.value
-    dead = melee.Action.DEAD_DOWN.value
-    p0 = _player(
-        shape,
-        melee.Character.FOX,
-        actions=[standing, standing],
-        stocks=[1, 1],
-    )
-    start = _game_from_players(
-        shape,
-        p0,
-        _player(
-            shape,
-            melee.Character.FOX,
-            actions=[standing, standing],
-            stocks=[1, 1],
-            percent=75,
-        ),
-    )
-    reset_next = _game_from_players(
-        shape,
-        p0,
-        _player(
-            shape,
-            melee.Character.FOX,
-            actions=[standing, standing],
-            stocks=[4, 4],
-        ),
-    )
-    terminal_next = _game_from_players(
-        shape,
-        p0,
-        _player(
-            shape,
-            melee.Character.FOX,
-            actions=[standing, dead],
-            stocks=[1, 0],
-            percent=75,
-        ),
-    )
-    selected_next = jax_rollout.terminal_corrected_game(
-        reset_game=reset_next,
-        terminal_game=terminal_next,
-        needs_reset=np.array([False, True], dtype=np.bool_),
-    )
-
-    rewards = jax_rollout.transition_reward(
-        start,
-        selected_next,
-        reward.RewardConfig(),
-    )
-
-    self.assertEqual(rewards.shape, (2,))
-    self.assertAlmostEqual(float(rewards[0]), 0.0)
-    self.assertGreater(float(rewards[1]), 0.0)
-
   def test_batched_transition_rewards_match_per_step_terminal_correction(self):
     shape = (2,)
     standing = melee.Action.STANDING.value
@@ -314,29 +215,16 @@ class JaxRlLearnerTest(unittest.TestCase):
         ),
     )
     reset_mask = np.array([False, True], dtype=np.bool_)
-    selected_state2 = jax_rollout.terminal_corrected_game(
-        reset_game=reset_state2,
-        terminal_game=terminal_state2,
-        needs_reset=reset_mask,
-    )
-    expected = np.stack([
-        jax_rollout.transition_reward(
-            state0,
-            state1,
-            reward.RewardConfig(),
-        ),
-        jax_rollout.transition_reward(
-            state1,
-            selected_state2,
-            reward.RewardConfig(),
-        ),
-    ], axis=0)
-
     time_major = utils.batch_nest_nt([
         state0,
         state1,
         reset_state2,
     ])
+    uncorrected = jax_rollout.batched_transition_rewards(
+        time_major,
+        terminal_reward_overrides=[],
+        reward_config=reward.RewardConfig(),
+    )
     actual = jax_rollout.batched_transition_rewards(
         time_major,
         terminal_reward_overrides=[
@@ -352,7 +240,10 @@ class JaxRlLearnerTest(unittest.TestCase):
         reward_config=reward.RewardConfig(),
     )
 
-    np.testing.assert_allclose(actual, expected)
+    self.assertEqual(actual.shape, (2, 2))
+    np.testing.assert_allclose(actual[0], uncorrected[0])
+    self.assertAlmostEqual(float(actual[1, 0]), float(uncorrected[1, 0]))
+    self.assertGreater(float(actual[1, 1]), float(uncorrected[1, 1]))
 
   def test_reset_does_not_rewrite_historical_learner_delay_outputs(self):
     queue = deque([

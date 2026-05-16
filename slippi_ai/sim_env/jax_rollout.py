@@ -140,7 +140,6 @@ class JaxSimRolloutWorker:
               self.length,
               self.max_game_frames,
               0,
-              0,
               self.character_pool,
               self._obs_owner.specs,
               self._terminal_obs_owner.specs,
@@ -658,13 +657,6 @@ def _build_trajectory(
   ), reward_done - reward_start
 
 
-def transition_reward(state, next_state, reward_config: reward_lib.RewardConfig):
-  transition = utils.batch_nest_nt([state, to_numpy_tree(next_state)])
-  return reward_lib.compute_rewards(
-      transition,
-      **dataclasses.asdict(reward_config))[0]
-
-
 @dataclasses.dataclass(frozen=True)
 class TerminalRewardOverride:
   transition_index: int
@@ -713,19 +705,6 @@ def batched_transition_rewards(
   return reward_lib.compute_rewards(
       transition_pairs,
       **dataclasses.asdict(reward_config))[0]
-
-
-def terminal_corrected_game(*, reset_game, terminal_game, needs_reset):
-  needs_reset = np.asarray(needs_reset, dtype=np.bool_)
-
-  def select(reset_leaf, terminal_leaf):
-    reset = needs_reset
-    reset_leaf = np.asarray(reset_leaf)
-    while reset.ndim < reset_leaf.ndim:
-      reset = reset[..., None]
-    return np.where(reset, np.asarray(terminal_leaf), reset_leaf)
-
-  return utils.map_nt(select, reset_game, terminal_game)
 
 
 def to_numpy_tree(value):
