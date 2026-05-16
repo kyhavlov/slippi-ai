@@ -9,6 +9,7 @@ from scripts import benchmark_jax_sim_rl
 from slippi_ai import data
 from slippi_ai import reward
 from slippi_ai import types
+from slippi_ai import utils
 from slippi_ai.controller_heads import SampleOutputs
 from slippi_ai.evaluators import Trajectory
 from slippi_ai.jax.rl import learner as jax_learner
@@ -257,6 +258,101 @@ class JaxRlLearnerTest(unittest.TestCase):
     self.assertEqual(rewards.shape, (2,))
     self.assertAlmostEqual(float(rewards[0]), 0.0)
     self.assertGreater(float(rewards[1]), 0.0)
+
+  def test_batched_transition_rewards_match_per_step_terminal_correction(self):
+    shape = (2,)
+    standing = melee.Action.STANDING.value
+    dead = melee.Action.DEAD_DOWN.value
+    p0 = _player(
+        shape,
+        melee.Character.FOX,
+        actions=[standing, standing],
+        stocks=[1, 1],
+    )
+    state0 = _game_from_players(
+        shape,
+        p0,
+        _player(
+            shape,
+            melee.Character.FOX,
+            actions=[standing, standing],
+            stocks=[1, 1],
+            percent=25,
+        ),
+    )
+    state1 = _game_from_players(
+        shape,
+        p0,
+        _player(
+            shape,
+            melee.Character.FOX,
+            actions=[standing, standing],
+            stocks=[1, 1],
+            percent=50,
+        ),
+    )
+    reset_state2 = _game_from_players(
+        shape,
+        p0,
+        _player(
+            shape,
+            melee.Character.FOX,
+            actions=[standing, standing],
+            stocks=[1, 4],
+            percent=0,
+        ),
+    )
+    terminal_state2 = _game_from_players(
+        shape,
+        p0,
+        _player(
+            shape,
+            melee.Character.FOX,
+            actions=[standing, dead],
+            stocks=[1, 0],
+            percent=75,
+        ),
+    )
+    reset_mask = np.array([False, True], dtype=np.bool_)
+    selected_state2 = benchmark_jax_sim_rl._terminal_corrected_game(
+        reset_game=reset_state2,
+        terminal_game=terminal_state2,
+        needs_reset=reset_mask,
+    )
+    expected = np.stack([
+        benchmark_jax_sim_rl._transition_reward(
+            state0,
+            state1,
+            reward.RewardConfig(),
+        ),
+        benchmark_jax_sim_rl._transition_reward(
+            state1,
+            selected_state2,
+            reward.RewardConfig(),
+        ),
+    ], axis=0)
+
+    time_major = utils.batch_nest_nt([
+        state0,
+        state1,
+        reset_state2,
+    ])
+    actual = benchmark_jax_sim_rl._batched_transition_rewards(
+        time_major,
+        terminal_reward_overrides=[
+            benchmark_jax_sim_rl._TerminalRewardOverride(
+                transition_index=1,
+                reset_mask=reset_mask,
+                terminal_game=benchmark_jax_sim_rl._masked_numpy_tree(
+                    terminal_state2,
+                    reset_mask,
+                ),
+            ),
+        ],
+        reward_config=reward.RewardConfig(),
+    )
+
+    np.testing.assert_allclose(actual, expected)
 
   def test_reset_does_not_rewrite_historical_learner_delay_outputs(self):
     queue = deque([

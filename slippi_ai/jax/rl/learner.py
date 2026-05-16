@@ -280,6 +280,11 @@ def group_record_axis(tree, scan_size: int):
       tree)
 
 
+def effective_record_scan_size(record_count: int, requested_scan_size: int) -> int:
+  """Cap requested scan size so one smaller record set can still use scan."""
+  return min(max(1, requested_scan_size), record_count)
+
+
 def flatten_batch_minibatch_axes(tree):
   """Flatten [ppo_batch, minibatch, ...] into one record axis."""
   return jax.tree.map(
@@ -473,6 +478,17 @@ class Learner(nnx.Module):
         Learner.unroll_ppo_batch_stacked_minibatch_value_grads)
     self.jit_unroll_ppo_batch_stacked_minibatch_value_grads = (
         jax_utils.cached_partial(jit_ppo_batch_unroll, self))
+
+    jit_single_minibatch_update_train_and_eval = nnx.jit(
+        Learner.ppo_single_equal_minibatch_update_train_and_eval)
+    self.jit_ppo_single_equal_minibatch_update_train_and_eval = (
+        jax_utils.cached_partial(
+            jit_single_minibatch_update_train_and_eval, self))
+
+    jit_single_minibatch_update_train = nnx.jit(
+        Learner.ppo_single_equal_minibatch_update_train)
+    self.jit_ppo_single_equal_minibatch_update_train = (
+        jax_utils.cached_partial(jit_single_minibatch_update_train, self))
 
     jit_equal_minibatch_update_train_and_eval = nnx.jit(
         Learner.ppo_equal_minibatch_update_train_and_eval)
@@ -1506,7 +1522,9 @@ class Learner(nnx.Module):
     value_metrics = utils.map_nt(
         lambda x: jnp.mean(x), learner_outputs.value.metrics)
 
-    scan_size = self._config.ppo.minibatch_scan_size
+    record_count = trajectories.rewards.shape[0] * trajectories.rewards.shape[1]
+    scan_size = effective_record_scan_size(
+        record_count, self._config.ppo.minibatch_scan_size)
     flat_outputs = flatten_batch_minibatch_axes(learner_outputs)
     flat_trajectories = flatten_batch_minibatch_axes(trajectories)
     chunked_outputs = group_record_axis(flat_outputs, scan_size)
@@ -1527,7 +1545,9 @@ class Learner(nnx.Module):
     value_metrics = utils.map_nt(
         lambda x: jnp.mean(x), learner_outputs.value.metrics)
 
-    scan_size = self._config.ppo.minibatch_scan_size
+    record_count = trajectories.rewards.shape[0] * trajectories.rewards.shape[1]
+    scan_size = effective_record_scan_size(
+        record_count, self._config.ppo.minibatch_scan_size)
     flat_outputs = flatten_batch_minibatch_axes(learner_outputs)
     flat_trajectories = flatten_batch_minibatch_axes(trajectories)
     chunked_outputs = group_record_axis(flat_outputs, scan_size)
@@ -1536,6 +1556,60 @@ class Learner(nnx.Module):
         chunked_outputs, chunked_trajectories)
     return hidden_state, value_metrics, train_metrics
 
+  def ppo_single_equal_minibatch_update_train_and_eval(
+      self,
+      trajectory_minibatches: Trajectory,
+      initial_state: LearnerState,
+  ) -> tuple[LearnerState, dict, dict, dict]:
+    """Run one PPO batch through the fused equal-minibatch update path."""
+    learner_outputs, hidden_state, value_metrics = (
+        self._unroll_single_equal_minibatch_value_update(
+            trajectory_minibatches, initial_state))
+    scan_size = effective_record_scan_size(
+        trajectory_minibatches.rewards.shape[0],
+        self._config.ppo.minibatch_scan_size)
+    chunked_outputs = group_record_axis(learner_outputs, scan_size)
+    chunked_trajectories = group_record_axis(trajectory_minibatches, scan_size)
+    train_metrics, final_metrics = self.ppo_chunked_minibatch_train_and_eval(
+        chunked_outputs, chunked_trajectories)
+    return hidden_state, value_metrics, train_metrics, final_metrics
+
+  def ppo_single_equal_minibatch_update_train(
+      self,
+      trajectory_minibatches: Trajectory,
+      initial_state: LearnerState,
+  ) -> tuple[LearnerState, dict, dict]:
+    """Run one PPO batch through the fused train-only equal-minibatch path."""
+    learner_outputs, hidden_state, value_metrics = (
+        self._unroll_single_equal_minibatch_value_update(
+            trajectory_minibatches, initial_state))
+    scan_size = effective_record_scan_size(
+        trajectory_minibatches.rewards.shape[0],
+        self._config.ppo.minibatch_scan_size)
+    chunked_outputs = group_record_axis(learner_outputs, scan_size)
+    chunked_trajectories = group_record_axis(trajectory_minibatches, scan_size)
+    train_metrics = self.ppo_chunked_minibatch_train(
+        chunked_outputs, chunked_trajectories)
+    return hidden_state, value_metrics, train_metrics
+
+  def _unroll_single_equal_minibatch_value_update(
+      self,
+      trajectory_minibatches: Trajectory,
+      initial_state: LearnerState,
+  ) -> tuple[LearnerOutputs, LearnerState, dict]:
+    state_minibatches = split_learner_state_minibatches(
+        initial_state, self._config.ppo.minibatch_size)
+    value_grads_sum, learner_outputs, final_states = (
+        self.unroll_stacked_minibatch_value_grads(
+            trajectory_minibatches, state_minibatches))
+    num_minibatches = trajectory_minibatches.rewards.shape[0]
+    value_grads = jax.tree.map(lambda g: g / num_minibatches, value_grads_sum)
+    self.value_optimizer.update(self.value_function, value_grads)
+    hidden_state = merge_learner_state_minibatches(final_states)
+    value_metrics = utils.map_nt(
+        lambda x: jnp.mean(x), learner_outputs.value.metrics)
+    return learner_outputs, hidden_state, value_metrics
+
   def build_equal_minibatch_chunks(
       self,
       learner_outputs: list[list[tuple[int, int, LearnerOutputs]]],
@@ -1543,7 +1617,7 @@ class Learner(nnx.Module):
       profile: dict | None = None,
   ) -> tuple[LearnerOutputs, Trajectory, int] | None:
     """Stack uniform minibatches into [chunk, scan, ...] trees if possible."""
-    scan_size = max(1, self._config.ppo.minibatch_scan_size)
+    requested_scan_size = max(1, self._config.ppo.minibatch_scan_size)
     minibatch_size = self._config.ppo.minibatch_size
     output_records = []
     trajectory_records = []
@@ -1564,7 +1638,10 @@ class Learner(nnx.Module):
       trajectory_records.append(split_trajectory)
 
     record_count = len(output_records)
-    if not output_records or record_count % scan_size:
+    if not output_records:
+      return None
+    scan_size = effective_record_scan_size(record_count, requested_scan_size)
+    if record_count % scan_size:
       return None
 
     stack_start = time.perf_counter()
@@ -1794,10 +1871,10 @@ class Learner(nnx.Module):
       profile: dict | None = None,
   ) -> tuple[LearnerState, dict, dict, dict, int, bool] | None:
     """Fast path for a full equal-minibatch PPO update."""
-    if len(trajectories) < 2:
+    if not trajectories:
       return None
     minibatch_size = self._config.ppo.minibatch_size
-    scan_size = max(1, self._config.ppo.minibatch_scan_size)
+    requested_scan_size = max(1, self._config.ppo.minibatch_scan_size)
     split_trajectories = []
     num_minibatches = None
     for trajectory in trajectories:
@@ -1815,28 +1892,43 @@ class Learner(nnx.Module):
     if num_minibatches is None:
       return None
     record_count = len(trajectories) * num_minibatches
+    scan_size = effective_record_scan_size(record_count, requested_scan_size)
     if record_count % scan_size:
       return None
 
-    stack_start = time.perf_counter()
-    stacked_trajectories = stack_trees(split_trajectories)
-    if profile is not None:
-      profile['equal_minibatch_stack_s'] += time.perf_counter() - stack_start
-
     update_start = time.perf_counter()
-    if evaluate_post_update:
-      hidden_state, value_metrics, epoch_metrics, final_metrics = (
-          self.jit_ppo_equal_minibatch_update_train_and_eval(
-              stacked_trajectories, initial_state))
-      ready = (hidden_state, value_metrics, epoch_metrics, final_metrics)
-      post_update_evaluated = True
+    if len(split_trajectories) == 1:
+      if evaluate_post_update:
+        hidden_state, value_metrics, epoch_metrics, final_metrics = (
+            self.jit_ppo_single_equal_minibatch_update_train_and_eval(
+                split_trajectories[0], initial_state))
+        ready = (hidden_state, value_metrics, epoch_metrics, final_metrics)
+        post_update_evaluated = True
+      else:
+        hidden_state, value_metrics, epoch_metrics = (
+            self.jit_ppo_single_equal_minibatch_update_train(
+                split_trajectories[0], initial_state))
+        final_metrics = epoch_metrics
+        ready = (hidden_state, value_metrics, epoch_metrics)
+        post_update_evaluated = False
     else:
-      hidden_state, value_metrics, epoch_metrics = (
-          self.jit_ppo_equal_minibatch_update_train(
-              stacked_trajectories, initial_state))
-      final_metrics = epoch_metrics
-      ready = (hidden_state, value_metrics, epoch_metrics)
-      post_update_evaluated = False
+      stack_start = time.perf_counter()
+      stacked_trajectories = stack_trees(split_trajectories)
+      if profile is not None:
+        profile['equal_minibatch_stack_s'] += time.perf_counter() - stack_start
+      if evaluate_post_update:
+        hidden_state, value_metrics, epoch_metrics, final_metrics = (
+            self.jit_ppo_equal_minibatch_update_train_and_eval(
+                stacked_trajectories, initial_state))
+        ready = (hidden_state, value_metrics, epoch_metrics, final_metrics)
+        post_update_evaluated = True
+      else:
+        hidden_state, value_metrics, epoch_metrics = (
+            self.jit_ppo_equal_minibatch_update_train(
+                stacked_trajectories, initial_state))
+        final_metrics = epoch_metrics
+        ready = (hidden_state, value_metrics, epoch_metrics)
+        post_update_evaluated = False
     if profile is not None:
       block_until_ready(ready)
       elapsed = time.perf_counter() - update_start

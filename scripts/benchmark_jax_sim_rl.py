@@ -811,7 +811,7 @@ def _collect_trajectory(
     barrier_timeout: float,
 ) -> tuple[Trajectory, dict]:
   states = []
-  rewards = []
+  terminal_reward_overrides = []
   actions = []
   resets = []
   timings = defaultdict(float)
@@ -871,16 +871,16 @@ def _collect_trajectory(
         obs_done = time.perf_counter()
 
         transition_state_start = time.perf_counter()
-        reward_next_state = _terminal_corrected_game(
-            reset_game=packed.game,
-            terminal_game=terminal_packed.game,
-            needs_reset=packed.needs_reset,
-        )
-        rewards.append(_transition_reward(
-            actor_state,
-            reward_next_state,
-            reward_config,
-        ))
+        next_reset_mask = np.asarray(packed.needs_reset, dtype=np.bool_).copy()
+        if np.any(next_reset_mask):
+          terminal_reward_overrides.append(_TerminalRewardOverride(
+              transition_index=len(states) - 1,
+              reset_mask=next_reset_mask,
+              terminal_game=_masked_numpy_tree(
+                  terminal_packed.game,
+                  next_reset_mask,
+              ),
+          ))
         transition_state_done = time.perf_counter()
 
         done, stockout, timeout, max_frame = benchmark_sim_mp._sum_step_counters(
@@ -964,10 +964,11 @@ def _collect_trajectory(
       learner_action_queue=learner_action_queue,
       dummy_outputs=dummy_outputs,
   )
-  trajectory = _build_trajectory(
+  trajectory, reward_compute_s = _build_trajectory(
       actor=actor,
       states=states,
-      rewards=rewards,
+      reward_config=reward_config,
+      terminal_reward_overrides=terminal_reward_overrides,
       actions=actions,
       resets=resets,
       initial_state=initial_state,
@@ -977,7 +978,9 @@ def _collect_trajectory(
       total_batch=total_batch,
   )
   final_state_done = time.perf_counter()
-  timings['trajectory_build_s'] += final_state_done - final_state_start
+  timings['terminal_reward_state_s'] += reward_compute_s
+  timings['trajectory_build_s'] += (
+      final_state_done - final_state_start - reward_compute_s)
   return trajectory, {
       'timings_sec': dict(timings),
       'counters': dict(counters),
@@ -988,7 +991,8 @@ def _build_trajectory(
     *,
     actor: jax_agents.BasicAgent,
     states: list,
-    rewards: list,
+    reward_config: reward_lib.RewardConfig,
+    terminal_reward_overrides: list['_TerminalRewardOverride'],
     actions: list,
     resets: list[np.ndarray],
     initial_state,
@@ -996,9 +1000,16 @@ def _build_trajectory(
     name_code: np.ndarray,
     rollout_length: int,
     total_batch: int,
-) -> Trajectory:
+) -> tuple[Trajectory, float]:
   time_major_states = utils.batch_nest_nt(states)
   encoded_states = actor._policy.network.encode_game(time_major_states)
+  reward_start = time.perf_counter()
+  rewards = _batched_transition_rewards(
+      time_major_states,
+      terminal_reward_overrides=terminal_reward_overrides,
+      reward_config=reward_config,
+  )
+  reward_done = time.perf_counter()
   return Trajectory(
       states=encoded_states,
       name=np.broadcast_to(
@@ -1006,17 +1017,67 @@ def _build_trajectory(
           [rollout_length + 1, total_batch * 2],
       ).copy(),
       actions=_batch_nest_jax(actions),
-      rewards=np.stack(rewards, axis=0),
+      rewards=rewards,
       is_resetting=np.stack(resets, axis=0),
       initial_state=initial_state,
       delayed_actions=delayed_actions,
-  )
+  ), reward_done - reward_start
 
 
 def _transition_reward(state, next_state, reward_config: reward_lib.RewardConfig):
   transition = utils.batch_nest_nt([state, _to_numpy_tree(next_state)])
   return reward_lib.compute_rewards(
       transition,
+      **dataclasses.asdict(reward_config))[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _TerminalRewardOverride:
+  transition_index: int
+  reset_mask: np.ndarray
+  terminal_game: object
+
+
+def _masked_numpy_tree(value, mask: np.ndarray):
+  mask = np.asarray(mask, dtype=np.bool_)
+  return utils.map_single_structure(lambda x: np.asarray(x)[mask].copy(), value)
+
+
+def _batched_transition_rewards(
+    time_major_states,
+    *,
+    terminal_reward_overrides: list[_TerminalRewardOverride],
+    reward_config: reward_lib.RewardConfig,
+) -> np.ndarray:
+  """Compute all per-transition rewards in one vectorized reward pass.
+
+  Terminal frames are only valid as the next frame for the transition that just
+  ended. The following transition must still start from the post-reset state, so
+  this builds a pair-shaped game: [current_or_seed, corrected_next] x T x B.
+  """
+
+  if terminal_reward_overrides:
+    terminal_games = [override.terminal_game
+                      for override in terminal_reward_overrides]
+
+    def pair_leaf(leaf, *terminal_leaves):
+      next_leaf = np.array(leaf[1:], copy=True)
+      for override, terminal_leaf in zip(
+          terminal_reward_overrides,
+          terminal_leaves,
+      ):
+        next_leaf[override.transition_index, override.reset_mask] = terminal_leaf
+      return np.stack([leaf[:-1], next_leaf], axis=0)
+
+    transition_pairs = utils.map_nt(pair_leaf, time_major_states, *terminal_games)
+  else:
+    transition_pairs = utils.map_single_structure(
+        lambda leaf: np.stack([leaf[:-1], leaf[1:]], axis=0),
+        time_major_states,
+    )
+
+  return reward_lib.compute_rewards(
+      transition_pairs,
       **dataclasses.asdict(reward_config))[0]
 
 

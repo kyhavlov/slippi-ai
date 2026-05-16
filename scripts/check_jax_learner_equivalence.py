@@ -33,6 +33,13 @@ def main():
       default=True,
       help='Compare fused minibatch PPO against the non-fused minibatch path.')
   parser.add_argument(
+      '--force-reference-fallback',
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          'When comparing minibatch paths, force the reference learner through '
+          'the older non-fused PPO epoch path.'))
+  parser.add_argument(
       '--check-controller-math',
       action='store_true',
       help='Compare fast controller reducers against reference embedding math.')
@@ -42,6 +49,8 @@ def main():
       default='float32')
   parser.add_argument('--length', type=int, default=64)
   parser.add_argument('--barrier-timeout', type=float, default=120.0)
+  parser.add_argument('--step', type=int, default=None,
+                      help='PPO step to check. Defaults to checkpoint step.')
   parser.add_argument('--atol', type=float, default=1e-4)
   parser.add_argument('--rtol', type=float, default=1e-4)
   args = parser.parse_args()
@@ -86,6 +95,8 @@ def main():
       sample_temperature=1.0,
       learner_param_dtype=args.learner_param_dtype,
   )
+  if args.compare_minibatch_paths and args.force_reference_fallback:
+    _disable_equal_minibatch_fast_paths(full)
   mini, _, _ = benchmark_jax_sim_rl._build_learner_and_actor(
       state=state,
       batch_size=total_packed,
@@ -101,7 +112,7 @@ def main():
 
   initial_full = full.initial_state(total_packed)
   initial_mini = mini.initial_state(total_packed)
-  step = int(state.get('step', 0))
+  step = args.step if args.step is not None else int(state.get('step', 0))
 
   controller_math_diff = None
   if args.check_controller_math:
@@ -132,6 +143,7 @@ def main():
       'controller_math_diff': controller_math_diff,
       'atol': args.atol,
       'rtol': args.rtol,
+      'step': step,
       'batch_size': args.batch_size,
       'total_player_batch_size': total_packed,
       'rollout_length': args.rollout_length,
@@ -141,6 +153,7 @@ def main():
       'minibatch_size': args.minibatch_size,
       'minibatch_scan_size': args.minibatch_scan_size,
       'compare_minibatch_paths': args.compare_minibatch_paths,
+      'force_reference_fallback': args.force_reference_fallback,
       'check_controller_math': args.check_controller_math,
       'learner_param_dtype': args.learner_param_dtype,
   }
@@ -362,11 +375,41 @@ def _tree_leaves(tree):
   return jax.tree_util.tree_leaves(tree)
 
 
+def _disable_equal_minibatch_fast_paths(learner):
+  learner.ppo_update_equal_minibatches = lambda *args, **kwargs: None
+  learner.build_equal_minibatch_chunks = lambda *args, **kwargs: None
+
+
+def _path_to_str(path):
+  parts = []
+  for entry in path:
+    key = getattr(entry, 'key', None)
+    if key is not None:
+      parts.append(str(key))
+      continue
+    idx = getattr(entry, 'idx', None)
+    if idx is not None:
+      parts.append(str(idx))
+      continue
+    name = getattr(entry, 'name', None)
+    if name is not None:
+      parts.append(str(name))
+      continue
+    parts.append(str(entry))
+  return '/'.join(parts)
+
+
 def _max_tree_diff(a, b):
   max_abs = 0.0
   max_rel = 0.0
+  max_abs_path = ''
+  max_rel_path = ''
+  max_abs_values = None
+  max_rel_values = None
   compared = 0
-  for left, right in zip(_tree_leaves(a), _tree_leaves(b), strict=True):
+  left_paths = jax.tree_util.tree_flatten_with_path(a)[0]
+  right_leaves = _tree_leaves(b)
+  for (path, left), right in zip(left_paths, right_leaves, strict=True):
     left = np.asarray(left)
     right = np.asarray(right)
     if left.shape != right.shape:
@@ -378,12 +421,27 @@ def _max_tree_diff(a, b):
     diff = np.abs(left - right)
     denom = np.maximum(np.maximum(np.abs(left), np.abs(right)), 1e-12)
     if diff.size:
-      max_abs = max(max_abs, float(np.max(diff)))
-      max_rel = max(max_rel, float(np.max(diff / denom)))
+      leaf_abs = float(np.max(diff))
+      leaf_rel = float(np.max(diff / denom))
+      if leaf_abs > max_abs:
+        max_abs = leaf_abs
+        max_abs_path = _path_to_str(path)
+        index = np.unravel_index(int(np.argmax(diff)), diff.shape)
+        max_abs_values = [float(left[index]), float(right[index])]
+      if leaf_rel > max_rel:
+        max_rel = leaf_rel
+        max_rel_path = _path_to_str(path)
+        rel = diff / denom
+        index = np.unravel_index(int(np.argmax(rel)), rel.shape)
+        max_rel_values = [float(left[index]), float(right[index])]
       compared += 1
   return {
       'max_abs_diff': max_abs,
       'max_rel_diff': max_rel,
+      'max_abs_path': max_abs_path,
+      'max_rel_path': max_rel_path,
+      'max_abs_values': max_abs_values,
+      'max_rel_values': max_rel_values,
       'leaves_compared': compared,
   }
 
