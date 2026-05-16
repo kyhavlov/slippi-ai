@@ -190,7 +190,7 @@ def _roll_sim_from_replay_inputs(replay: ReplayData) -> ReplayData:
       },
       length=max(128, length + 8),
       stage=replay.stage,
-      character_pairs=[replay.characters],
+      character_pool=replay.characters,
   )
   games = [[], []]
   try:

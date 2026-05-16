@@ -32,8 +32,7 @@ def main():
   parser.add_argument('--games', type=int, default=250)
   parser.add_argument('--length', type=int, default=128)
   parser.add_argument('--max-game-frames', type=int, default=28800)
-  parser.add_argument('--matchup', choices=sim_env.SUPPORTED_MATCHUPS,
-                      default='fox-falco')
+  parser.add_argument('--character-pool', default='fox,falco')
   parser.add_argument('--sample-temperature', type=float, default=1.0)
   parser.add_argument('--learner-param-dtype', choices=('float32', 'bfloat16'),
                       default='float32')
@@ -61,7 +60,7 @@ def main():
   result = {
       'model_a': args.model_a,
       'model_b': args.model_b,
-      'matchup': args.matchup,
+      'character_pool': args.character_pool,
       'rounds': summaries,
       'aggregate': _aggregate_rounds(summaries),
   }
@@ -81,13 +80,14 @@ def _run_round(
     a_port: int,
 ) -> dict:
   total_batch = args.workers * args.batch_size
-  total_packed = total_batch * 2
+  total_players = total_batch * 2
   ctx = mp.get_context('spawn')
 
   obs_owner = multiprocess_env.SharedArrayOwner()
-  packed = sim_env.make_packed_game_builder(total_batch, array_factory=obs_owner.array)
+  game_batch = sim_env.make_game_batch_buffers(
+      total_batch, array_factory=obs_owner.array)
   action_owner = multiprocess_env.SharedArrayOwner()
-  action = multiprocess_env.shared_encoded_controller(total_packed, action_owner.array)
+  action = multiprocess_env.shared_action_buffer(total_players, action_owner.array)
 
   obs_barrier = ctx.Barrier(args.workers + 1)
   action_barrier = ctx.Barrier(args.workers + 1)
@@ -108,7 +108,7 @@ def _run_round(
               offset,
               args.length,
               args.max_game_frames,
-              args.matchup,
+              args.character_pool,
               obs_owner.specs,
               action_owner.specs,
               controller_spacing,
@@ -143,15 +143,15 @@ def _run_round(
 
     while completed_games < args.games:
       policy_start = time.perf_counter()
-      reset_a = np.asarray(packed.needs_reset[a_slice], dtype=np.bool_)
-      reset_b = np.asarray(packed.needs_reset[b_slice], dtype=np.bool_)
+      reset_a = np.asarray(game_batch.needs_reset[a_slice], dtype=np.bool_)
+      reset_b = np.asarray(game_batch.needs_reset[b_slice], dtype=np.bool_)
       _reset_action_delay_queue(action_queue_a, agent_a, reset_a)
       _reset_action_delay_queue(action_queue_b, agent_b, reset_b)
       ctrl_a = agent_a.step_controller_state(
-          _slice_tree(packed.game, a_slice),
+          _slice_tree(game_batch.game, a_slice),
           reset_a)
       ctrl_b = agent_b.step_controller_state(
-          _slice_tree(packed.game, b_slice),
+          _slice_tree(game_batch.game, b_slice),
           reset_b)
       ctrl_a = _delay_action(action_queue_a, ctrl_a)
       ctrl_b = _delay_action(action_queue_b, ctrl_b)
@@ -230,7 +230,7 @@ def _worker_main(
     offset: int,
     length: int,
     max_game_frames: int,
-    matchup: str,
+    character_pool: str,
     obs_specs: list[multiprocess_env.SharedArraySpec],
     action_specs: list[multiprocess_env.SharedArraySpec],
     controller_spacing: tuple[int, int],
@@ -245,13 +245,14 @@ def _worker_main(
   action_attacher = multiprocess_env.SharedArrayAttacher(action_specs)
   env = None
   try:
-    packed = sim_env.make_packed_game_builder(
+    game_batch = sim_env.make_game_batch_buffers(
         total_batch,
         array_factory=obs_attacher.array,
     )
-    action = multiprocess_env.shared_encoded_controller(
+    action = multiprocess_env.shared_action_buffer(
         total_batch * 2, action_attacher.array)
-    p1_character, p2_character = sim_env.player_pair_for_matchup(matchup)
+    p1_character, p2_character = sim_env.character_assignments_for_pool(
+        character_pool, 1, offset)[0]
     env = sim_env.SimBatchedEnvironment(
         num_envs=batch_size,
         players={
@@ -260,12 +261,12 @@ def _worker_main(
         },
         length=length,
         stage=multiprocess_env.cycle_stages(batch_size, offset),
-        character_pairs=sim_env.character_pairs_for_matchup(
-            matchup, batch_size, offset),
+        character_pool=character_pool,
         max_frame_id=max_game_frames - 123,
     )
     env_slice = slice(offset, offset + batch_size)
-    packed.fill_slice(
+    post_step_frame = np.empty_like(env.buffers.gamestate_view[env.cursor])
+    game_batch.fill_slice(
         env.buffers.gamestate_view[env.cursor],
         np.ones(batch_size, dtype=np.bool_),
         env_slice,
@@ -290,7 +291,7 @@ def _worker_main(
         break
 
       step_start = time.perf_counter()
-      needs_reset, terminal = multiprocess_env.step_with_global_actions(
+      needs_reset, terminal = multiprocess_env.step_worker_with_shared_actions(
           env,
           action,
           total_batch=total_batch,
@@ -298,10 +299,11 @@ def _worker_main(
           batch_size=batch_size,
           max_frame_id=max_game_frames - 123,
           controller_spacing=controller_spacing,
+          post_step_frame_out=post_step_frame,
       )
       step_done = time.perf_counter()
-      _record_done_stats(env, needs_reset, terminal, stats)
-      packed.fill_slice(
+      _record_done_stats(post_step_frame, needs_reset, terminal, stats)
+      game_batch.fill_slice(
           env.buffers.gamestate_view[env.cursor],
           needs_reset,
           env_slice,
@@ -438,16 +440,21 @@ def _empty_port_stats() -> dict:
       'port1_wins': 0,
       'port2_wins': 0,
       'ties': 0,
+      'zero_zero_ties': 0,
+      'equal_nonzero_ties': 0,
+      'timeout_ties': 0,
       'port1_percent_sum': 0.0,
       'port2_percent_sum': 0.0,
       'frame_sum': 0.0,
       'stage_counts': Counter(),
       'character_pair_counts': Counter(),
+      'terminal_alive_counts': Counter(),
+      'terminal_stock_counts': Counter(),
   }
 
 
 def _record_done_stats(
-    env: sim_env.SimBatchedEnvironment,
+    post_step_frame: np.ndarray,
     needs_reset: np.ndarray,
     terminal: np.ndarray,
     stats: dict,
@@ -455,24 +462,34 @@ def _record_done_stats(
   done_ids = np.flatnonzero(needs_reset)
   if done_ids.size == 0:
     return
-  frame = env.buffers.gamestate_view[env._last_step_info.step_t]
-  p1 = _source_slot(frame, 0)
-  p2 = _source_slot(frame, 1)
+  p1 = _source_slot(post_step_frame, 0)
+  p2 = _source_slot(post_step_frame, 1)
   p1_stocks = p1['stocks'][done_ids]
   p2_stocks = p2['stocks'][done_ids]
   p1_percent = p1['percent'][done_ids]
   p2_percent = p2['percent'][done_ids]
+  terminal_done = terminal[done_ids]
+  ties = p1_stocks == p2_stocks
+  zero_zero_ties = np.logical_and(ties, p1_stocks == 0)
+  timeout_ties = np.logical_and(ties, terminal_done['max_frame_reached'] != 0)
   stats['games'] += int(done_ids.size)
   stats['port1_wins'] += int((p1_stocks > p2_stocks).sum())
   stats['port2_wins'] += int((p2_stocks > p1_stocks).sum())
-  stats['ties'] += int((p1_stocks == p2_stocks).sum())
+  stats['ties'] += int(ties.sum())
+  stats['zero_zero_ties'] += int(zero_zero_ties.sum())
+  stats['equal_nonzero_ties'] += int(
+      np.logical_and(ties, p1_stocks != 0).sum())
+  stats['timeout_ties'] += int(timeout_ties.sum())
   stats['port1_percent_sum'] += float(np.sum(p1_percent))
   stats['port2_percent_sum'] += float(np.sum(p2_percent))
   stats['frame_sum'] += float(np.sum(terminal['frame_id'][done_ids]))
-  stats['stage_counts'].update(map(int, frame['stage_id'][done_ids]))
+  stats['stage_counts'].update(map(int, post_step_frame['stage_id'][done_ids]))
   stats['character_pair_counts'].update(
       (int(a), int(b))
       for a, b in zip(p1['char_id'][done_ids], p2['char_id'][done_ids]))
+  stats['terminal_alive_counts'].update(map(int, terminal_done['alive_count']))
+  stats['terminal_stock_counts'].update(
+      (int(a), int(b)) for a, b in zip(p1_stocks, p2_stocks))
 
 
 def _source_slot(frame: np.ndarray, source_player: int) -> np.ndarray:
@@ -491,6 +508,9 @@ def _jsonable_port_stats(stats: dict) -> dict:
       'port1_wins': int(stats['port1_wins']),
       'port2_wins': int(stats['port2_wins']),
       'ties': int(stats['ties']),
+      'zero_zero_ties': int(stats['zero_zero_ties']),
+      'equal_nonzero_ties': int(stats['equal_nonzero_ties']),
+      'timeout_ties': int(stats['timeout_ties']),
       'port1_avg_end_percent': stats['port1_percent_sum'] / games,
       'port2_avg_end_percent': stats['port2_percent_sum'] / games,
       'avg_game_length_frames': stats['frame_sum'] / games,
@@ -498,6 +518,13 @@ def _jsonable_port_stats(stats: dict) -> dict:
       'character_pair_counts': {
           f'{k[0]}:{k[1]}': int(v)
           for k, v in stats['character_pair_counts'].items()
+      },
+      'terminal_alive_counts': {
+          str(k): int(v) for k, v in stats['terminal_alive_counts'].items()
+      },
+      'terminal_stock_counts': {
+          f'{k[0]}:{k[1]}': int(v)
+          for k, v in stats['terminal_stock_counts'].items()
       },
   }
 
@@ -512,6 +539,9 @@ def _combine_worker_stats(worker_results: list[dict]) -> dict:
     combined['port1_wins'] += stats['port1_wins']
     combined['port2_wins'] += stats['port2_wins']
     combined['ties'] += stats['ties']
+    combined['zero_zero_ties'] += stats.get('zero_zero_ties', 0)
+    combined['equal_nonzero_ties'] += stats.get('equal_nonzero_ties', 0)
+    combined['timeout_ties'] += stats.get('timeout_ties', 0)
     combined['port1_percent_sum'] += stats['port1_avg_end_percent'] * max(1, stats['games'])
     combined['port2_percent_sum'] += stats['port2_avg_end_percent'] * max(1, stats['games'])
     combined['frame_sum'] += stats['avg_game_length_frames'] * max(1, stats['games'])
@@ -519,6 +549,11 @@ def _combine_worker_stats(worker_results: list[dict]) -> dict:
     for key, value in stats['character_pair_counts'].items():
       a, b = key.split(':')
       combined['character_pair_counts'][(int(a), int(b))] += value
+    combined['terminal_alive_counts'].update({
+        int(k): v for k, v in stats.get('terminal_alive_counts', {}).items()})
+    for key, value in stats.get('terminal_stock_counts', {}).items():
+      a, b = key.split(':')
+      combined['terminal_stock_counts'][(int(a), int(b))] += value
   return _jsonable_port_stats(combined)
 
 
@@ -538,6 +573,9 @@ def _map_port_stats_to_models(port_stats: dict, a_port: int) -> dict:
       'model_a_wins': a_wins,
       'model_b_wins': b_wins,
       'ties': port_stats['ties'],
+      'zero_zero_ties': port_stats['zero_zero_ties'],
+      'equal_nonzero_ties': port_stats['equal_nonzero_ties'],
+      'timeout_ties': port_stats['timeout_ties'],
       'model_a_winrate': a_wins / games,
       'model_b_winrate': b_wins / games,
       'model_a_avg_end_percent': a_percent,
@@ -550,6 +588,9 @@ def _aggregate_rounds(rounds: list[dict]) -> dict:
   a_wins = 0
   b_wins = 0
   ties = 0
+  zero_zero_ties = 0
+  equal_nonzero_ties = 0
+  timeout_ties = 0
   timeouts = 0
   for item in rounds:
     stats = item['model_stats']
@@ -557,6 +598,9 @@ def _aggregate_rounds(rounds: list[dict]) -> dict:
     a_wins += stats['model_a_wins']
     b_wins += stats['model_b_wins']
     ties += stats['ties']
+    zero_zero_ties += stats['zero_zero_ties']
+    equal_nonzero_ties += stats['equal_nonzero_ties']
+    timeout_ties += stats['timeout_ties']
     timeouts += item['main_counters']['timeout']
   denom = max(1, games)
   return {
@@ -564,6 +608,9 @@ def _aggregate_rounds(rounds: list[dict]) -> dict:
       'model_a_wins': a_wins,
       'model_b_wins': b_wins,
       'ties': ties,
+      'zero_zero_ties': zero_zero_ties,
+      'equal_nonzero_ties': equal_nonzero_ties,
+      'timeout_ties': timeout_ties,
       'timeouts': timeouts,
       'model_a_winrate': a_wins / denom,
       'model_b_winrate': b_wins / denom,

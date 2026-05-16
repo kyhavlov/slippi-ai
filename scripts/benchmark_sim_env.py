@@ -8,7 +8,6 @@ from pathlib import Path
 import melee
 import numpy as np
 
-from slippi_ai import dolphin
 from slippi_ai import eval_lib
 from slippi_ai import sim_env
 from slippi_ai import utils
@@ -46,12 +45,9 @@ def main():
   stages = _cycle_stages(args.batch_size)
   env = sim_env.SimBatchedEnvironment(
       num_envs=args.batch_size,
-      players={
-          1: dolphin.AI(melee.Character.FOX),
-          2: dolphin.AI(melee.Character.FALCO),
-      },
       length=args.length,
       stage=stages,
+      character_pool='fox,falco',
       max_frame_id=args.max_game_frames - 123,
   )
 
@@ -70,7 +66,7 @@ def main():
   try:
     if args.fast_path:
       spacing = _default_controller_spacing(state)
-      output = env.current_packed_state(
+      output = env.current_game_batch(
           needs_reset=np.ones(args.batch_size, dtype=np.bool_))
       agent.step(output.game, output.needs_reset)
     else:
@@ -137,7 +133,7 @@ def main():
             axis_spacing=spacing[0],
             shoulder_spacing=spacing[1],
         )
-        output = env.current_packed_state(needs_reset=needs_reset)
+        output = env.current_game_batch(needs_reset=needs_reset)
       else:
         output = env.step(controllers)
       elapsed = time.perf_counter() - env_start

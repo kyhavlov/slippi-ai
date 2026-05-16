@@ -9,7 +9,6 @@ import tree
 
 from slippi_ai.sim_env import multiprocess_env
 from slippi_ai import data
-from slippi_ai import dolphin
 from slippi_ai import embed as tf_embed
 from slippi_ai import eval_lib
 from slippi_ai import sim_env
@@ -53,13 +52,9 @@ def main():
 
   env = sim_env.SimBatchedEnvironment(
       num_envs=args.batch_size,
-      players={
-          1: dolphin.AI(melee.Character.FOX),
-          2: dolphin.AI(melee.Character.FALCO),
-      },
       length=max(128, args.steps + 4),
       stage=stage,
-      character_pairs=sim_env.balanced_fox_falco_pairs(args.batch_size),
+      character_pool='fox,falco',
       max_frame_id=28800 - 123,
   )
 
@@ -71,15 +66,15 @@ def main():
   invalid_count = 0
 
   try:
-    packed = env.current_packed_state(
+    game_batch = env.current_game_batch(
         needs_reset=np.ones(args.batch_size, dtype=np.bool_))
     prev_controller = tf_agent._agent._prev_controller
     tf_hidden = tf_agent._agent.hidden_state
     jax_hidden = jax_agent._agent.hidden_state()
 
     for step in range(args.steps):
-      game = packed.game
-      needs_reset = packed.needs_reset
+      game = game_batch.game
+      needs_reset = game_batch.needs_reset
 
       tf_game = tf_agent._policy.embed_game.from_state(game)
       tf_state_action = tf_embed.StateAction(
@@ -119,7 +114,7 @@ def main():
           shoulder_spacing=spacing[1],
       )
       done_count += int(needs_reset.sum())
-      packed = env.current_packed_state(needs_reset=needs_reset)
+      game_batch = env.current_game_batch(needs_reset=needs_reset)
       prev_controller = utils.map_single_structure(
           lambda x: np.asarray(x), tf_sample.controller_state)
       tf_hidden = next_tf_hidden

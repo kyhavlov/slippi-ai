@@ -1,5 +1,6 @@
 import concurrent.futures
 import dataclasses
+import multiprocessing as mp
 import time
 from collections import defaultdict, deque
 
@@ -8,16 +9,250 @@ import jax.numpy as jnp
 import numpy as np
 
 from slippi_ai import reward as reward_lib
+from slippi_ai import sim_env
 from slippi_ai import utils
 from slippi_ai.evaluators import Trajectory
 from slippi_ai.jax import agents as jax_agents
 from slippi_ai.sim_env import multiprocess_env
 
 
+class JaxSimRolloutWorker:
+  """RolloutWorker-compatible wrapper around multiprocessing melee_sim shards.
+
+  The learner sees the same Trajectory shape as Dolphin rollouts. Internally,
+  worker processes own CPU sim batches while the main process owns JAX policy
+  inference and shared-memory action/observation buffers.
+  """
+
+  ports = (1, 2)
+
+  def __init__(
+      self,
+      *,
+      actor: jax_agents.BasicAgent,
+      total_batch: int,
+      worker_batch_size: int,
+      length: int,
+      max_game_frames: int,
+      character_pool: str,
+      controller_spacing: tuple[int, int],
+      name_code: np.ndarray,
+      reward_config: reward_lib.RewardConfig,
+      actor_step_chunk_size: int,
+      async_rollout_inference: bool,
+      initial_stagger_total_steps: int,
+      barrier_timeout: float = 900.0,
+      print_every: int = 0,
+  ):
+    if total_batch <= 0 or worker_batch_size <= 0:
+      raise ValueError('total_batch and worker_batch_size must be positive')
+    if total_batch % worker_batch_size:
+      raise ValueError(
+          f'total_batch={total_batch} must be divisible by worker_batch_size='
+          f'{worker_batch_size}')
+    self.actor = actor
+    self.total_batch = int(total_batch)
+    self.worker_batch_size = int(worker_batch_size)
+    self.workers = self.total_batch // self.worker_batch_size
+    self.length = int(length)
+    self.max_game_frames = int(max_game_frames)
+    self.character_pool = character_pool
+    self.controller_spacing = controller_spacing
+    self.name_code = np.asarray(name_code, dtype=np.int32)
+    self.reward_config = reward_config
+    self.actor_step_chunk_size = int(actor_step_chunk_size)
+    self.async_rollout_inference = bool(async_rollout_inference)
+    self.initial_stagger_total_steps = int(initial_stagger_total_steps)
+    self.stagger_steps_per_worker = stagger_steps_per_worker(
+        self.workers,
+        self.initial_stagger_total_steps,
+    )
+    self.barrier_timeout = float(barrier_timeout)
+    self.print_every = int(print_every)
+
+    self._ctx = mp.get_context('spawn')
+    self._processes = []
+    self._started = False
+
+  def start(self):
+    if self._started:
+      return
+    # Observation and action buffers live in shared memory. Workers write Game
+    # leaves in-place; the main process reads the same arrays for JAX inference.
+    self._obs_owner = multiprocess_env.SharedArrayOwner()
+    self.game_batch = sim_env.make_game_batch_buffers(
+        self.total_batch,
+        array_factory=self._obs_owner.array,
+    )
+    self._terminal_obs_owner = multiprocess_env.SharedArrayOwner()
+    self.terminal_game_batch = sim_env.make_game_batch_buffers(
+        self.total_batch,
+        array_factory=self._terminal_obs_owner.array,
+    )
+    self._action_owner = multiprocess_env.SharedArrayOwner()
+    self.action = multiprocess_env.shared_action_buffer(
+        self.total_batch * 2,
+        self._action_owner.array,
+    )
+    self._obs_barrier = self._ctx.Barrier(self.workers + 1)
+    self._action_barrier = self._ctx.Barrier(self.workers + 1)
+    self._stop_event = self._ctx.Event()
+    self._step_counters = self._ctx.Array('i', self.workers * 4, lock=False)
+    self._step_timings = self._ctx.Array('d', self.workers * 3, lock=False)
+    self._active_worker_count = self._ctx.Value(
+        'i',
+        1 if self.stagger_steps_per_worker > 0 else self.workers,
+        lock=False,
+    )
+    self._measure_worker_steps = self._ctx.Value(
+        'b',
+        self.stagger_steps_per_worker == 0,
+        lock=False,
+    )
+    self._result_queue = self._ctx.Queue()
+    self._processes = []
+
+    for worker_id in range(self.workers):
+      offset = worker_id * self.worker_batch_size
+      process = self._ctx.Process(
+          target=multiprocess_env.worker_main,
+          args=(
+              worker_id,
+              self.worker_batch_size,
+              self.total_batch,
+              offset,
+              self.length,
+              self.max_game_frames,
+              0,
+              0,
+              self.character_pool,
+              self._obs_owner.specs,
+              self._terminal_obs_owner.specs,
+              self._action_owner.specs,
+              self.controller_spacing,
+              self._obs_barrier,
+              self._action_barrier,
+              self._stop_event,
+              self._step_counters,
+              self._step_timings,
+              self.barrier_timeout,
+              self._result_queue,
+              self._active_worker_count,
+              self._measure_worker_steps,
+          ),
+      )
+      process.start()
+      self._processes.append(process)
+
+    dummy_outputs = self.actor._policy.controller_head.dummy_sample_outputs(
+        [self.total_batch * 2])
+    self._dummy_outputs = dummy_outputs
+    # Model delay is represented by two queues: controller states for the env and
+    # full sampled outputs for PPO old-policy data. They reset differently.
+    self._env_action_queue = deque(
+        [to_numpy_tree(dummy_outputs.controller_state)
+         for _ in range(self.actor._policy.delay)])
+    self._learner_action_queue = deque(
+        [to_numpy_tree(dummy_outputs)
+         for _ in range(self.actor._policy.delay + 1)])
+
+    multiprocess_env.barrier_wait(
+        self._obs_barrier,
+        self.barrier_timeout,
+        'initial observations',
+    )
+    self.initial_stagger = run_initial_stagger_warmup(
+        actor=self.actor,
+        game_batch=self.game_batch,
+        action=self.action,
+        env_action_queue=self._env_action_queue,
+        learner_action_queue=self._learner_action_queue,
+        dummy_outputs=self._dummy_outputs,
+        active_worker_count=self._active_worker_count,
+        measure_worker_steps=self._measure_worker_steps,
+        action_barrier=self._action_barrier,
+        obs_barrier=self._obs_barrier,
+        step_counters=self._step_counters,
+        step_timings=self._step_timings,
+        workers=self.workers,
+        stagger_steps=self.stagger_steps_per_worker,
+        total_batch=self.total_batch,
+        controller_spacing=self.controller_spacing,
+        barrier_timeout=self.barrier_timeout,
+        print_every=self.print_every,
+    )
+    self._started = True
+
+  def reset_env(self):
+    self.stop()
+    self.start()
+
+  def update_variables(self, updates):
+    del updates
+
+  def rollout(self, num_steps: int) -> tuple[Trajectory, dict]:
+    trajectory, stats = collect_trajectory(
+        actor=self.actor,
+        game_batch=self.game_batch,
+        terminal_game_batch=self.terminal_game_batch,
+        action=self.action,
+        env_action_queue=self._env_action_queue,
+        learner_action_queue=self._learner_action_queue,
+        dummy_outputs=self._dummy_outputs,
+        action_barrier=self._action_barrier,
+        obs_barrier=self._obs_barrier,
+        step_counters=self._step_counters,
+        step_timings=self._step_timings,
+        workers=self.workers,
+        total_batch=self.total_batch,
+        rollout_length=num_steps,
+        actor_step_chunk_size=self.actor_step_chunk_size,
+        async_rollout_inference=self.async_rollout_inference,
+        controller_spacing=self.controller_spacing,
+        name_code=self.name_code,
+        reward_config=self.reward_config,
+        barrier_timeout=self.barrier_timeout,
+    )
+    return trajectory, {
+        'timing': {
+            'sim': timing_summary(stats['timings_sec']),
+        },
+        'counters': stats['counters'],
+    }
+
+  def stop(self):
+    if not self._started:
+      return
+    self._stop_event.set()
+    try:
+      self._action_barrier.abort()
+    except Exception:
+      pass
+    for process in self._processes:
+      if process.is_alive():
+        process.terminate()
+      process.join(timeout=1.0)
+    self._obs_owner.close()
+    self._terminal_obs_owner.close()
+    self._action_owner.close()
+    self._obs_owner.unlink()
+    self._terminal_obs_owner.unlink()
+    self._action_owner.unlink()
+    self._processes = []
+    self._started = False
+
+
 def initial_stagger_total_steps(workers: int, stagger_steps: int) -> int:
   if stagger_steps <= 0:
     return 0
   return int(workers) * int(stagger_steps)
+
+
+def stagger_steps_per_worker(workers: int, total_steps: int) -> int:
+  if total_steps <= 0:
+    return 0
+  workers = int(workers)
+  return max(1, (int(total_steps) + workers - 1) // workers)
 
 
 def active_workers_for_stagger_step(
@@ -33,7 +268,7 @@ def active_workers_for_stagger_step(
 def run_initial_stagger_warmup(
     *,
     actor: jax_agents.BasicAgent,
-    packed,
+    game_batch,
     action,
     env_action_queue: deque,
     learner_action_queue: deque,
@@ -51,6 +286,9 @@ def run_initial_stagger_warmup(
     barrier_timeout: float,
     print_every: int,
 ) -> dict:
+  # Activating workers gradually avoids every game starting from the exact same
+  # opening frame distribution. The inactive workers still synchronize on the
+  # barriers, so the main rollout loop does not need a separate startup path.
   total_steps = initial_stagger_total_steps(workers, stagger_steps)
   if total_steps == 0:
     active_worker_count.value = workers
@@ -69,7 +307,7 @@ def run_initial_stagger_warmup(
     active_env_steps += active * (total_batch // workers)
 
     reset_start = time.perf_counter()
-    reset_mask = np.asarray(packed.needs_reset, dtype=np.bool_)
+    reset_mask = np.asarray(game_batch.needs_reset, dtype=np.bool_)
     if np.any(reset_mask):
       reset_delay_queues(
           env_action_queue=env_action_queue,
@@ -80,14 +318,14 @@ def run_initial_stagger_warmup(
     reset_done = time.perf_counter()
 
     policy_start = time.perf_counter()
-    sample_outputs = actor.step_device(packed.game, packed.needs_reset)
+    sample_outputs = actor.step_device(game_batch.game, game_batch.needs_reset)
     policy_done = time.perf_counter()
     env_action_queue.append(to_numpy_tree(sample_outputs.controller_state))
     delayed_controller = env_action_queue.popleft()
     learner_action_queue.append(sample_outputs)
     learner_action_queue.popleft()
 
-    invalid = multiprocess_env.copy_controller(
+    invalid = multiprocess_env.copy_action_to_shared_buffer(
         action, delayed_controller, controller_spacing)
     action_done = time.perf_counter()
     multiprocess_env.barrier_wait(
@@ -159,8 +397,8 @@ def timing_summary(timings: dict) -> dict:
 def collect_trajectory(
     *,
     actor: jax_agents.BasicAgent,
-    packed,
-    terminal_packed,
+    game_batch,
+    terminal_game_batch,
     action,
     env_action_queue: deque,
     learner_action_queue: deque,
@@ -179,6 +417,7 @@ def collect_trajectory(
     reward_config: reward_lib.RewardConfig,
     barrier_timeout: float,
 ) -> tuple[Trajectory, dict]:
+  """Collect one rollout while preserving policy delay and terminal rewards."""
   states = []
   terminal_reward_overrides = []
   actions = []
@@ -201,8 +440,10 @@ def collect_trajectory(
 
       for _ in range(chunk_len):
         state_start = time.perf_counter()
-        actor_state = to_numpy_tree(packed.game)
-        reset_mask = np.asarray(packed.needs_reset, dtype=np.bool_).copy()
+        # Snapshot only the leaf arrays. The shared Game buffers are immediately
+        # reused by workers for the next observation.
+        actor_state = to_numpy_tree(game_batch.game)
+        reset_mask = np.asarray(game_batch.needs_reset, dtype=np.bool_).copy()
         states.append(actor_state)
         resets.append(reset_mask)
         chunk_inputs.append((actor_state, reset_mask))
@@ -229,7 +470,7 @@ def collect_trajectory(
         actions.append(learner_action)
 
         action_start = time.perf_counter()
-        invalid = multiprocess_env.copy_controller(
+        invalid = multiprocess_env.copy_action_to_shared_buffer(
             action, delayed_controller, controller_spacing)
         action_done = time.perf_counter()
         multiprocess_env.barrier_wait(
@@ -240,13 +481,16 @@ def collect_trajectory(
         obs_done = time.perf_counter()
 
         transition_state_start = time.perf_counter()
-        next_reset_mask = np.asarray(packed.needs_reset, dtype=np.bool_).copy()
+        next_reset_mask = np.asarray(game_batch.needs_reset, dtype=np.bool_).copy()
         if np.any(next_reset_mask):
+          # The worker resets lanes before the next observation is exposed.
+          # Reward for the transition that just ended must use the pre-reset
+          # post-step terminal frame instead.
           terminal_reward_overrides.append(TerminalRewardOverride(
               transition_index=len(states) - 1,
               reset_mask=next_reset_mask,
               terminal_game=masked_numpy_tree(
-                  terminal_packed.game,
+                  terminal_game_batch.game,
                   next_reset_mask,
               ),
           ))
@@ -274,6 +518,9 @@ def collect_trajectory(
 
       if policy_executor is None:
         policy_start = time.perf_counter()
+        # Batch several sequential actor steps into one compiled call. This
+        # reduces Python/JAX launch overhead but still replays delay-queue reset
+        # effects so the visible action stream matches single-step rollout.
         if chunk_len == 1:
           sample_outputs_list = [
               actor.step_device(chunk_inputs[0][0], chunk_inputs[0][1])]
@@ -325,8 +572,8 @@ def collect_trajectory(
       policy_executor.shutdown(wait=True)
 
   final_state_start = time.perf_counter()
-  states.append(to_numpy_tree(packed.game))
-  resets.append(np.asarray(packed.needs_reset, dtype=np.bool_).copy())
+  states.append(to_numpy_tree(game_batch.game))
+  resets.append(np.asarray(game_batch.needs_reset, dtype=np.bool_).copy())
   actions.append(_resolve_learner_action_entry(learner_action_queue[0]))
   _resolve_delay_queues(
       env_action_queue=env_action_queue,
@@ -370,6 +617,8 @@ def _build_trajectory(
     rollout_length: int,
     total_batch: int,
 ) -> tuple[Trajectory, float]:
+  # Encode observations and compute rewards after rollout collection, rather
+  # than once per frame, to keep the CPU stepping loop focused on env progress.
   time_major_states = utils.batch_nest_nt(states)
   encoded_states = actor._policy.network.encode_game(time_major_states)
   reward_start = time.perf_counter()

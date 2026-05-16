@@ -37,8 +37,22 @@ class SimEnvTest(unittest.TestCase):
       self.assertTrue(np.all(initial.gamestates[1].p1.on_ground))
       self.assertTrue(np.all(initial.gamestates[1].p1.facing))
       self.assertTrue(np.all(initial.gamestates[1].p1.shield_strength == 60.0))
-      self.assertTrue(np.all(initial.gamestates[1].p0.character == melee.Character.FOX.value))
-      self.assertTrue(np.all(initial.gamestates[1].p2.character == melee.Character.FALCO.value))
+      self.assertEqual(
+          initial.gamestates[1].p0.character.tolist(),
+          [
+              melee.Character.FOX.value,
+              melee.Character.FALCO.value,
+              melee.Character.FALCO.value,
+          ],
+      )
+      self.assertEqual(
+          initial.gamestates[1].p2.character.tolist(),
+          [
+              melee.Character.FALCO.value,
+              melee.Character.FOX.value,
+              melee.Character.FALCO.value,
+          ],
+      )
       self.assertTrue(np.all(initial.gamestates[1].p0.jumps_left == 1))
       self.assertFalse(np.any(initial.gamestates[1].items.item_0.exists))
       self.assertTrue(np.all(initial.gamestates[2].p0.character == melee.Character.FALCO.value))
@@ -91,7 +105,7 @@ class SimEnvTest(unittest.TestCase):
       env.step(controllers)
 
       env.reset([1])
-      state = env.current_packed_state(
+      state = env.current_game_batch(
           needs_reset=np.array([False, True], dtype=np.bool_))
 
       self.assertTrue(np.allclose(state.game.p0.controller.main_stick.x, [
@@ -135,34 +149,77 @@ class SimEnvTest(unittest.TestCase):
   def test_default_supported_stage_pool_excludes_fountain(self):
     self.assertNotIn(melee.Stage.FOUNTAIN_OF_DREAMS, sim_env.supported_stages())
 
-  def test_per_env_character_pairs(self):
-    pairs = sim_env.balanced_fox_falco_pairs(4)
+  def test_per_env_character_pool(self):
     env = self._sim_env(
         num_envs=4,
         length=8,
-        character_pairs=pairs,
+        character_pool='fox,falco',
     )
     try:
-      state = env.current_packed_state(
+      state = env.current_game_batch(
           needs_reset=np.ones(4, dtype=np.bool_))
       self.assertEqual(
           state.game.p0.character[:4].tolist(),
           [
               melee.Character.FOX.value,
-              melee.Character.FALCO.value,
               melee.Character.FOX.value,
+              melee.Character.FALCO.value,
               melee.Character.FALCO.value,
           ],
       )
       self.assertEqual(
           state.game.p0.character[4:].tolist(),
           [
-              melee.Character.FALCO.value,
               melee.Character.FOX.value,
               melee.Character.FALCO.value,
               melee.Character.FOX.value,
+              melee.Character.FALCO.value,
           ],
       )
+    finally:
+      env.stop()
+
+  def test_character_pool_assignments_cover_ordered_matrix(self):
+    assignments = sim_env.character_assignments_for_pool('fox,falco', 5)
+    self.assertEqual(assignments, (
+        (melee.Character.FOX, melee.Character.FOX),
+        (melee.Character.FOX, melee.Character.FALCO),
+        (melee.Character.FALCO, melee.Character.FOX),
+        (melee.Character.FALCO, melee.Character.FALCO),
+        (melee.Character.FOX, melee.Character.FOX),
+    ))
+    self.assertEqual(
+        sim_env.character_assignments_for_pool('fox', 2),
+        (
+            (melee.Character.FOX, melee.Character.FOX),
+            (melee.Character.FOX, melee.Character.FOX),
+        ),
+    )
+
+  def test_character_pool_rejects_unsupported_characters(self):
+    with self.assertRaises(ValueError):
+      sim_env.character_assignments_for_pool('fox,peach', 2)
+
+  def test_character_pool_assignment_stays_fixed_on_reset(self):
+    env = self._sim_env(
+        num_envs=1,
+        length=8,
+        character_pool='fox,falco',
+    )
+    try:
+      state = env.current_game_batch(np.ones(1, dtype=np.bool_))
+      self.assertEqual(state.game.p0.character.tolist(), [
+          melee.Character.FOX.value,
+          melee.Character.FOX.value,
+      ])
+
+      state = env.reset([0]).gamestates[1]
+      self.assertEqual(state.p0.character.tolist(), [melee.Character.FOX.value])
+      self.assertEqual(state.p2.character.tolist(), [melee.Character.FOX.value])
+
+      state = env.reset([0]).gamestates[1]
+      self.assertEqual(state.p0.character.tolist(), [melee.Character.FOX.value])
+      self.assertEqual(state.p2.character.tolist(), [melee.Character.FOX.value])
     finally:
       env.stop()
 
@@ -195,14 +252,26 @@ class SimEnvTest(unittest.TestCase):
         length=8,
     )
     try:
-      state = env.current_packed_state(
+      state = env.current_game_batch(
           needs_reset=np.ones(2, dtype=np.bool_))
       self.assertEqual(state.needs_reset.shape, (4,))
       self.assertEqual(state.game.p0.x.shape, (4,))
-      self.assertTrue(np.all(state.game.p0.character[:2] == melee.Character.FOX.value))
-      self.assertTrue(np.all(state.game.p0.character[2:] == melee.Character.FALCO.value))
-      self.assertTrue(np.all(state.game.p2.character[:2] == melee.Character.FALCO.value))
-      self.assertTrue(np.all(state.game.p2.character[2:] == melee.Character.FOX.value))
+      self.assertEqual(state.game.p0.character[:2].tolist(), [
+          melee.Character.FOX.value,
+          melee.Character.FALCO.value,
+      ])
+      self.assertEqual(state.game.p0.character[2:].tolist(), [
+          melee.Character.FALCO.value,
+          melee.Character.FOX.value,
+      ])
+      self.assertEqual(state.game.p2.character[:2].tolist(), [
+          melee.Character.FALCO.value,
+          melee.Character.FOX.value,
+      ])
+      self.assertEqual(state.game.p2.character[2:].tolist(), [
+          melee.Character.FOX.value,
+          melee.Character.FALCO.value,
+      ])
 
       encoded = _neutral_encoded_controller(batch_size=4)
       needs_reset = env.step_encoded(
@@ -211,7 +280,7 @@ class SimEnvTest(unittest.TestCase):
           shoulder_spacing=4,
       )
       self.assertEqual(needs_reset.shape, (2,))
-      next_state = env.current_packed_state(needs_reset=needs_reset)
+      next_state = env.current_game_batch(needs_reset=needs_reset)
       self.assertEqual(next_state.game.p0.x.shape, (4,))
     finally:
       env.stop()
