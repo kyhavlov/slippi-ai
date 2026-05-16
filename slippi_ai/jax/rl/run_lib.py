@@ -427,18 +427,16 @@ def run(config: Config):
 
     main_chars = [None] if config.agent.char is None else config.agent.char
     opp_chars_list = [None] if opponent_chars is None else opponent_chars
-
     char_combinations = list(itertools.product(main_chars, opp_chars_list))
     char_combination_batch = list(itertools.islice(
         itertools.cycle(char_combinations), batch_size))
 
-    main_agent_chars, opp_agent_chars = zip(*char_combination_batch)
-    for player, main_char, opp_char in zip(
-        opponent_players, main_agent_chars, opp_agent_chars):
+    for main_player, opponent_player, (main_char, opp_char) in zip(
+        main_players, opponent_players, char_combination_batch):
       if main_char is not None:
-        player.character = main_char
+        main_player.character = main_char
       if opp_char is not None:
-        player.character = opp_char
+        opponent_player.character = opp_char
 
   if config.actor.env_backend == 'sim':
     if not config.opponent.should_train():
