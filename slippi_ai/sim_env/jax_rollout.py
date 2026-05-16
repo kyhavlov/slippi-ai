@@ -1,3 +1,19 @@
+"""JAX rollout assembly on top of multiprocessing sim workers.
+
+`JaxSimRolloutWorker` is the object that lets the normal JAX RL training loop
+use melee-sim-light instead of Dolphin. It starts the worker processes from
+`multiprocess_env.py`, keeps the policy delay queues, runs batched JAX inference
+from shared observations, writes delayed controller actions back to shared
+memory, and converts each rollout window into the same `Trajectory` shape the
+learner already consumes.
+
+The implementation is deliberately split from both `env.py` and the learner:
+`env.py` handles one process worth of native sim state, `multiprocess_env.py`
+handles shared-memory worker coordination, and this module owns rollout-level
+concerns such as startup staggering, terminal reward correction, async policy
+stepping, and the old-policy sample data needed by PPO.
+"""
+
 import concurrent.futures
 import dataclasses
 import multiprocessing as mp

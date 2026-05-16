@@ -1,3 +1,18 @@
+"""Multiprocessing support for CPU sim shards.
+
+The main JAX process owns policy inference and allocates shared-memory
+observation/action arrays. Each worker process attaches to those arrays, owns a
+single `SimBatchedEnvironment` shard, and synchronizes with the main process
+through barriers: wait for actions, step the shard, write the next observations,
+then release the main process to run another policy batch.
+
+This file intentionally stays below the RL layer. It knows how to allocate and
+attach shared arrays, decode shared policy actions into worker-local env steps,
+cycle supported stages across lanes, and report timing/counter data. It does not
+own learner logic, reward construction, or checkpoint handling; `jax_rollout.py`
+builds those pieces around these workers.
+"""
+
 import dataclasses
 import time
 import traceback

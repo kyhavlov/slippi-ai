@@ -1,3 +1,20 @@
+"""Single-process melee-sim-light environment adapter.
+
+This module is the direct bridge from `melee_sim.EnvBatch` native buffers to the
+slippi-ai `Game`/`Controller` structures used by policies. It owns the Python
+API for a batched sim env, including stage and character-pool setup, reset
+handling, terminal side-channel views, and conversion from native SoA buffers to
+the libmelee-shaped observation nest.
+
+There are two use modes. `current_state`/`step` preserve the familiar
+port-keyed Dolphin env interface for tests and small tools. The high-throughput
+path uses `current_game_batch` and `step_encoded`: one reusable `GameBatch`
+stores all p1 perspectives followed by all p2 perspectives, and policy action
+buckets are decoded straight into the native action ring. That path avoids
+rebuilding Python game objects during rollout and is what the JAX sim pipeline
+uses.
+"""
+
 import collections
 import contextlib
 import dataclasses
