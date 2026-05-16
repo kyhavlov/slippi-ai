@@ -8,8 +8,9 @@ from pathlib import Path
 import jax
 import numpy as np
 
-from scripts import benchmark_jax_sim_rl
-from scripts import benchmark_sim_mp
+from slippi_ai.jax.rl import build as rl_build
+from slippi_ai.sim_env import multiprocess_env
+from slippi_ai.sim_env import jax_rollout
 from slippi_ai import data
 from slippi_ai import eval_lib
 from slippi_ai import sim_env
@@ -83,7 +84,7 @@ def main():
       if args.minibatch_size > 0 else 1)
   full_minibatch_size = args.minibatch_size if args.compare_minibatch_paths else 0
   full_scan_size = fallback_scan_size if args.compare_minibatch_paths else 1
-  full, _, _ = benchmark_jax_sim_rl._build_learner_and_actor(
+  full, _, _ = rl_build.build_learner_and_actor(
       state=state,
       batch_size=total_packed,
       ppo_batches=args.ppo_batches,
@@ -97,7 +98,7 @@ def main():
   )
   if args.compare_minibatch_paths and args.force_reference_fallback:
     _disable_equal_minibatch_fast_paths(full)
-  mini, _, _ = benchmark_jax_sim_rl._build_learner_and_actor(
+  mini, _, _ = rl_build.build_learner_and_actor(
       state=state,
       batch_size=total_packed,
       ppo_batches=args.ppo_batches,
@@ -175,15 +176,15 @@ def _collect_trajectories(
 ):
   ctx = mp.get_context('spawn')
   total_packed = batch_size * 2
-  obs_owner = benchmark_sim_mp.SharedArrayOwner()
+  obs_owner = multiprocess_env.SharedArrayOwner()
   packed = sim_env.make_packed_game_builder(batch_size, array_factory=obs_owner.array)
-  terminal_obs_owner = benchmark_sim_mp.SharedArrayOwner()
+  terminal_obs_owner = multiprocess_env.SharedArrayOwner()
   terminal_packed = sim_env.make_packed_game_builder(
       batch_size, array_factory=terminal_obs_owner.array)
-  action_owner = benchmark_sim_mp.SharedArrayOwner()
-  action = benchmark_sim_mp._shared_encoded_controller(
+  action_owner = multiprocess_env.SharedArrayOwner()
+  action = multiprocess_env.shared_encoded_controller(
       total_packed, action_owner.array)
-  spacing = benchmark_sim_mp._default_controller_spacing(state)
+  spacing = multiprocess_env.default_controller_spacing(state)
   obs_barrier = ctx.Barrier(2)
   action_barrier = ctx.Barrier(2)
   stop_event = ctx.Event()
@@ -194,7 +195,7 @@ def _collect_trajectories(
 
   try:
     process = ctx.Process(
-        target=benchmark_sim_mp._worker_main,
+        target=multiprocess_env.worker_main,
         args=(
             0,
             batch_size,
@@ -220,7 +221,7 @@ def _collect_trajectories(
     )
     process.start()
 
-    collect_learner, actor, name_code = benchmark_jax_sim_rl._build_learner_and_actor(
+    collect_learner, actor, name_code = rl_build.build_learner_and_actor(
         state=state,
         batch_size=total_packed,
         ppo_batches=1,
@@ -234,17 +235,17 @@ def _collect_trajectories(
     )
     dummy_outputs = actor._policy.controller_head.dummy_sample_outputs([total_packed])
     env_action_queue = deque(
-        [benchmark_jax_sim_rl._to_numpy_tree(dummy_outputs.controller_state)
+        [jax_rollout.to_numpy_tree(dummy_outputs.controller_state)
          for _ in range(actor._policy.delay)])
     learner_action_queue = deque(
-        [benchmark_jax_sim_rl._to_numpy_tree(dummy_outputs)
+        [jax_rollout.to_numpy_tree(dummy_outputs)
          for _ in range(actor._policy.delay + 1)])
 
-    benchmark_sim_mp._barrier_wait(
+    multiprocess_env.barrier_wait(
         obs_barrier, barrier_timeout, 'initial observations')
     trajectories = []
     for _ in range(ppo_batches):
-      trajectory, _ = benchmark_jax_sim_rl._collect_trajectory(
+      trajectory, _ = jax_rollout.collect_trajectory(
           actor=actor,
           packed=packed,
           terminal_packed=terminal_packed,

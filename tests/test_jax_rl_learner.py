@@ -5,7 +5,7 @@ from collections import deque
 import melee
 import numpy as np
 
-from scripts import benchmark_jax_sim_rl
+from slippi_ai.sim_env import jax_rollout
 from slippi_ai import data
 from slippi_ai import reward
 from slippi_ai import types
@@ -192,7 +192,7 @@ class JaxRlLearnerTest(unittest.TestCase):
         ),
     )
 
-    selected = benchmark_jax_sim_rl._terminal_corrected_game(
+    selected = jax_rollout.terminal_corrected_game(
         reset_game=reset_game,
         terminal_game=terminal_game,
         needs_reset=np.array([False, True], dtype=np.bool_),
@@ -243,13 +243,13 @@ class JaxRlLearnerTest(unittest.TestCase):
             percent=75,
         ),
     )
-    selected_next = benchmark_jax_sim_rl._terminal_corrected_game(
+    selected_next = jax_rollout.terminal_corrected_game(
         reset_game=reset_next,
         terminal_game=terminal_next,
         needs_reset=np.array([False, True], dtype=np.bool_),
     )
 
-    rewards = benchmark_jax_sim_rl._transition_reward(
+    rewards = jax_rollout.transition_reward(
         start,
         selected_next,
         reward.RewardConfig(),
@@ -314,18 +314,18 @@ class JaxRlLearnerTest(unittest.TestCase):
         ),
     )
     reset_mask = np.array([False, True], dtype=np.bool_)
-    selected_state2 = benchmark_jax_sim_rl._terminal_corrected_game(
+    selected_state2 = jax_rollout.terminal_corrected_game(
         reset_game=reset_state2,
         terminal_game=terminal_state2,
         needs_reset=reset_mask,
     )
     expected = np.stack([
-        benchmark_jax_sim_rl._transition_reward(
+        jax_rollout.transition_reward(
             state0,
             state1,
             reward.RewardConfig(),
         ),
-        benchmark_jax_sim_rl._transition_reward(
+        jax_rollout.transition_reward(
             state1,
             selected_state2,
             reward.RewardConfig(),
@@ -337,13 +337,13 @@ class JaxRlLearnerTest(unittest.TestCase):
         state1,
         reset_state2,
     ])
-    actual = benchmark_jax_sim_rl._batched_transition_rewards(
+    actual = jax_rollout.batched_transition_rewards(
         time_major,
         terminal_reward_overrides=[
-            benchmark_jax_sim_rl._TerminalRewardOverride(
+            jax_rollout.TerminalRewardOverride(
                 transition_index=1,
                 reset_mask=reset_mask,
-                terminal_game=benchmark_jax_sim_rl._masked_numpy_tree(
+                terminal_game=jax_rollout.masked_numpy_tree(
                     terminal_state2,
                     reset_mask,
                 ),
@@ -374,7 +374,7 @@ class JaxRlLearnerTest(unittest.TestCase):
     before = [np.asarray(v.controller_state).copy() for v in queue]
 
     env_queue = deque([v.controller_state.copy() for v in queue])
-    benchmark_jax_sim_rl._handle_reset_delay_queues(
+    jax_rollout.reset_delay_queues(
         env_action_queue=env_queue,
         learner_action_queue=queue,
         dummy_outputs=dummy,
@@ -416,7 +416,7 @@ class JaxRlLearnerTest(unittest.TestCase):
     single_step_queue = deque([v.copy() for v in queue_start])
     for sample, reset_mask in zip(samples, reset_masks):
       if np.any(reset_mask):
-        benchmark_jax_sim_rl._reset_delay_queue_lanes(
+        jax_rollout.reset_delay_queue_lanes(
             single_step_queue,
             dummy.controller_state,
             reset_mask,
@@ -425,7 +425,7 @@ class JaxRlLearnerTest(unittest.TestCase):
       single_step_queue.popleft()
 
     chunked_queue = deque([v.copy() for v in queue_start])
-    benchmark_jax_sim_rl._replace_env_action_queue_after_chunk(
+    jax_rollout.replace_env_action_queue_after_chunk(
         env_action_queue=chunked_queue,
         queue_start=[v.copy() for v in queue_start],
         sample_outputs_list=samples,
@@ -449,19 +449,19 @@ class JaxRlLearnerTest(unittest.TestCase):
             logits=np.array([1.0, 2.0], dtype=np.float32),
         )
     ])
-    pending = benchmark_jax_sim_rl._PendingEnvAction(future=future, index=0)
+    pending = jax_rollout.PendingEnvAction(future=future, index=0)
     queue = deque([pending])
     dummy = SampleOutputs(
         controller_state=np.array([-1, -2], dtype=np.int32),
         logits=np.array([-3.0, -4.0], dtype=np.float32),
     )
 
-    benchmark_jax_sim_rl._reset_delay_queue_lanes(
+    jax_rollout.reset_delay_queue_lanes(
         queue,
         dummy.controller_state,
         np.array([False, True], dtype=np.bool_),
     )
-    resolved = benchmark_jax_sim_rl._resolve_env_action_entry(
+    resolved = jax_rollout.resolve_env_action_entry(
         queue[0],
         dummy_outputs=dummy,
     )

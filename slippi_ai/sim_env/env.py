@@ -72,7 +72,13 @@ ArrayFactory = tp.Callable[[tuple[int, ...], np.dtype | type], np.ndarray]
 
 
 class SimBatchedEnvironment:
-  """Batched melee_sim-backed environment with the existing slippi-ai env shape."""
+  """Batched melee_sim-backed environment using slippi-ai Game objects.
+
+  The public env shape mirrors the Dolphin-backed envs: callers pass controller
+  actions and receive `EnvOutput` objects. High-throughput JAX paths should use
+  `current_packed_state` and `step_encoded` to avoid rebuilding per-port Python
+  objects while still feeding the same policy-facing fields.
+  """
 
   def __init__(
       self,
@@ -190,14 +196,14 @@ class SimBatchedEnvironment:
       axis_spacing: int,
       shoulder_spacing: int,
   ) -> np.ndarray:
-    """Step from encoded default-controller buckets shaped [2 * batch]."""
+    """Step from encoded default-controller buckets shaped [p1 batch, p2 batch]."""
     self._ensure_cursor_room()
     if np.any(self._pending_reset):
       self.reset(np.flatnonzero(self._pending_reset))
       self._pending_reset[:] = False
 
     action = self._buffers.controller_action_view[self._env.t]
-    _write_encoded_controller_action(
+    write_encoded_controller_action(
         action,
         controller_state,
         player_index=0,
@@ -205,7 +211,7 @@ class SimBatchedEnvironment:
         axis_spacing=axis_spacing,
         shoulder_spacing=shoulder_spacing,
     )
-    _write_encoded_controller_action(
+    write_encoded_controller_action(
         action,
         controller_state,
         player_index=1,
@@ -213,14 +219,14 @@ class SimBatchedEnvironment:
         axis_spacing=axis_spacing,
         shoulder_spacing=shoulder_spacing,
     )
-    _copy_encoded_controller(
+    copy_encoded_controller(
         self._last_controllers[1],
         controller_state,
         source_slice=slice(0, self._num_envs),
         axis_spacing=axis_spacing,
         shoulder_spacing=shoulder_spacing,
     )
-    _copy_encoded_controller(
+    copy_encoded_controller(
         self._last_controllers[2],
         controller_state,
         source_slice=slice(self._num_envs, 2 * self._num_envs),
@@ -314,7 +320,11 @@ class SimBatchedEnvironment:
     slots_by_source = _slots_by_source(frame['slots'])
     self_source = port - 1
     opponent_source = 1 - self_source
-    self_controller = self._last_controllers[port] if self._include_controller_state else neutral_controllers(self._num_envs)
+    self_controller = (
+        self._last_controllers[port]
+        if self._include_controller_state
+        else neutral_controllers(self._num_envs)
+    )
     opponent_port = 1 if port == 2 else 2
     opponent_controller = (
         self._last_controllers[opponent_port]
@@ -323,9 +333,9 @@ class SimBatchedEnvironment:
     )
     empty = _empty_player(self._num_envs)
     return Game(
-        p0=_player_from_slot(slots_by_source[self_source], self_controller),
+        p0=player_from_slot(slots_by_source[self_source], self_controller),
         p1=empty,
-        p2=_player_from_slot(slots_by_source[opponent_source], opponent_controller),
+        p2=player_from_slot(slots_by_source[opponent_source], opponent_controller),
         p3=empty,
         stage=_stage_array(frame['stage_id']),
         randall_phase=np.mod(frame['frame_id'], 1200).astype(np.float32),
@@ -334,7 +344,7 @@ class SimBatchedEnvironment:
             y=frame['stage']['randall']['y'].astype(np.float32, copy=True),
         ),
         items=(
-            _items_from_frame(frame['items'])
+            items_from_frame(frame['items'])
             if self._include_items
             else _empty_items(self._num_envs)),
         is_teams=frame['is_teams'].astype(np.bool_, copy=True),
@@ -361,10 +371,15 @@ def neutral_controllers(batch_size: int) -> Controller:
 
 
 def terminal_view(buffers: melee_sim.Buffers) -> np.ndarray:
+  """View the native terminal side-channel as a structured NumPy array."""
   raw = buffers.terminal
   if raw.shape[2] < _TERMINAL_DTYPE.itemsize:
     raise ValueError('terminal buffer row is smaller than MslTerminal')
-  return raw[:, :, :_TERMINAL_DTYPE.itemsize].view(_TERMINAL_DTYPE).reshape(raw.shape[0], raw.shape[1])
+  return (
+      raw[:, :, :_TERMINAL_DTYPE.itemsize]
+      .view(_TERMINAL_DTYPE)
+      .reshape(raw.shape[0], raw.shape[1])
+  )
 
 
 def supported_stages() -> tuple[melee.Stage, ...]:
@@ -406,7 +421,7 @@ def make_packed_game_builder(
     array_factory: ArrayFactory = np.zeros,
     include_items: bool = True,
 ) -> '_PackedGameBuilder':
-  """Create reusable packed policy-game buffers for `batch_size` envs."""
+  """Create reusable [p1 batch, p2 batch] policy-game buffers."""
   return _PackedGameBuilder(
       batch_size,
       array_factory=array_factory,
@@ -425,7 +440,7 @@ def _write_controller_action(action_frame: np.ndarray, controller: Controller, p
     player['buttons'][name][:] = getattr(controller.buttons, name)
 
 
-def _write_encoded_controller_action(
+def write_encoded_controller_action(
     action_frame: np.ndarray,
     controller: Controller,
     *,
@@ -434,6 +449,7 @@ def _write_encoded_controller_action(
     axis_spacing: int,
     shoulder_spacing: int,
 ):
+  """Decode discretized policy controller buckets into melee_sim actions."""
   player = action_frame['p'][:, int(player_index)]
   scale_axis = np.float32(1.0 / float(axis_spacing))
   scale_shoulder = np.float32(1.0 / float(shoulder_spacing))
@@ -456,7 +472,7 @@ def _copy_controller(dst: Controller, src: Controller, target: slice, source: sl
     getattr(dst.buttons, name)[target] = getattr(src.buttons, name)[source]
 
 
-def _copy_encoded_controller(
+def copy_encoded_controller(
     dst: Controller,
     src: Controller,
     *,
@@ -464,6 +480,7 @@ def _copy_encoded_controller(
     axis_spacing: int,
     shoulder_spacing: int,
 ):
+  """Decode discretized policy controller buckets into policy-observation state."""
   scale_axis = np.float32(1.0 / float(axis_spacing))
   scale_shoulder = np.float32(1.0 / float(shoulder_spacing))
   dst.main_stick.x[:] = np.asarray(src.main_stick.x)[source_slice] * scale_axis
@@ -535,7 +552,8 @@ def _slots_by_source(slots: np.ndarray) -> dict[int, np.ndarray]:
   return result
 
 
-def _player_from_slot(slot: np.ndarray, controller: Controller) -> Player:
+def player_from_slot(slot: np.ndarray, controller: Controller) -> Player:
+  """Convert one melee_sim source-player slot into a policy-facing Player."""
   present = slot['present'].astype(np.bool_, copy=False)
   stocks = slot['stocks'].astype(np.uint8, copy=True)
   return Player(
@@ -607,7 +625,8 @@ def _libmelee_jumps_left(slot: np.ndarray) -> np.ndarray:
   return np.maximum(values, 0).astype(np.uint8)
 
 
-def _items_from_frame(items: np.ndarray) -> Items:
+def items_from_frame(items: np.ndarray) -> Items:
+  """Convert melee_sim item slots into the fixed policy-facing item nest."""
   items = _canonical_items(items)
   return Items(**{
       f'item_{i}': Item(
@@ -663,6 +682,12 @@ def _make_array(
 
 
 class _PackedGameBuilder:
+  """Reusable packed Game storage for batched policy calls.
+
+  The policy sees each env twice: first from port 1's perspective, then from
+  port 2's perspective. Keeping this storage live lets rollout code fill arrays
+  in place instead of allocating a fresh Game nest for every frame.
+  """
 
   def __init__(
       self,

@@ -11,8 +11,9 @@ import melee
 import numpy as np
 from flax import nnx
 
-from scripts import benchmark_jax_sim_rl
-from scripts import benchmark_sim_mp
+from slippi_ai.jax.rl import build as rl_build
+from slippi_ai.sim_env import jax_rollout
+from slippi_ai.sim_env import multiprocess_env
 from slippi_ai import dolphin
 from slippi_ai import eval_lib
 from slippi_ai import sim_env
@@ -43,8 +44,8 @@ def main():
 
   model_a = eval_lib.load_state(path=args.model_a)
   model_b = eval_lib.load_state(path=args.model_b)
-  spacing = benchmark_sim_mp._default_controller_spacing(model_a)
-  if spacing != benchmark_sim_mp._default_controller_spacing(model_b):
+  spacing = multiprocess_env.default_controller_spacing(model_a)
+  if spacing != multiprocess_env.default_controller_spacing(model_b):
     raise ValueError('model controller embeddings use different spacing')
 
   summaries = []
@@ -83,10 +84,10 @@ def _run_round(
   total_packed = total_batch * 2
   ctx = mp.get_context('spawn')
 
-  obs_owner = benchmark_sim_mp.SharedArrayOwner()
+  obs_owner = multiprocess_env.SharedArrayOwner()
   packed = sim_env.make_packed_game_builder(total_batch, array_factory=obs_owner.array)
-  action_owner = benchmark_sim_mp.SharedArrayOwner()
-  action = benchmark_sim_mp._shared_encoded_controller(total_packed, action_owner.array)
+  action_owner = multiprocess_env.SharedArrayOwner()
+  action = multiprocess_env.shared_encoded_controller(total_packed, action_owner.array)
 
   obs_barrier = ctx.Barrier(args.workers + 1)
   action_barrier = ctx.Barrier(args.workers + 1)
@@ -130,7 +131,7 @@ def _run_round(
         args.learner_param_dtype, seed=1)
     action_queue_a = _action_delay_queue(agent_a)
     action_queue_b = _action_delay_queue(agent_b)
-    benchmark_sim_mp._barrier_wait(
+    multiprocess_env.barrier_wait(
         obs_barrier, args.barrier_timeout, 'initial observations')
 
     a_slice, b_slice = _model_slices(a_port, total_batch)
@@ -160,14 +161,14 @@ def _run_round(
       invalid += _copy_controller_slice(action, ctrl_a, a_slice, controller_spacing)
       invalid += _copy_controller_slice(action, ctrl_b, b_slice, controller_spacing)
       action_done = time.perf_counter()
-      benchmark_sim_mp._barrier_wait(
+      multiprocess_env.barrier_wait(
           action_barrier, args.barrier_timeout, 'action release')
       release_done = time.perf_counter()
-      benchmark_sim_mp._barrier_wait(
+      multiprocess_env.barrier_wait(
           obs_barrier, args.barrier_timeout, 'observation wait')
       obs_done = time.perf_counter()
 
-      done, stockout, timeout, max_frame = benchmark_sim_mp._sum_step_counters(
+      done, stockout, timeout, max_frame = multiprocess_env.sum_step_counters(
           step_counters, args.workers)
       completed_games += done
       counters['done'] += done
@@ -230,8 +231,8 @@ def _worker_main(
     length: int,
     max_game_frames: int,
     matchup: str,
-    obs_specs: list[benchmark_sim_mp.SharedArraySpec],
-    action_specs: list[benchmark_sim_mp.SharedArraySpec],
+    obs_specs: list[multiprocess_env.SharedArraySpec],
+    action_specs: list[multiprocess_env.SharedArraySpec],
     controller_spacing: tuple[int, int],
     obs_barrier,
     action_barrier,
@@ -240,15 +241,15 @@ def _worker_main(
     barrier_timeout: float,
     result_queue,
 ):
-  obs_attacher = benchmark_sim_mp.SharedArrayAttacher(obs_specs)
-  action_attacher = benchmark_sim_mp.SharedArrayAttacher(action_specs)
+  obs_attacher = multiprocess_env.SharedArrayAttacher(obs_specs)
+  action_attacher = multiprocess_env.SharedArrayAttacher(action_specs)
   env = None
   try:
     packed = sim_env.make_packed_game_builder(
         total_batch,
         array_factory=obs_attacher.array,
     )
-    action = benchmark_sim_mp._shared_encoded_controller(
+    action = multiprocess_env.shared_encoded_controller(
         total_batch * 2, action_attacher.array)
     p1_character, p2_character = sim_env.player_pair_for_matchup(matchup)
     env = sim_env.SimBatchedEnvironment(
@@ -258,7 +259,7 @@ def _worker_main(
             2: dolphin.AI(p2_character),
         },
         length=length,
-        stage=benchmark_sim_mp._cycle_stages(batch_size, offset),
+        stage=multiprocess_env.cycle_stages(batch_size, offset),
         character_pairs=sim_env.character_pairs_for_matchup(
             matchup, batch_size, offset),
         max_frame_id=max_game_frames - 123,
@@ -271,7 +272,7 @@ def _worker_main(
         env._last_controllers,
         controller_slice=slice(None),
     )
-    benchmark_sim_mp._barrier_wait(
+    multiprocess_env.barrier_wait(
         obs_barrier, barrier_timeout, f'worker {worker_id} initial observations')
 
     stats = _empty_port_stats()
@@ -279,7 +280,7 @@ def _worker_main(
     counters = defaultdict(int)
     while not stop_event.is_set():
       try:
-        benchmark_sim_mp._barrier_wait(
+        multiprocess_env.barrier_wait(
             action_barrier, barrier_timeout, f'worker {worker_id} action wait')
       except RuntimeError:
         if stop_event.is_set():
@@ -289,7 +290,7 @@ def _worker_main(
         break
 
       step_start = time.perf_counter()
-      needs_reset, terminal = benchmark_sim_mp._step_with_global_actions(
+      needs_reset, terminal = multiprocess_env.step_with_global_actions(
           env,
           action,
           total_batch=total_batch,
@@ -311,14 +312,14 @@ def _worker_main(
       done_count = int(needs_reset.sum())
       stockout_count = int(terminal['stockout'].sum())
       timeout_count = int(terminal['max_frame_reached'].sum())
-      benchmark_sim_mp._write_step_counters(
+      multiprocess_env.write_step_counters(
           step_counters,
           worker_id,
           done_count,
           stockout_count,
           timeout_count,
       )
-      benchmark_sim_mp._barrier_wait(
+      multiprocess_env.barrier_wait(
           obs_barrier, barrier_timeout, f'worker {worker_id} observation release')
       obs_done = time.perf_counter()
       timings['step_s'] += step_done - step_start
@@ -356,7 +357,7 @@ def _build_agent(
     seed: int,
 ):
   policy = tf_checkpoint.load_policy_from_tf_state(state, param_dtype=param_dtype)
-  name_code = benchmark_jax_sim_rl._name_code(state, batch_size)
+  name_code = rl_build.name_code_from_state(state, batch_size)
   return jax_agents.BasicAgent(
       policy,
       batch_size=batch_size,
@@ -389,7 +390,7 @@ def _reset_action_delay_queue(
 ):
   if not np.any(reset_mask):
     return
-  benchmark_jax_sim_rl._reset_delay_queue_lanes(
+  jax_rollout.reset_delay_queue_lanes(
       action_queue,
       agent._policy.controller_head.dummy_controller([agent._batch_size]),
       reset_mask,

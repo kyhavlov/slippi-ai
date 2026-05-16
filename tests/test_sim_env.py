@@ -239,7 +239,7 @@ class SimEnvTest(unittest.TestCase):
     slot['on_ground'] = [True, False, False]
     slot['shield_hp'] = 60.0
 
-    player = sim_env._player_from_slot(slot, sim_env.neutral_controllers(3))
+    player = sim_env.player_from_slot(slot, sim_env.neutral_controllers(3))
 
     self.assertEqual(player.percent.tolist(), [11, 11, 12])
     self.assertEqual(player.jumps_left.tolist(), [2, 1, 1])
@@ -258,7 +258,7 @@ class SimEnvTest(unittest.TestCase):
     items[0, :4]['pos_x'] = [-54.0, -32.0, 60.0, 0.0]
     items[0, :4]['pos_y'] = [20.0, 40.0, 20.0, 0.0]
 
-    out = sim_env._items_from_frame(items)
+    out = sim_env.items_from_frame(items)
 
     self.assertEqual(out.item_0.type.tolist(), [74])
     self.assertEqual(out.item_0.x.tolist(), [-54.0])

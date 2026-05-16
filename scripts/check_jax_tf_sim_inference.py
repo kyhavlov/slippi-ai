@@ -7,7 +7,7 @@ import melee
 import numpy as np
 import tree
 
-from scripts import benchmark_sim_mp
+from slippi_ai.sim_env import multiprocess_env
 from slippi_ai import data
 from slippi_ai import dolphin
 from slippi_ai import embed as tf_embed
@@ -27,7 +27,7 @@ def main():
   args = parser.parse_args()
 
   state = eval_lib.load_state(path=args.model_path)
-  spacing = benchmark_sim_mp._default_controller_spacing(state)
+  spacing = multiprocess_env.default_controller_spacing(state)
   stage = getattr(melee.Stage, args.stage.upper())
 
   tf_agent = eval_lib.build_delayed_agent(
