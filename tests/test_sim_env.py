@@ -9,8 +9,18 @@ from slippi_ai import sim_env
 
 class SimEnvTest(unittest.TestCase):
 
+  def _sim_env(self, *args, **kwargs):
+    try:
+      return sim_env.SimBatchedEnvironment(*args, **kwargs)
+    except MemoryError as exc:
+      if 'msl_batch_create failed' not in str(exc):
+        raise
+      self.skipTest(
+          'melee_sim EnvBatch could not initialize; set MELEE_SIM_DATA to an '
+          'extracted melee-sim-light data directory before running sim env tests.')
+
   def test_current_state_and_step_match_existing_game_shape(self):
-    env = sim_env.SimBatchedEnvironment(
+    env = self._sim_env(
         num_envs=3,
         players={
             1: dolphin.AI(melee.Character.FOX),
@@ -49,7 +59,7 @@ class SimEnvTest(unittest.TestCase):
       env.stop()
 
   def test_push_pop_queue_and_partial_reset(self):
-    env = sim_env.SimBatchedEnvironment(num_envs=2, length=4)
+    env = self._sim_env(num_envs=2, length=4)
     try:
       first = env.pop()
       self.assertTrue(np.all(first.needs_reset))
@@ -70,7 +80,7 @@ class SimEnvTest(unittest.TestCase):
       env.stop()
 
   def test_partial_reset_clears_observed_previous_controllers(self):
-    env = sim_env.SimBatchedEnvironment(num_envs=2, length=8)
+    env = self._sim_env(num_envs=2, length=8)
     try:
       controllers = {
           1: sim_env.neutral_controllers(2),
@@ -99,7 +109,7 @@ class SimEnvTest(unittest.TestCase):
         melee.Stage.BATTLEFIELD,
         melee.Stage.YOSHIS_STORY,
     ]
-    env = sim_env.SimBatchedEnvironment(num_envs=3, length=2, stage=stages)
+    env = self._sim_env(num_envs=3, length=2, stage=stages)
     try:
       current = env.current_state()
       self.assertEqual(current.gamestates[1].stage.tolist(), [stage.value for stage in stages])
@@ -127,7 +137,7 @@ class SimEnvTest(unittest.TestCase):
 
   def test_per_env_character_pairs(self):
     pairs = sim_env.balanced_fox_falco_pairs(4)
-    env = sim_env.SimBatchedEnvironment(
+    env = self._sim_env(
         num_envs=4,
         length=8,
         character_pairs=pairs,
@@ -157,7 +167,7 @@ class SimEnvTest(unittest.TestCase):
       env.stop()
 
   def test_max_frame_terminal_is_reported_separately(self):
-    env = sim_env.SimBatchedEnvironment(num_envs=2, length=128, max_frame_id=0)
+    env = self._sim_env(num_envs=2, length=128, max_frame_id=0)
     try:
       controllers = {
           1: sim_env.neutral_controllers(2),
@@ -176,7 +186,7 @@ class SimEnvTest(unittest.TestCase):
       env.stop()
 
   def test_packed_state_and_encoded_step(self):
-    env = sim_env.SimBatchedEnvironment(
+    env = self._sim_env(
         num_envs=2,
         players={
             1: dolphin.AI(melee.Character.FOX),

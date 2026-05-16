@@ -74,13 +74,14 @@ class BasicAgent:
       policy: policies.Policy,
       batch_size: int,
       name_code: tp.Union[int, tp.Sequence[int]],
-      sample_kwargs: dict = {},
+      sample_kwargs: dict | None = None,
       compile: bool = True,
       jit_compile: bool = False,
       run_on_cpu: bool = False,
       multi_step_size: int = 1,
       assume_game_is_from_state: bool = False,
   ):
+    sample_kwargs = {} if sample_kwargs is None else sample_kwargs
     self._policy = policy
     self._embed_controller = policy.controller_embedding
     self._batch_size = batch_size
@@ -431,7 +432,7 @@ class JaxDelayedAgent:
       console_delay: int = 0,
       batch_steps: int = 0,
       name_code: tp.Union[int, tp.Sequence[int]] = 0,
-      sample_kwargs: dict = {},
+      sample_kwargs: dict | None = None,
       compile: bool = True,
       jit_compile: bool = False,
       jax_param_dtype: str = 'float32',
@@ -440,6 +441,7 @@ class JaxDelayedAgent:
       async_inference: bool = False,
       **agent_kwargs,
   ):
+    sample_kwargs = {} if sample_kwargs is None else sample_kwargs
     if fake:
       raise ValueError('fake agents are not supported with platform="jax"')
     if async_inference:

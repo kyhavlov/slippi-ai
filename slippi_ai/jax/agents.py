@@ -36,12 +36,13 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
       name_code: tp.Union[int, tp.Sequence[int]],
       rngs: tp.Optional[nnx.Rngs] = None,
       seed: int = 0,
-      sample_kwargs: dict = {},
+      sample_kwargs: dict | None = None,
       compile: bool = True,
       run_on_cpu: bool = False,
       pack_args: bool = False,
       functionalize: bool = False,
   ):
+    sample_kwargs = {} if sample_kwargs is None else sample_kwargs
     self._policy = policy
     self._batch_size = batch_size
     self.set_name_code(name_code)
