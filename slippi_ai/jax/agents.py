@@ -242,6 +242,14 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
       self,
       states: list[tuple[Game, agents.BoolArray]],
   ) -> list[SampleOutputs[ControllerType]]:
+    sample_outputs = self.multi_step_device(states)
+    return jax.copy_to_host_async(sample_outputs)
+
+  def multi_step_device(
+      self,
+      states: list[tuple[Game, agents.BoolArray]],
+  ) -> list[SampleOutputs[ControllerType]]:
+    """Sample a time chunk and leave the full output tree on device."""
     states_and_resets = [
         (self._policy.network.encode_game(game), needs_reset)
         for game, needs_reset in states
@@ -254,4 +262,4 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
 
     self._prev_controller = sample_outputs[-1].controller_state
 
-    return jax.copy_to_host_async(sample_outputs)
+    return sample_outputs

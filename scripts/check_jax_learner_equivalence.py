@@ -21,6 +21,7 @@ def main():
   parser.add_argument('--model-path', default='models/rl_doubles_v27_11000.pkl')
   parser.add_argument('--batch-size', type=int, default=8)
   parser.add_argument('--rollout-length', type=int, default=32)
+  parser.add_argument('--actor-step-chunk-size', type=int, default=1)
   parser.add_argument('--ppo-batches', type=int, default=1)
   parser.add_argument('--matchup', choices=sim_env.SUPPORTED_MATCHUPS,
                       default='fox-falco')
@@ -61,6 +62,7 @@ def main():
       state=state,
       batch_size=args.batch_size,
       rollout_length=args.rollout_length,
+      actor_step_chunk_size=args.actor_step_chunk_size,
       ppo_batches=args.ppo_batches,
       matchup=args.matchup,
       length=args.length,
@@ -133,6 +135,7 @@ def main():
       'batch_size': args.batch_size,
       'total_player_batch_size': total_packed,
       'rollout_length': args.rollout_length,
+      'actor_step_chunk_size': args.actor_step_chunk_size,
       'ppo_batches': args.ppo_batches,
       'matchup': args.matchup,
       'minibatch_size': args.minibatch_size,
@@ -151,6 +154,7 @@ def _collect_trajectories(
     state: dict,
     batch_size: int,
     rollout_length: int,
+    actor_step_chunk_size: int,
     ppo_batches: int,
     matchup: str,
     length: int,
@@ -171,6 +175,7 @@ def _collect_trajectories(
   action_barrier = ctx.Barrier(2)
   stop_event = ctx.Event()
   step_counters = ctx.Array('i', 4, lock=False)
+  step_timings = ctx.Array('d', 3, lock=False)
   result_queue = ctx.Queue()
   process = None
 
@@ -195,6 +200,7 @@ def _collect_trajectories(
             action_barrier,
             stop_event,
             step_counters,
+            step_timings,
             barrier_timeout,
             result_queue,
         ),
@@ -236,9 +242,11 @@ def _collect_trajectories(
           action_barrier=action_barrier,
           obs_barrier=obs_barrier,
           step_counters=step_counters,
+          step_timings=step_timings,
           workers=1,
           total_batch=batch_size,
           rollout_length=rollout_length,
+          actor_step_chunk_size=actor_step_chunk_size,
           controller_spacing=spacing,
           name_code=name_code,
           reward_config=collect_learner._config.reward,

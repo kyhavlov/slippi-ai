@@ -294,6 +294,56 @@ class JaxRlLearnerTest(unittest.TestCase):
         [[10, -1], [11, -1], [12, -1]],
     )
 
+  def test_chunked_env_delay_queue_matches_single_step_resets(self):
+    queue_start = [
+        np.array([10 + i, 20 + i], dtype=np.int32)
+        for i in range(4)
+    ]
+    samples = [
+        SampleOutputs(
+            controller_state=np.array([100 + i, 200 + i], dtype=np.int32),
+            logits=np.array([300 + i, 400 + i], dtype=np.float32),
+        )
+        for i in range(3)
+    ]
+    reset_masks = [
+        np.array([False, False], dtype=np.bool_),
+        np.array([False, True], dtype=np.bool_),
+        np.array([False, False], dtype=np.bool_),
+    ]
+    dummy = SampleOutputs(
+        controller_state=np.array([-1, -2], dtype=np.int32),
+        logits=np.array([-3.0, -4.0], dtype=np.float32),
+    )
+
+    single_step_queue = deque([v.copy() for v in queue_start])
+    for sample, reset_mask in zip(samples, reset_masks):
+      if np.any(reset_mask):
+        benchmark_jax_sim_rl._reset_delay_queue_lanes(
+            single_step_queue,
+            dummy.controller_state,
+            reset_mask,
+        )
+      single_step_queue.append(sample.controller_state.copy())
+      single_step_queue.popleft()
+
+    chunked_queue = deque([v.copy() for v in queue_start])
+    benchmark_jax_sim_rl._replace_env_action_queue_after_chunk(
+        env_action_queue=chunked_queue,
+        queue_start=[v.copy() for v in queue_start],
+        sample_outputs_list=samples,
+        reset_masks=reset_masks,
+        dummy_outputs=dummy,
+    )
+
+    self.assertEqual(
+        [v.tolist() for v in chunked_queue],
+        [v.tolist() for v in single_step_queue],
+    )
+    # The sample from frame 0 is still pending after the reset lane, so it must
+    # be neutralized for that lane just like the per-frame rollout path.
+    self.assertEqual(chunked_queue[1].tolist(), [100, -2])
+
   def test_reset_frame_actions_splits_network_input_from_actor_outputs(self):
     controller_state = np.array([
         [10, 11],

@@ -36,6 +36,13 @@ def main():
   parser.add_argument('--batch-size', type=int, default=64,
                       help='Env batch per sim worker.')
   parser.add_argument('--rollout-length', type=int, default=64)
+  parser.add_argument(
+      '--actor-step-chunk-size',
+      type=int,
+      default=1,
+      help=(
+          'Number of sequential rollout observations to sample in one JAX '
+          'actor call. Must be no larger than the policy delay.'))
   parser.add_argument('--updates', type=int, default=2)
   parser.add_argument('--warmup-updates', type=int, default=1)
   parser.add_argument('--ppo-batches', type=int, default=0,
@@ -216,6 +223,12 @@ def main():
       raise ValueError(
           f'--rollout-length must be greater than policy delay '
           f'{actor._policy.delay}, got {args.rollout_length}')
+    if args.actor_step_chunk_size <= 0:
+      raise ValueError('--actor-step-chunk-size must be positive')
+    if args.actor_step_chunk_size > actor._policy.delay:
+      raise ValueError(
+          f'--actor-step-chunk-size must be <= policy delay '
+          f'{actor._policy.delay}, got {args.actor_step_chunk_size}')
     learner_state = learner.initial_state(total_packed)
     dummy_outputs = actor._policy.controller_head.dummy_sample_outputs([total_packed])
     env_action_queue = deque(
@@ -294,6 +307,7 @@ def main():
             workers=args.workers,
             total_batch=total_batch,
             rollout_length=args.rollout_length,
+            actor_step_chunk_size=args.actor_step_chunk_size,
             controller_spacing=spacing,
             name_code=name_code,
             reward_config=learner._config.reward,
@@ -418,6 +432,7 @@ def main():
             'total_env_batch_size': total_batch,
             'total_player_batch_size': total_packed,
             'rollout_length': args.rollout_length,
+            'actor_step_chunk_size': args.actor_step_chunk_size,
             'ppo_batches': ppo_batches,
             'ppo_epochs': learner._config.ppo.num_epochs,
             'learner_minibatch_size': args.learner_minibatch_size,
@@ -774,6 +789,7 @@ def _collect_trajectory(
     workers: int,
     total_batch: int,
     rollout_length: int,
+    actor_step_chunk_size: int,
     controller_spacing: tuple[int, int],
     name_code: np.ndarray,
     reward_config: reward_lib.RewardConfig,
@@ -786,73 +802,97 @@ def _collect_trajectory(
   timings = defaultdict(float)
   counters = defaultdict(int)
   initial_state = actor.hidden_state()
+  actor_step_chunk_size = max(1, int(actor_step_chunk_size))
 
-  for _ in range(rollout_length):
-    state_start = time.perf_counter()
-    actor_state = _to_numpy_tree(packed.game)
-    states.append(actor_state)
-    resets.append(np.asarray(packed.needs_reset, dtype=np.bool_).copy())
-    state_done = time.perf_counter()
+  for chunk_start in range(0, rollout_length, actor_step_chunk_size):
+    chunk_len = min(actor_step_chunk_size, rollout_length - chunk_start)
+    chunk_inputs = []
+    chunk_reset_masks = []
+    env_queue_start = list(env_action_queue)
 
-    reset_mask = np.asarray(packed.needs_reset, dtype=np.bool_)
-    if np.any(reset_mask):
-      _handle_reset_delay_queues(
-          env_action_queue=env_action_queue,
-          learner_action_queue=learner_action_queue,
-          dummy_outputs=dummy_outputs,
-          reset_mask=reset_mask,
+    for _ in range(chunk_len):
+      state_start = time.perf_counter()
+      actor_state = _to_numpy_tree(packed.game)
+      reset_mask = np.asarray(packed.needs_reset, dtype=np.bool_).copy()
+      states.append(actor_state)
+      resets.append(reset_mask)
+      chunk_inputs.append((actor_state, reset_mask))
+      chunk_reset_masks.append(reset_mask)
+      state_done = time.perf_counter()
+
+      if np.any(reset_mask):
+        _handle_reset_delay_queues(
+            env_action_queue=env_action_queue,
+            learner_action_queue=learner_action_queue,
+            dummy_outputs=dummy_outputs,
+            reset_mask=reset_mask,
+        )
+
+      delayed_controller = env_action_queue.popleft()
+      actions.append(learner_action_queue.popleft())
+
+      action_start = time.perf_counter()
+      invalid = benchmark_sim_mp._copy_controller(
+          action, delayed_controller, controller_spacing)
+      action_done = time.perf_counter()
+      benchmark_sim_mp._barrier_wait(
+          action_barrier, barrier_timeout, 'action release')
+      release_done = time.perf_counter()
+      benchmark_sim_mp._barrier_wait(
+          obs_barrier, barrier_timeout, 'observation wait')
+      obs_done = time.perf_counter()
+
+      transition_state_start = time.perf_counter()
+      reward_next_state = _terminal_corrected_game(
+          reset_game=packed.game,
+          terminal_game=terminal_packed.game,
+          needs_reset=packed.needs_reset,
       )
+      rewards.append(_transition_reward(
+          actor_state,
+          reward_next_state,
+          reward_config,
+      ))
+      transition_state_done = time.perf_counter()
+
+      done, stockout, timeout, max_frame = benchmark_sim_mp._sum_step_counters(
+          step_counters, workers)
+      worker_step_s, worker_fill_s, _ = (
+          benchmark_sim_mp._sum_step_timings(step_timings, workers))
+
+      timings['state_copy_s'] += state_done - state_start
+      timings['action_copy_s'] += action_done - action_start
+      timings['action_release_s'] += release_done - action_done
+      timings['obs_wait_s'] += obs_done - release_done
+      timings['terminal_reward_state_s'] += (
+          transition_state_done - transition_state_start)
+      timings['env_step_s'] += worker_step_s
+      timings['env_fill_s'] += worker_fill_s
+      counters['invalid_actions'] += invalid
+      counters['done'] += done
+      counters['stockout'] += stockout
+      counters['timeout'] += timeout
+      counters['max_frame_reached'] += max_frame
 
     policy_start = time.perf_counter()
-    sample_outputs = actor.step_device(packed.game, packed.needs_reset)
+    if chunk_len == 1:
+      sample_outputs_list = [
+          actor.step_device(chunk_inputs[0][0], chunk_inputs[0][1])]
+    else:
+      sample_outputs_list = actor.multi_step_device(chunk_inputs)
     policy_done = time.perf_counter()
-    env_action_queue.append(_to_numpy_tree(sample_outputs.controller_state))
-    delayed_controller = env_action_queue.popleft()
-    learner_action_queue.append(sample_outputs)
-    actions.append(learner_action_queue.popleft())
-
-    invalid = benchmark_sim_mp._copy_controller(
-        action, delayed_controller, controller_spacing)
-    action_done = time.perf_counter()
-    benchmark_sim_mp._barrier_wait(
-        action_barrier, barrier_timeout, 'action release')
-    release_done = time.perf_counter()
-    benchmark_sim_mp._barrier_wait(
-        obs_barrier, barrier_timeout, 'observation wait')
-    obs_done = time.perf_counter()
-
-    transition_state_start = time.perf_counter()
-    reward_next_state = _terminal_corrected_game(
-        reset_game=packed.game,
-        terminal_game=terminal_packed.game,
-        needs_reset=packed.needs_reset,
-    )
-    rewards.append(_transition_reward(
-        actor_state,
-        reward_next_state,
-        reward_config,
-    ))
-    transition_state_done = time.perf_counter()
-
-    done, stockout, timeout, max_frame = benchmark_sim_mp._sum_step_counters(
-        step_counters, workers)
-    worker_step_s, worker_fill_s, _ = (
-        benchmark_sim_mp._sum_step_timings(step_timings, workers))
-
-    timings['state_copy_s'] += state_done - state_start
     timings['policy_sample_s'] += policy_done - policy_start
-    timings['action_copy_s'] += action_done - policy_done
-    timings['action_release_s'] += release_done - action_done
-    timings['obs_wait_s'] += obs_done - release_done
-    timings['terminal_reward_state_s'] += (
-        transition_state_done - transition_state_start)
-    timings['env_step_s'] += worker_step_s
-    timings['env_fill_s'] += worker_fill_s
-    counters['invalid_actions'] += invalid
-    counters['done'] += done
-    counters['stockout'] += stockout
-    counters['timeout'] += timeout
-    counters['max_frame_reached'] += max_frame
+    counters['policy_sample_calls'] += 1
+
+    _replace_env_action_queue_after_chunk(
+        env_action_queue=env_action_queue,
+        queue_start=env_queue_start,
+        sample_outputs_list=sample_outputs_list,
+        reset_masks=chunk_reset_masks,
+        dummy_outputs=dummy_outputs,
+    )
+    for sample_outputs in sample_outputs_list:
+      learner_action_queue.append(sample_outputs)
 
   final_state_start = time.perf_counter()
   states.append(_to_numpy_tree(packed.game))
@@ -955,6 +995,36 @@ def _handle_reset_delay_queues(
       reset_mask,
   )
   _ = learner_action_queue
+
+
+def _replace_env_action_queue_after_chunk(
+    *,
+    env_action_queue: deque,
+    queue_start: list,
+    sample_outputs_list: list,
+    reset_masks: list[np.ndarray],
+    dummy_outputs,
+) -> None:
+  """Replay single-frame env-delay queue updates after chunked sampling.
+
+  During a chunk, env steps consume only controllers that were already delayed at
+  the chunk start. New samples from the chunk cannot be consumed until at least
+  `policy.delay` frames later, so policy inference can run after the env steps.
+  Resets are the subtle case: the single-frame path clears queued env actions at
+  the reset frame, including earlier samples from the same chunk. Replaying the
+  queue updates after sampling preserves that final queue state.
+  """
+  env_action_queue.clear()
+  env_action_queue.extend(queue_start)
+  for sample_outputs, reset_mask in zip(sample_outputs_list, reset_masks):
+    if np.any(reset_mask):
+      _reset_delay_queue_lanes(
+          env_action_queue,
+          dummy_outputs.controller_state,
+          reset_mask,
+      )
+    env_action_queue.append(_to_numpy_tree(sample_outputs.controller_state))
+    env_action_queue.popleft()
 
 
 def _reset_tree_lanes(value, default, reset_mask: np.ndarray):
