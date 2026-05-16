@@ -1,4 +1,5 @@
 import unittest
+import concurrent.futures
 from collections import deque
 
 import melee
@@ -343,6 +344,33 @@ class JaxRlLearnerTest(unittest.TestCase):
     # The sample from frame 0 is still pending after the reset lane, so it must
     # be neutralized for that lane just like the per-frame rollout path.
     self.assertEqual(chunked_queue[1].tolist(), [100, -2])
+
+  def test_pending_env_action_applies_reset_before_resolution(self):
+    future = concurrent.futures.Future()
+    future.set_result([
+        SampleOutputs(
+            controller_state=np.array([10, 20], dtype=np.int32),
+            logits=np.array([1.0, 2.0], dtype=np.float32),
+        )
+    ])
+    pending = benchmark_jax_sim_rl._PendingEnvAction(future=future, index=0)
+    queue = deque([pending])
+    dummy = SampleOutputs(
+        controller_state=np.array([-1, -2], dtype=np.int32),
+        logits=np.array([-3.0, -4.0], dtype=np.float32),
+    )
+
+    benchmark_jax_sim_rl._reset_delay_queue_lanes(
+        queue,
+        dummy.controller_state,
+        np.array([False, True], dtype=np.bool_),
+    )
+    resolved = benchmark_jax_sim_rl._resolve_env_action_entry(
+        queue[0],
+        dummy_outputs=dummy,
+    )
+
+    self.assertEqual(resolved.tolist(), [10, -2])
 
   def test_reset_frame_actions_splits_network_input_from_actor_outputs(self):
     controller_state = np.array([

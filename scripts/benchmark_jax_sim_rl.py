@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import copy
 import dataclasses
 import json
@@ -43,6 +44,10 @@ def main():
       help=(
           'Number of sequential rollout observations to sample in one JAX '
           'actor call. Must be no larger than the policy delay.'))
+  parser.add_argument(
+      '--async-rollout-inference',
+      action='store_true',
+      help='Overlap rollout env stepping with delayed actor inference.')
   parser.add_argument('--updates', type=int, default=2)
   parser.add_argument('--warmup-updates', type=int, default=1)
   parser.add_argument('--ppo-batches', type=int, default=0,
@@ -308,6 +313,7 @@ def main():
             total_batch=total_batch,
             rollout_length=args.rollout_length,
             actor_step_chunk_size=args.actor_step_chunk_size,
+            async_rollout_inference=args.async_rollout_inference,
             controller_spacing=spacing,
             name_code=name_code,
             reward_config=learner._config.reward,
@@ -433,6 +439,7 @@ def main():
             'total_player_batch_size': total_packed,
             'rollout_length': args.rollout_length,
             'actor_step_chunk_size': args.actor_step_chunk_size,
+            'async_rollout_inference': args.async_rollout_inference,
             'ppo_batches': ppo_batches,
             'ppo_epochs': learner._config.ppo.num_epochs,
             'learner_minibatch_size': args.learner_minibatch_size,
@@ -765,6 +772,13 @@ def _timing_summary(timings: dict) -> dict:
       'rollout_s': float(timings.get('trajectory_collect_total_s', 0.0)),
       'learner_s': float(timings.get('learner_ppo_s', 0.0)),
       'agent_step_s': float(timings.get('policy_sample_s', 0.0)),
+      'policy_wait_s': float(timings.get('policy_wait_s', 0.0)),
+      'policy_dependency_wait_s': float(
+          timings.get('policy_dependency_wait_s', 0.0)),
+      'policy_blocking_s': float(
+          timings.get('policy_sample_s', 0.0)
+          + timings.get('policy_wait_s', 0.0)
+          + timings.get('policy_dependency_wait_s', 0.0)),
       'env_step_s': float(timings.get('env_step_s', 0.0)),
       'env_fill_s': float(timings.get('env_fill_s', 0.0)),
       'obs_wait_s': float(timings.get('obs_wait_s', 0.0)),
@@ -790,6 +804,7 @@ def _collect_trajectory(
     total_batch: int,
     rollout_length: int,
     actor_step_chunk_size: int,
+    async_rollout_inference: bool,
     controller_spacing: tuple[int, int],
     name_code: np.ndarray,
     reward_config: reward_lib.RewardConfig,
@@ -803,101 +818,152 @@ def _collect_trajectory(
   counters = defaultdict(int)
   initial_state = actor.hidden_state()
   actor_step_chunk_size = max(1, int(actor_step_chunk_size))
+  policy_executor = (
+      concurrent.futures.ThreadPoolExecutor(max_workers=1)
+      if async_rollout_inference and actor_step_chunk_size > 1 else None)
+  pending_policy_future = None
 
-  for chunk_start in range(0, rollout_length, actor_step_chunk_size):
-    chunk_len = min(actor_step_chunk_size, rollout_length - chunk_start)
-    chunk_inputs = []
-    chunk_reset_masks = []
-    env_queue_start = list(env_action_queue)
+  try:
+    for chunk_start in range(0, rollout_length, actor_step_chunk_size):
+      chunk_len = min(actor_step_chunk_size, rollout_length - chunk_start)
+      chunk_inputs = []
+      chunk_reset_masks = []
+      env_queue_start = list(env_action_queue) if policy_executor is None else None
 
-    for _ in range(chunk_len):
-      state_start = time.perf_counter()
-      actor_state = _to_numpy_tree(packed.game)
-      reset_mask = np.asarray(packed.needs_reset, dtype=np.bool_).copy()
-      states.append(actor_state)
-      resets.append(reset_mask)
-      chunk_inputs.append((actor_state, reset_mask))
-      chunk_reset_masks.append(reset_mask)
-      state_done = time.perf_counter()
+      for _ in range(chunk_len):
+        state_start = time.perf_counter()
+        actor_state = _to_numpy_tree(packed.game)
+        reset_mask = np.asarray(packed.needs_reset, dtype=np.bool_).copy()
+        states.append(actor_state)
+        resets.append(reset_mask)
+        chunk_inputs.append((actor_state, reset_mask))
+        chunk_reset_masks.append(reset_mask)
+        state_done = time.perf_counter()
 
-      if np.any(reset_mask):
-        _handle_reset_delay_queues(
-            env_action_queue=env_action_queue,
-            learner_action_queue=learner_action_queue,
+        if np.any(reset_mask):
+          _handle_reset_delay_queues(
+              env_action_queue=env_action_queue,
+              learner_action_queue=learner_action_queue,
+              dummy_outputs=dummy_outputs,
+              reset_mask=reset_mask,
+          )
+
+        delayed_entry = env_action_queue.popleft()
+        action_entry = learner_action_queue.popleft()
+        wait_start = time.perf_counter()
+        delayed_controller = _resolve_env_action_entry(
+            delayed_entry,
             dummy_outputs=dummy_outputs,
-            reset_mask=reset_mask,
         )
+        learner_action = _resolve_learner_action_entry(action_entry)
+        wait_done = time.perf_counter()
+        actions.append(learner_action)
 
-      delayed_controller = env_action_queue.popleft()
-      actions.append(learner_action_queue.popleft())
+        action_start = time.perf_counter()
+        invalid = benchmark_sim_mp._copy_controller(
+            action, delayed_controller, controller_spacing)
+        action_done = time.perf_counter()
+        benchmark_sim_mp._barrier_wait(
+            action_barrier, barrier_timeout, 'action release')
+        release_done = time.perf_counter()
+        benchmark_sim_mp._barrier_wait(
+            obs_barrier, barrier_timeout, 'observation wait')
+        obs_done = time.perf_counter()
 
-      action_start = time.perf_counter()
-      invalid = benchmark_sim_mp._copy_controller(
-          action, delayed_controller, controller_spacing)
-      action_done = time.perf_counter()
-      benchmark_sim_mp._barrier_wait(
-          action_barrier, barrier_timeout, 'action release')
-      release_done = time.perf_counter()
-      benchmark_sim_mp._barrier_wait(
-          obs_barrier, barrier_timeout, 'observation wait')
-      obs_done = time.perf_counter()
+        transition_state_start = time.perf_counter()
+        reward_next_state = _terminal_corrected_game(
+            reset_game=packed.game,
+            terminal_game=terminal_packed.game,
+            needs_reset=packed.needs_reset,
+        )
+        rewards.append(_transition_reward(
+            actor_state,
+            reward_next_state,
+            reward_config,
+        ))
+        transition_state_done = time.perf_counter()
 
-      transition_state_start = time.perf_counter()
-      reward_next_state = _terminal_corrected_game(
-          reset_game=packed.game,
-          terminal_game=terminal_packed.game,
-          needs_reset=packed.needs_reset,
+        done, stockout, timeout, max_frame = benchmark_sim_mp._sum_step_counters(
+            step_counters, workers)
+        worker_step_s, worker_fill_s, _ = (
+            benchmark_sim_mp._sum_step_timings(step_timings, workers))
+
+        timings['state_copy_s'] += state_done - state_start
+        timings['policy_wait_s'] += wait_done - wait_start
+        timings['action_copy_s'] += action_done - action_start
+        timings['action_release_s'] += release_done - action_done
+        timings['obs_wait_s'] += obs_done - release_done
+        timings['terminal_reward_state_s'] += (
+            transition_state_done - transition_state_start)
+        timings['env_step_s'] += worker_step_s
+        timings['env_fill_s'] += worker_fill_s
+        counters['invalid_actions'] += invalid
+        counters['done'] += done
+        counters['stockout'] += stockout
+        counters['timeout'] += timeout
+        counters['max_frame_reached'] += max_frame
+
+      if policy_executor is None:
+        policy_start = time.perf_counter()
+        if chunk_len == 1:
+          sample_outputs_list = [
+              actor.step_device(chunk_inputs[0][0], chunk_inputs[0][1])]
+        else:
+          sample_outputs_list = actor.multi_step_device(chunk_inputs)
+        policy_done = time.perf_counter()
+        timings['policy_sample_s'] += policy_done - policy_start
+        counters['policy_sample_calls'] += 1
+
+        _replace_env_action_queue_after_chunk(
+            env_action_queue=env_action_queue,
+            queue_start=env_queue_start,
+            sample_outputs_list=sample_outputs_list,
+            reset_masks=chunk_reset_masks,
+            dummy_outputs=dummy_outputs,
+        )
+        for sample_outputs in sample_outputs_list:
+          learner_action_queue.append(sample_outputs)
+        continue
+
+      dependency_wait_start = time.perf_counter()
+      if pending_policy_future is not None:
+        pending_policy_future.result()
+      dependency_wait_done = time.perf_counter()
+      timings['policy_dependency_wait_s'] += (
+          dependency_wait_done - dependency_wait_start)
+
+      # The actor carries recurrent state and previous-controller state, so
+      # policy chunks must be launched in order. The overlap comes from stepping
+      # the env with already-delayed actions while the current chunk is sampled.
+      policy_start = time.perf_counter()
+      pending_policy_future = policy_executor.submit(
+          actor.multi_step_device,
+          chunk_inputs,
       )
-      rewards.append(_transition_reward(
-          actor_state,
-          reward_next_state,
-          reward_config,
-      ))
-      transition_state_done = time.perf_counter()
+      policy_done = time.perf_counter()
+      timings['policy_sample_s'] += policy_done - policy_start
+      counters['policy_sample_calls'] += 1
+      counters['async_policy_sample_calls'] += 1
 
-      done, stockout, timeout, max_frame = benchmark_sim_mp._sum_step_counters(
-          step_counters, workers)
-      worker_step_s, worker_fill_s, _ = (
-          benchmark_sim_mp._sum_step_timings(step_timings, workers))
-
-      timings['state_copy_s'] += state_done - state_start
-      timings['action_copy_s'] += action_done - action_start
-      timings['action_release_s'] += release_done - action_done
-      timings['obs_wait_s'] += obs_done - release_done
-      timings['terminal_reward_state_s'] += (
-          transition_state_done - transition_state_start)
-      timings['env_step_s'] += worker_step_s
-      timings['env_fill_s'] += worker_fill_s
-      counters['invalid_actions'] += invalid
-      counters['done'] += done
-      counters['stockout'] += stockout
-      counters['timeout'] += timeout
-      counters['max_frame_reached'] += max_frame
-
-    policy_start = time.perf_counter()
-    if chunk_len == 1:
-      sample_outputs_list = [
-          actor.step_device(chunk_inputs[0][0], chunk_inputs[0][1])]
-    else:
-      sample_outputs_list = actor.multi_step_device(chunk_inputs)
-    policy_done = time.perf_counter()
-    timings['policy_sample_s'] += policy_done - policy_start
-    counters['policy_sample_calls'] += 1
-
-    _replace_env_action_queue_after_chunk(
-        env_action_queue=env_action_queue,
-        queue_start=env_queue_start,
-        sample_outputs_list=sample_outputs_list,
-        reset_masks=chunk_reset_masks,
-        dummy_outputs=dummy_outputs,
-    )
-    for sample_outputs in sample_outputs_list:
-      learner_action_queue.append(sample_outputs)
+      for index in range(chunk_len):
+        env_action_queue.append(_PendingEnvAction(pending_policy_future, index))
+        learner_action_queue.append(
+            _PendingLearnerAction(pending_policy_future, index))
+  finally:
+    if pending_policy_future is not None:
+      pending_policy_future.result()
+    if policy_executor is not None:
+      policy_executor.shutdown(wait=True)
 
   final_state_start = time.perf_counter()
   states.append(_to_numpy_tree(packed.game))
   resets.append(np.asarray(packed.needs_reset, dtype=np.bool_).copy())
-  actions.append(learner_action_queue[0])
+  actions.append(_resolve_learner_action_entry(learner_action_queue[0]))
+  _resolve_delay_queues(
+      env_action_queue=env_action_queue,
+      learner_action_queue=learner_action_queue,
+      dummy_outputs=dummy_outputs,
+  )
   trajectory = _build_trajectory(
       actor=actor,
       states=states,
@@ -975,7 +1041,10 @@ def _reset_delay_queue_lanes(queue: deque, default, reset_mask: np.ndarray):
   if not queue:
     return
   for index, value in enumerate(queue):
-    queue[index] = _reset_tree_lanes(value, default, reset_mask)
+    if isinstance(value, _PendingEnvAction):
+      value.add_reset(reset_mask)
+    else:
+      queue[index] = _reset_tree_lanes(value, default, reset_mask)
 
 
 def _handle_reset_delay_queues(
@@ -995,6 +1064,61 @@ def _handle_reset_delay_queues(
       reset_mask,
   )
   _ = learner_action_queue
+
+
+@dataclasses.dataclass
+class _PendingEnvAction:
+  future: concurrent.futures.Future
+  index: int
+  reset_mask: np.ndarray | None = None
+
+  def add_reset(self, reset_mask: np.ndarray) -> None:
+    reset_mask = np.asarray(reset_mask, dtype=np.bool_).copy()
+    if self.reset_mask is None:
+      self.reset_mask = reset_mask
+    else:
+      self.reset_mask = np.logical_or(self.reset_mask, reset_mask)
+
+
+@dataclasses.dataclass(frozen=True)
+class _PendingLearnerAction:
+  future: concurrent.futures.Future
+  index: int
+
+
+def _resolve_env_action_entry(entry, *, dummy_outputs):
+  if not isinstance(entry, _PendingEnvAction):
+    return entry
+  sample_outputs = entry.future.result()[entry.index]
+  controller = _to_numpy_tree(sample_outputs.controller_state)
+  if entry.reset_mask is not None and np.any(entry.reset_mask):
+    controller = _reset_tree_lanes(
+        controller,
+        dummy_outputs.controller_state,
+        entry.reset_mask,
+    )
+  return controller
+
+
+def _resolve_learner_action_entry(entry):
+  if not isinstance(entry, _PendingLearnerAction):
+    return entry
+  return entry.future.result()[entry.index]
+
+
+def _resolve_delay_queues(
+    *,
+    env_action_queue: deque,
+    learner_action_queue: deque,
+    dummy_outputs,
+) -> None:
+  for index, entry in enumerate(env_action_queue):
+    env_action_queue[index] = _resolve_env_action_entry(
+        entry,
+        dummy_outputs=dummy_outputs,
+    )
+  for index, entry in enumerate(learner_action_queue):
+    learner_action_queue[index] = _resolve_learner_action_entry(entry)
 
 
 def _replace_env_action_queue_after_chunk(

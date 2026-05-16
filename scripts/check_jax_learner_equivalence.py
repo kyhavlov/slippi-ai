@@ -247,6 +247,7 @@ def _collect_trajectories(
           total_batch=batch_size,
           rollout_length=rollout_length,
           actor_step_chunk_size=actor_step_chunk_size,
+          async_rollout_inference=False,
           controller_spacing=spacing,
           name_code=name_code,
           reward_config=collect_learner._config.reward,
