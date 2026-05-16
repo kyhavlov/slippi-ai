@@ -24,8 +24,7 @@ def main():
   parser.add_argument('--rollout-length', type=int, default=32)
   parser.add_argument('--actor-step-chunk-size', type=int, default=1)
   parser.add_argument('--ppo-batches', type=int, default=1)
-  parser.add_argument('--matchup', choices=sim_env.SUPPORTED_MATCHUPS,
-                      default='fox-falco')
+  parser.add_argument('--character-pool', default='fox,falco')
   parser.add_argument('--minibatch-size', type=int, default=4)
   parser.add_argument('--minibatch-scan-size', type=int, default=4)
   parser.add_argument(
@@ -63,8 +62,8 @@ def main():
     raise ValueError('--rollout-length must exceed the policy delay')
   if args.batch_size <= 0 or args.ppo_batches <= 0 or args.minibatch_size < 0:
     raise ValueError('--batch-size must be positive and --minibatch-size nonnegative')
-  total_packed = args.batch_size * 2
-  if args.minibatch_size > 0 and total_packed % args.minibatch_size:
+  total_players = args.batch_size * 2
+  if args.minibatch_size > 0 and total_players % args.minibatch_size:
     raise ValueError('--minibatch-size must divide batch_size * 2')
 
   state = eval_lib.load_state(path=str(model_path))
@@ -74,19 +73,19 @@ def main():
       rollout_length=args.rollout_length,
       actor_step_chunk_size=args.actor_step_chunk_size,
       ppo_batches=args.ppo_batches,
-      matchup=args.matchup,
+      character_pool=args.character_pool,
       length=args.length,
       barrier_timeout=args.barrier_timeout,
   )
 
   fallback_scan_size = (
-      args.ppo_batches * total_packed // args.minibatch_size + 1
+      args.ppo_batches * total_players // args.minibatch_size + 1
       if args.minibatch_size > 0 else 1)
   full_minibatch_size = args.minibatch_size if args.compare_minibatch_paths else 0
   full_scan_size = fallback_scan_size if args.compare_minibatch_paths else 1
   full, _, _ = rl_build.build_learner_and_actor(
       state=state,
-      batch_size=total_packed,
+      batch_size=total_players,
       ppo_batches=args.ppo_batches,
       ppo_epochs=1,
       learner_minibatch_size=full_minibatch_size,
@@ -100,7 +99,7 @@ def main():
     _disable_equal_minibatch_fast_paths(full)
   mini, _, _ = rl_build.build_learner_and_actor(
       state=state,
-      batch_size=total_packed,
+      batch_size=total_players,
       ppo_batches=args.ppo_batches,
       ppo_epochs=1,
       learner_minibatch_size=args.minibatch_size,
@@ -111,8 +110,8 @@ def main():
       learner_param_dtype=args.learner_param_dtype,
   )
 
-  initial_full = full.initial_state(total_packed)
-  initial_mini = mini.initial_state(total_packed)
+  initial_full = full.initial_state(total_players)
+  initial_mini = mini.initial_state(total_players)
   step = args.step if args.step is not None else int(state.get('step', 0))
 
   controller_math_diff = None
@@ -146,11 +145,11 @@ def main():
       'rtol': args.rtol,
       'step': step,
       'batch_size': args.batch_size,
-      'total_player_batch_size': total_packed,
+      'total_player_batch_size': total_players,
       'rollout_length': args.rollout_length,
       'actor_step_chunk_size': args.actor_step_chunk_size,
       'ppo_batches': args.ppo_batches,
-      'matchup': args.matchup,
+      'character_pool': args.character_pool,
       'minibatch_size': args.minibatch_size,
       'minibatch_scan_size': args.minibatch_scan_size,
       'compare_minibatch_paths': args.compare_minibatch_paths,
@@ -170,20 +169,21 @@ def _collect_trajectories(
     rollout_length: int,
     actor_step_chunk_size: int,
     ppo_batches: int,
-    matchup: str,
+    character_pool: str,
     length: int,
     barrier_timeout: float,
 ):
   ctx = mp.get_context('spawn')
-  total_packed = batch_size * 2
+  total_players = batch_size * 2
   obs_owner = multiprocess_env.SharedArrayOwner()
-  packed = sim_env.make_packed_game_builder(batch_size, array_factory=obs_owner.array)
+  game_batch = sim_env.make_game_batch_buffers(
+      batch_size, array_factory=obs_owner.array)
   terminal_obs_owner = multiprocess_env.SharedArrayOwner()
-  terminal_packed = sim_env.make_packed_game_builder(
+  terminal_game_batch = sim_env.make_game_batch_buffers(
       batch_size, array_factory=terminal_obs_owner.array)
   action_owner = multiprocess_env.SharedArrayOwner()
-  action = multiprocess_env.shared_encoded_controller(
-      total_packed, action_owner.array)
+  action = multiprocess_env.shared_action_buffer(
+      total_players, action_owner.array)
   spacing = multiprocess_env.default_controller_spacing(state)
   obs_barrier = ctx.Barrier(2)
   action_barrier = ctx.Barrier(2)
@@ -205,7 +205,7 @@ def _collect_trajectories(
             28800,
             0,
             0,
-            matchup,
+            character_pool,
             obs_owner.specs,
             terminal_obs_owner.specs,
             action_owner.specs,
@@ -223,7 +223,7 @@ def _collect_trajectories(
 
     collect_learner, actor, name_code = rl_build.build_learner_and_actor(
         state=state,
-        batch_size=total_packed,
+        batch_size=total_players,
         ppo_batches=1,
         ppo_epochs=1,
         learner_minibatch_size=0,
@@ -233,7 +233,7 @@ def _collect_trajectories(
         sample_temperature=1.0,
         learner_param_dtype='float32',
     )
-    dummy_outputs = actor._policy.controller_head.dummy_sample_outputs([total_packed])
+    dummy_outputs = actor._policy.controller_head.dummy_sample_outputs([total_players])
     env_action_queue = deque(
         [jax_rollout.to_numpy_tree(dummy_outputs.controller_state)
          for _ in range(actor._policy.delay)])
@@ -247,8 +247,8 @@ def _collect_trajectories(
     for _ in range(ppo_batches):
       trajectory, _ = jax_rollout.collect_trajectory(
           actor=actor,
-          packed=packed,
-          terminal_packed=terminal_packed,
+          game_batch=game_batch,
+          terminal_game_batch=terminal_game_batch,
           action=action,
           env_action_queue=env_action_queue,
           learner_action_queue=learner_action_queue,

@@ -14,6 +14,11 @@ class JaxSimStaggerTest(unittest.TestCase):
 
   def test_stagger_schedule_activates_one_worker_per_interval(self):
     self.assertEqual(
+        jax_rollout.stagger_steps_per_worker(
+            workers=4, total_steps=2400),
+        600,
+    )
+    self.assertEqual(
         jax_rollout.initial_stagger_total_steps(
             workers=4, stagger_steps=600),
         2400,

@@ -75,14 +75,13 @@ def main():
                       help='Sim EnvBatch ring buffer length.')
   parser.add_argument('--max-game-frames', type=int, default=28800)
   parser.add_argument(
-      '--initial-stagger-steps',
+      '--initial-stagger-total-steps',
       type=int,
       default=0,
       help=(
           'Before training, activate one sim worker at a time and run this '
-          'many policy-driven sim steps between activations.'))
-  parser.add_argument('--matchup', choices=sim_env.SUPPORTED_MATCHUPS,
-                      default='fox-falco')
+          'many total policy-driven sim steps across the stagger.'))
+  parser.add_argument('--character-pool', default='fox,falco')
   parser.add_argument('--sample-temperature', type=float, default=1.0)
   parser.add_argument('--barrier-timeout', type=float, default=900.0)
   parser.add_argument('--print-every', type=int, default=1)
@@ -107,8 +106,8 @@ def main():
     raise ValueError('--workers and --batch-size must be positive')
   if args.rollout_length <= 0 or args.ppo_batches < 0 or args.updates <= 0:
     raise ValueError('--rollout-length and --updates must be positive')
-  if args.initial_stagger_steps < 0:
-    raise ValueError('--initial-stagger-steps must be non-negative')
+  if args.initial_stagger_total_steps < 0:
+    raise ValueError('--initial-stagger-total-steps must be non-negative')
   save_path = Path(args.save_path) if args.save_path else None
   log_path = Path(args.log_jsonl) if args.log_jsonl else None
   trace_path = Path(args.jax_trace_dir) if args.jax_trace_dir else None
@@ -121,16 +120,17 @@ def main():
 
   state = eval_lib.load_state(path=str(model_path))
   total_batch = args.workers * args.batch_size
-  total_packed = total_batch * 2
+  total_players = total_batch * 2
   ctx = mp.get_context('spawn')
 
   obs_owner = multiprocess_env.SharedArrayOwner()
-  packed = sim_env.make_packed_game_builder(total_batch, array_factory=obs_owner.array)
+  game_batch = sim_env.make_game_batch_buffers(
+      total_batch, array_factory=obs_owner.array)
   terminal_obs_owner = multiprocess_env.SharedArrayOwner()
-  terminal_packed = sim_env.make_packed_game_builder(
+  terminal_game_batch = sim_env.make_game_batch_buffers(
       total_batch, array_factory=terminal_obs_owner.array)
   action_owner = multiprocess_env.SharedArrayOwner()
-  action = multiprocess_env.shared_encoded_controller(total_packed, action_owner.array)
+  action = multiprocess_env.shared_action_buffer(total_players, action_owner.array)
   spacing = multiprocess_env.default_controller_spacing(state)
 
   obs_barrier = ctx.Barrier(args.workers + 1)
@@ -140,12 +140,12 @@ def main():
   step_timings = ctx.Array('d', args.workers * 3, lock=False)
   active_worker_count = ctx.Value(
       'i',
-      1 if args.initial_stagger_steps > 0 else args.workers,
+      1 if args.initial_stagger_total_steps > 0 else args.workers,
       lock=False,
   )
   measure_worker_steps = ctx.Value(
       'b',
-      args.initial_stagger_steps == 0,
+      args.initial_stagger_total_steps == 0,
       lock=False,
   )
   result_queue = ctx.Queue()
@@ -165,7 +165,7 @@ def main():
               args.max_game_frames,
               0,
               0,
-              args.matchup,
+              args.character_pool,
               obs_owner.specs,
               terminal_obs_owner.specs,
               action_owner.specs,
@@ -186,7 +186,7 @@ def main():
 
     learner, actor, name_code = rl_build.build_learner_and_actor(
         state=state,
-        batch_size=total_packed,
+        batch_size=total_players,
         ppo_batches=args.ppo_batches,
         ppo_epochs=args.ppo_epochs,
         learner_minibatch_size=args.learner_minibatch_size,
@@ -224,8 +224,8 @@ def main():
       raise ValueError(
           f'--actor-step-chunk-size must be <= policy delay '
           f'{actor._policy.delay}, got {args.actor_step_chunk_size}')
-    learner_state = learner.initial_state(total_packed)
-    dummy_outputs = actor._policy.controller_head.dummy_sample_outputs([total_packed])
+    learner_state = learner.initial_state(total_players)
+    dummy_outputs = actor._policy.controller_head.dummy_sample_outputs([total_players])
     env_action_queue = deque(
         [jax_rollout.to_numpy_tree(dummy_outputs.controller_state)
          for _ in range(actor._policy.delay)])
@@ -236,7 +236,7 @@ def main():
         obs_barrier, args.barrier_timeout, 'initial observations')
     initial_stagger = jax_rollout.run_initial_stagger_warmup(
         actor=actor,
-        packed=packed,
+        game_batch=game_batch,
         action=action,
         env_action_queue=env_action_queue,
         learner_action_queue=learner_action_queue,
@@ -248,7 +248,10 @@ def main():
         step_counters=step_counters,
         step_timings=step_timings,
         workers=args.workers,
-        stagger_steps=args.initial_stagger_steps,
+        stagger_steps=jax_rollout.stagger_steps_per_worker(
+            args.workers,
+            args.initial_stagger_total_steps,
+        ),
         total_batch=total_batch,
         controller_spacing=spacing,
         barrier_timeout=args.barrier_timeout,
@@ -289,8 +292,8 @@ def main():
         rollout_start = time.perf_counter()
         trajectory, rollout_stats = jax_rollout.collect_trajectory(
             actor=actor,
-            packed=packed,
-            terminal_packed=terminal_packed,
+            game_batch=game_batch,
+            terminal_game_batch=terminal_game_batch,
             action=action,
             env_action_queue=env_action_queue,
             learner_action_queue=learner_action_queue,
@@ -374,7 +377,7 @@ def main():
         measured_updates += 1
 
       update_env_steps = total_batch * args.rollout_length
-      update_player_frames = total_packed * args.rollout_length
+      update_player_frames = total_players * args.rollout_length
       update_total_s = max(update_timings['update_total_s'], 1e-9)
       timing_summary = jax_rollout.timing_summary(update_timings)
       if log_path is not None:
@@ -419,14 +422,14 @@ def main():
 
     measured_elapsed = 0.0 if measured_start is None else measured_end - measured_start
     measured_env_steps = measured_rollout_steps * total_batch
-    measured_player_frames = measured_rollout_steps * total_packed
+    measured_player_frames = measured_rollout_steps * total_players
     summary = {
         'benchmark': {
             'model_path': str(model_path),
             'workers': args.workers,
             'batch_size_per_worker': args.batch_size,
             'total_env_batch_size': total_batch,
-            'total_player_batch_size': total_packed,
+            'total_player_batch_size': total_players,
             'rollout_length': args.rollout_length,
             'actor_step_chunk_size': args.actor_step_chunk_size,
             'async_rollout_inference': args.async_rollout_inference,
@@ -439,9 +442,9 @@ def main():
             'updates': args.updates,
             'warmup_updates': args.warmup_updates,
             'policy_delay': actor._policy.delay,
-            'initial_stagger_steps': args.initial_stagger_steps,
+            'initial_stagger_total_steps': args.initial_stagger_total_steps,
             'initial_stagger': initial_stagger,
-            'matchup': args.matchup,
+            'character_pool': args.character_pool,
             'learning_rate': learner._config.learning_rate,
             'policy_gradient_weight': learner._config.policy_gradient_weight,
             'kl_teacher_weight': learner._config.kl_teacher_weight,

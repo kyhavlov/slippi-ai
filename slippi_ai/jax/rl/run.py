@@ -3,6 +3,11 @@
 if __name__ == '__main__':
   __spec__ = None  # https://github.com/python/cpython/issues/87115
 
+  import sys
+
+  sys.stdout.reconfigure(line_buffering=True)
+  sys.stderr.reconfigure(line_buffering=True)
+
   from absl import app
   import fancyflags as ff
 

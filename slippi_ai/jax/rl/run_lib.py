@@ -22,8 +22,11 @@ from slippi_ai import (
     utils,
 )
 from slippi_ai.jax import saving as jax_saving
+from slippi_ai.jax import agents as jax_agents
 from slippi_ai.jax import train_lib as train_lib
 from slippi_ai.jax.rl import learner as learner_lib
+from slippi_ai.sim_env import jax_rollout
+from slippi_ai.sim_env import multiprocess_env
 from slippi_ai.types import Game
 
 field = lambda f: dataclasses.field(default_factory=f)
@@ -53,6 +56,11 @@ class ActorConfig:
   inner_batch_size: int = 1
   gpu_inference: bool = True
   use_fake_envs: bool = False
+  env_backend: str = 'dolphin'
+  sim_character_pool: str = 'fox,falco'
+  sim_max_game_frames: int = 28800
+  sim_initial_stagger_total_steps: int = 0
+  sim_barrier_timeout: float = 900.0
 
 
 @dataclasses.dataclass
@@ -112,7 +120,7 @@ class OpponentConfig:
   train: bool = False
 
   def should_update(self, step: int):
-    if self.type is not OpponentType.SELF:
+    if self.type != OpponentType.SELF:
       return False
     if self.train:
       return True
@@ -121,7 +129,7 @@ class OpponentConfig:
     return step % self.update_interval == 0
 
   def should_train(self):
-    return self.type is OpponentType.SELF and self.train
+    return self.type == OpponentType.SELF and self.train
 
 
 @dataclasses.dataclass
@@ -189,6 +197,9 @@ class LearnerManager:
 
   def _rollout(self) -> tuple[evaluators.Trajectory, dict]:
     trajectories, timings = self.actor.rollout(self._unroll_length)
+
+    if isinstance(trajectories, evaluators.Trajectory):
+      return trajectories, timings
 
     if self._config.opponent.should_train():
       ports = [self._port, self._enemy_port]
@@ -265,12 +276,24 @@ def reset_optimizer_steps(imitation_state: dict):
     imitation_state['state'][key]['step'] = 0
 
 
+def _name_codes(state: dict, names: list[str]) -> np.ndarray:
+  return np.asarray(
+      [eval_lib.get_name_code(state, name) for name in names],
+      dtype=np.int32,
+  )
+
+
+def _sim_buffer_length(rollout_length: int, policy_delay: int) -> int:
+  needed = int(rollout_length) + int(policy_delay) + 2
+  return 1 << (needed - 1).bit_length()
+
+
 def run(config: Config):
   tag = config.runtime.tag or train_lib.get_experiment_tag()
   expt_dir = config.runtime.expt_dir
   if expt_dir is None:
     expt_dir = os.path.join(config.runtime.expt_root, tag)
-    os.makedirs(expt_dir, exist_ok=True)
+  os.makedirs(expt_dir, exist_ok=True)
   logging.info('experiment directory: %s', expt_dir)
 
   if config.agent.path is not None:
@@ -367,7 +390,8 @@ def run(config: Config):
     opponent_players = [dolphin_lib.AI() for _ in range(batch_size)]
 
   main_agent_kwargs = config.agent.get_kwargs()
-  config.agent.check_allowed_chars(rl_state)
+  if config.actor.env_backend == 'dolphin':
+    config.agent.check_allowed_chars(rl_state)
   main_agent_kwargs['state'] = rl_state
   agent_kwargs = {PORT: main_agent_kwargs}
 
@@ -416,6 +440,59 @@ def run(config: Config):
       if opp_char is not None:
         player.character = opp_char
 
+  if config.actor.env_backend == 'sim':
+    if not config.opponent.should_train():
+      raise ValueError('JAX sim RL currently requires self-play training.')
+    if config.actor.inner_batch_size <= 0:
+      raise ValueError('actor.inner_batch_size must be positive for sim RL.')
+    if config.actor.num_envs % config.actor.inner_batch_size:
+      raise ValueError(
+          'actor.num_envs must be divisible by actor.inner_batch_size '
+          'for sim RL.')
+    if config.agent.batch_steps > 0 and (
+        config.agent.batch_steps > policy.delay):
+      raise ValueError(
+          f'agent.batch_steps={config.agent.batch_steps} must be <= '
+          f'policy delay {policy.delay} for sim RL.')
+
+    sim_name_code = _name_codes(
+        rl_state,
+        list(main_agent_kwargs['name']) + list(opponent_kwargs['name']),
+    )
+
+    def build_actor():
+      sim_actor = jax_agents.BasicAgent(
+          policy=learner.policy,
+          batch_size=config.actor.num_envs * 2,
+          name_code=sim_name_code,
+          compile=config.agent.compile,
+          pack_args=True,
+      )
+      return jax_rollout.JaxSimRolloutWorker(
+          actor=sim_actor,
+          total_batch=config.actor.num_envs,
+          worker_batch_size=config.actor.inner_batch_size,
+          length=_sim_buffer_length(config.actor.rollout_length, policy.delay),
+          max_game_frames=config.actor.sim_max_game_frames,
+          character_pool=config.actor.sim_character_pool,
+          controller_spacing=multiprocess_env.default_controller_spacing(
+              rl_state),
+          name_code=sim_name_code,
+          reward_config=config.learner.reward,
+          actor_step_chunk_size=max(1, config.agent.batch_steps),
+          async_rollout_inference=config.agent.async_inference,
+          initial_stagger_total_steps=(
+              config.actor.sim_initial_stagger_total_steps),
+          barrier_timeout=config.actor.sim_barrier_timeout,
+          print_every=jax_rollout.stagger_steps_per_worker(
+              config.actor.num_envs // config.actor.inner_batch_size,
+              config.actor.sim_initial_stagger_total_steps,
+          ),
+      )
+
+  elif config.actor.env_backend != 'dolphin':
+    raise ValueError(f'Unknown actor env_backend: {config.actor.env_backend}')
+
   dolphin_kwargs = [
       dict(
           players={
@@ -433,15 +510,16 @@ def run(config: Config):
         inner_batch_size=config.actor.inner_batch_size,
     )
 
-  build_actor = lambda: evaluators.RolloutWorker(
-      agent_kwargs=agent_kwargs,
-      dolphin_kwargs=dolphin_kwargs,
-      env_kwargs=env_kwargs,
-      num_envs=config.actor.num_envs,
-      async_envs=config.actor.async_envs,
-      use_gpu=config.actor.gpu_inference,
-      use_fake_envs=config.actor.use_fake_envs,
-  )
+  if config.actor.env_backend == 'dolphin':
+    build_actor = lambda: evaluators.RolloutWorker(
+        agent_kwargs=agent_kwargs,
+        dolphin_kwargs=dolphin_kwargs,
+        env_kwargs=env_kwargs,
+        num_envs=config.actor.num_envs,
+        async_envs=config.actor.async_envs,
+        use_gpu=config.actor.gpu_inference,
+        use_fake_envs=config.actor.use_fake_envs,
+    )
 
   learner_manager = LearnerManager(
       config=config,
@@ -477,7 +555,7 @@ def run(config: Config):
         reversed_name_combination_indices[rev(nc)].append(i)
 
     def get_name_matchup_stats(states: Game) -> dict:
-      tm_kos = reward.ko_diff(states)  # [T, P, B]
+      tm_kos = reward.compute_rewards(states, damage_ratio=0)  # [T, P, B]
       bm_kos = tm_kos.mean(axis=(0, 1))  # [B]
       stats = {}
       for nc, indices in ordered_name_combination_indices.items():
@@ -494,28 +572,43 @@ def run(config: Config):
       metrics: dict,
   ) -> dict:
     step_time = step_profiler.mean_time()
-    frames_per_rollout = config.actor.num_envs * config.actor.rollout_length
+    latest_step_time = step_profiler.last_time
+    players_per_env = 2 if config.opponent.should_train() else 1
+    frames_per_rollout = (
+        config.actor.num_envs * players_per_env * config.actor.rollout_length)
     fps = len(trajectories) * frames_per_rollout / step_time
+    latest_fps = (
+        len(trajectories) * frames_per_rollout
+        / max(latest_step_time, 1e-9))
     mps = fps / (60 * 60)
 
     timings = dict(
         rollout=learner_manager.rollout_profiler.mean_time(),
+        rollout_latest=learner_manager.rollout_profiler.last_time,
         learner=learner_manager.learner_profiler.mean_time(),
+        learner_latest=learner_manager.learner_profiler.last_time,
         reset=learner_manager.reset_profiler.mean_time(),
         total=step_time,
+        total_latest=latest_step_time,
         fps=fps,
+        fps_latest=latest_fps,
         mps=mps,
+        mps_latest=latest_fps / (60 * 60),
     )
     actor_timing = metrics['actor'].pop('timing')
-    for key in ['env_pop', 'env_push']:
-      timings[key] = actor_timing[key]
+    if config.actor.env_backend == 'sim':
+      timings.update(actor_timing['sim'])
+      metrics['actor_counters'] = metrics['actor'].get('counters', {})
+    else:
+      for key in ['env_pop', 'env_push']:
+        timings[key] = actor_timing[key]
 
-    agent_keys = ['agent_step']
-    if config.agent.async_inference:
-      agent_keys.append('agent_pop')
-    for key in agent_keys:
-      timings[key] = actor_timing[key][PORT]
-      timings[key + '_total'] = sum(actor_timing[key].values())
+      agent_keys = ['agent_step']
+      if config.agent.async_inference:
+        agent_keys.append('agent_pop')
+      for key in agent_keys:
+        timings[key] = actor_timing[key][PORT]
+        timings[key + '_total'] = sum(actor_timing[key].values())
 
     states: Game = utils.map_nt(
         lambda *xs: np.stack(xs, axis=1),
@@ -530,7 +623,8 @@ def run(config: Config):
           lambda x: x[:, :, :batch_size], states)
       metrics['by_name'] = get_name_matchup_stats(deduplicated_states)
     else:
-      metrics['ko_diff'] = reward.ko_diff(states) * MINUTES_PER_FRAME
+      metrics['ko_diff'] = (
+          reward.compute_rewards(states, damage_ratio=0) * MINUTES_PER_FRAME)
 
     metrics.update(
         timings=timings,
@@ -540,7 +634,9 @@ def run(config: Config):
 
   logger = Logger()
   steps_per_epoch = config.learner.ppo.num_batches
-  frames_per_step = config.actor.num_envs * config.actor.rollout_length
+  players_per_env = 2 if config.opponent.should_train() else 1
+  frames_per_step = (
+      config.actor.num_envs * players_per_env * config.actor.rollout_length)
 
   def flush(epoch: int):
     total_steps = epoch * steps_per_epoch
@@ -553,23 +649,45 @@ def run(config: Config):
     if metrics is None:
       return
 
-    print('\nStep:', epoch)
+    print(
+        f'\nStep: {epoch} total_frames: {metrics["total_frames"]:.0f}',
+        flush=True,
+    )
 
     timings: dict = metrics['timings']
+    timing_keys = [
+        'total_latest', 'rollout_latest', 'learner_latest',
+        'fps_latest', 'mps_latest',
+        'total', 'rollout', 'learner', 'fps', 'mps',
+        'agent_step_s', 'policy_wait_s', 'policy_dependency_wait_s',
+        'policy_blocking_s', 'env_step_s', 'env_fill_s', 'obs_wait_s',
+        'action_copy_s', 'action_release_s',
+    ]
     timing_str = ', '.join(
-        ['{k}: {v:.3f}'.format(k=k, v=v) for k, v in timings.items()])
-    print(timing_str)
+        f'{key}: {timings[key]:.3f}'
+        for key in timing_keys
+        if key in timings)
+    print(timing_str, flush=True)
+    actor_counters = metrics.get('actor_counters')
+    if actor_counters:
+      counter_str = ', '.join(
+          f'{key}: {value:.0f}'
+          for key, value in sorted(actor_counters.items()))
+      print(f'actor_counters: {counter_str}', flush=True)
 
     learner_metrics = metrics['learner']
     post_update = learner_metrics['post_update']
     mean_actor_kl = post_update['actor_kl']['mean']
     max_actor_kl = post_update['actor_kl']['max']
-    print(f'actor_kl: mean={mean_actor_kl:.3g} max={max_actor_kl:.3g}')
+    print(f'actor_kl: mean={mean_actor_kl:.3g} max={max_actor_kl:.3g}',
+          flush=True)
     teacher_kl = post_update['teacher_kl']
-    print(f'teacher_kl: {teacher_kl:.3g}')
-    print(f'uev: {learner_metrics["value"]["uev"]:.3f}')
-    if config.opponent.type is not OpponentType.SELF:
-      print(f'ko_diff: {metrics["ko_diff"]:.3f}')
+    if isinstance(teacher_kl, dict):
+      teacher_kl = teacher_kl['mean']
+    print(f'teacher_kl: {teacher_kl:.3g}', flush=True)
+    print(f'uev: {learner_metrics["value"]["uev"]:.3f}', flush=True)
+    if config.opponent.type != OpponentType.SELF:
+      print(f'ko_diff: {metrics["ko_diff"]:.3f}', flush=True)
 
   maybe_flush = utils.Periodically(flush, config.runtime.log_interval)
 
@@ -619,7 +737,10 @@ def run(config: Config):
         trajectories, metrics = learner_manager.step(step)
 
       logger.record(get_log_data(trajectories, metrics))
-      maybe_flush(step)
+      if config.actor.env_backend == 'sim':
+        flush(step)
+      else:
+        maybe_flush(step)
 
       maybe_save(step)
       step += 1

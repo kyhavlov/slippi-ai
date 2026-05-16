@@ -1038,3 +1038,7 @@ def update_character(player: dolphin.AI, config: dict):
     # Could use character_list[0] here, but that might lead to silently never
     # picking the other options.
     raise ValueError(f"Character must be one of {character_list}")
+
+
+def allowed_characters(config: dict):
+  return data.chars_from_string(config['dataset']['allowed_characters'])
