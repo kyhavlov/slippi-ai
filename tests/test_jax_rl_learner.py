@@ -1,11 +1,13 @@
 import unittest
 import concurrent.futures
+import dataclasses
 from collections import deque
 
 import melee
 import numpy as np
 
 from slippi_ai.sim_env import jax_rollout
+from slippi_ai.sim_env import rewards as sim_rewards
 from slippi_ai import data
 from slippi_ai import reward
 from slippi_ai import types
@@ -139,6 +141,35 @@ def _game_from_players(shape, p0, p2):
   )
 
 
+def _generic_batched_transition_rewards(
+    time_major,
+    terminal_reward_overrides,
+    reward_config: reward.RewardConfig,
+):
+  if terminal_reward_overrides:
+    terminal_games = [
+        override.terminal_game for override in terminal_reward_overrides]
+
+    def pair_leaf(leaf, *terminal_leaves):
+      next_leaf = np.array(leaf[1:], copy=True)
+      for override, terminal_leaf in zip(
+          terminal_reward_overrides,
+          terminal_leaves,
+      ):
+        next_leaf[override.transition_index, override.reset_mask] = terminal_leaf
+      return np.stack([leaf[:-1], next_leaf], axis=0)
+
+    transition_pairs = utils.map_nt(pair_leaf, time_major, *terminal_games)
+  else:
+    transition_pairs = utils.map_single_structure(
+        lambda leaf: np.stack([leaf[:-1], leaf[1:]], axis=0),
+        time_major,
+    )
+  return reward.compute_rewards(
+      transition_pairs,
+      **dataclasses.asdict(reward_config))[0]
+
+
 class JaxRlLearnerTest(unittest.TestCase):
 
   def test_update_rewards_matches_legacy_tf_on_reset_boundary_stock_loss(self):
@@ -220,18 +251,18 @@ class JaxRlLearnerTest(unittest.TestCase):
         state1,
         reset_state2,
     ])
-    uncorrected = jax_rollout.batched_transition_rewards(
+    uncorrected = sim_rewards.compute_transition_rewards(
         time_major,
         terminal_reward_overrides=[],
         reward_config=reward.RewardConfig(),
     )
-    actual = jax_rollout.batched_transition_rewards(
+    actual = sim_rewards.compute_transition_rewards(
         time_major,
         terminal_reward_overrides=[
-            jax_rollout.TerminalRewardOverride(
+            sim_rewards.TerminalRewardOverride(
                 transition_index=1,
                 reset_mask=reset_mask,
-                terminal_game=jax_rollout.masked_numpy_tree(
+                terminal_game=sim_rewards.masked_numpy_tree(
                     terminal_state2,
                     reset_mask,
                 ),
@@ -244,6 +275,72 @@ class JaxRlLearnerTest(unittest.TestCase):
     np.testing.assert_allclose(actual[0], uncorrected[0])
     self.assertAlmostEqual(float(actual[1, 0]), float(uncorrected[1, 0]))
     self.assertGreater(float(actual[1, 1]), float(uncorrected[1, 1]))
+
+  def test_fast_sim_rewards_match_generic_reward_path(self):
+    shape = (4, 2)
+    standing = melee.Action.STANDING.value
+    edge = melee.Action.EDGE_CATCHING.value
+    dead = melee.Action.DEAD_DOWN.value
+    p0 = _player(
+        shape,
+        melee.Character.FOX,
+        actions=[
+            standing, standing,
+            standing, edge,
+            standing, standing,
+            standing, standing,
+        ],
+        stocks=[
+            4, 4,
+            4, 4,
+            4, 3,
+            4, 3,
+        ],
+    )
+    p0 = p0._replace(
+        percent=np.array([[0, 0], [12, 4], [20, 9], [25, 9]], dtype=np.uint16),
+        x=np.array([[-20, -10], [-35, -15], [-90, -25], [-92, -30]], dtype=np.float32),
+        y=np.array([[0, 0], [0, 5], [-5, 10], [-15, 15]], dtype=np.float32),
+    )
+    p2 = _player(
+        shape,
+        melee.Character.FOX,
+        actions=[
+            standing, standing,
+            standing, standing,
+            dead, standing,
+            dead, standing,
+        ],
+        stocks=[
+            4, 4,
+            4, 4,
+            3, 4,
+            3, 4,
+        ],
+        percent=40,
+    )
+    p2 = p2._replace(
+        percent=np.array([[0, 0], [5, 8], [80, 10], [0, 12]], dtype=np.uint16),
+        x=np.array([[20, 10], [25, 16], [30, 30], [35, 35]], dtype=np.float32),
+        y=np.array([[0, 0], [0, 0], [0, 1], [0, 2]], dtype=np.float32),
+    )
+    game = _game_from_players(shape, p0, p2)
+    config = reward.RewardConfig(
+        damage_ratio=0.01,
+        ledge_grab_penalty=0.02,
+        approaching_factor=1e-3,
+        stalling_penalty=0.1,
+        zelda_penalty=0.01,
+    )
+
+    expected = _generic_batched_transition_rewards(game, [], config)
+    actual = sim_rewards.compute_transition_rewards(
+        game,
+        terminal_reward_overrides=[],
+        reward_config=config,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
   def test_reset_does_not_rewrite_historical_learner_delay_outputs(self):
     queue = deque([
