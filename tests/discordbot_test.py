@@ -1,4 +1,5 @@
 import dataclasses
+import types
 import unittest
 from unittest import mock
 from typing import Optional
@@ -135,6 +136,26 @@ class DiscordAutocompleteHelperTest(unittest.TestCase):
         [('Cody', 'Cody')],
     )
 
+  def test_playstyle_autocomplete_uses_character_default_option(self):
+    state = {
+        'name_map': {
+            'Master Player': 0,
+            'Dragunov': 1,
+            'Ralph': 2,
+        },
+    }
+
+    choices = discordbot.get_playstyle_autocomplete_choices(state, '', 'Dragunov')
+
+    self.assertEqual(
+        (choices[0].name, choices[0].value),
+        ('Default (Dragunov)', discordbot.DEFAULT_PLAYSTYLE_SENTINEL),
+    )
+    self.assertEqual(
+        [(choice.name, choice.value) for choice in choices[1:]],
+        [('Master Player', 'Master Player'), ('Ralph', 'Ralph')],
+    )
+
   def test_playstyle_autocomplete_uses_none_for_models_without_names(self):
     state = {}
 
@@ -155,6 +176,49 @@ class DiscordAutocompleteHelperTest(unittest.TestCase):
     )
 
     self.assertEqual(resolved, 'Master Player')
+
+  def test_missing_playstyle_resolves_to_character_default(self):
+    state = {'name_map': {'Master Player': 0, 'Dragunov': 1}}
+
+    resolved = discordbot.resolve_playstyle_for_state(
+        None,
+        'Dragunov',
+        state,
+    )
+
+    self.assertEqual(resolved, 'Dragunov')
+
+  def test_parse_model_scoped_character_playstyle_defaults(self):
+    defaults = discordbot.parse_default_playstyle_by_character(
+        'rl_doubles_d21_v4_latest:MARTH=Dragunov,FOX=Ralph,SHEIK=Darkatma')
+
+    self.assertEqual(
+        defaults,
+        {
+            'rl_doubles_d21_v4_latest': {
+                discordbot.Character.MARTH: 'Dragunov',
+                discordbot.Character.FOX: 'Ralph',
+                discordbot.Character.SHEIK: 'Darkatma',
+            },
+        },
+    )
+
+  def test_character_default_playstyle_validates_supported_name(self):
+    state = {'name_map': {'Master Player': 0, 'Dragunov': 1}}
+    defaults = {
+        'rl_doubles_d21_v4_latest': {
+            discordbot.Character.MARTH: 'dragunov',
+        },
+    }
+
+    default = discordbot.get_character_default_playstyle(
+        'rl_doubles_d21_v4_latest',
+        discordbot.Character.MARTH,
+        defaults,
+        state,
+    )
+
+    self.assertEqual(default, 'Dragunov')
 
   def test_character_autocomplete_uses_allowed_characters(self):
     state = {
@@ -199,6 +263,58 @@ class DiscordPlayerOrderTest(unittest.TestCase):
     )
 
     self.assertEqual(order, (2, 3, 1, 4))
+
+
+class DiscordBotPlaystyleDefaultTest(unittest.IsolatedAsyncioTestCase):
+
+  def _bot(self):
+    bot = object.__new__(discordbot.DiscordBot)
+    bot._default_agent_name = 'rl_doubles_d21_v4_latest'
+    bot._requested_agents = {}
+    bot.agent_kwargs = {'name': 'Master Player'}
+    bot._models = {
+        'rl_doubles_d21_v4_latest': {
+            'name_map': {
+                'Master Player': 0,
+                'Dragunov': 1,
+                'Ralph': 2,
+            },
+        },
+    }
+    bot._default_playstyles_by_character = {
+        'rl_doubles_d21_v4_latest': {
+            discordbot.Character.MARTH: 'Dragunov',
+            discordbot.Character.FOX: 'Ralph',
+        },
+    }
+    return bot
+
+  async def test_playstyle_autocomplete_uses_selected_character_default(self):
+    bot = self._bot()
+    interaction = types.SimpleNamespace(
+        user=types.SimpleNamespace(id=1),
+        namespace=types.SimpleNamespace(character1='MARTH'),
+    )
+
+    choices = await discordbot.DiscordBot._autocomplete_playstyle_for_port(
+        bot, interaction, '', 1)
+
+    self.assertEqual(
+        (choices[0].name, choices[0].value),
+        ('Default (Dragunov)', discordbot.DEFAULT_PLAYSTYLE_SENTINEL),
+    )
+
+  def test_missing_playstyle_uses_character_default_at_launch(self):
+    bot = self._bot()
+
+    resolved = discordbot.DiscordBot._resolve_playstyle(
+        bot,
+        'rl_doubles_d21_v4_latest',
+        None,
+        discordbot.Character.FOX,
+    )
+
+    self.assertEqual(resolved, 'Ralph')
 
 
 class FakeEmbedController:

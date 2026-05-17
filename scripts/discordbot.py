@@ -69,6 +69,10 @@ GPU_MICROBATCH_MS = flags.DEFINE_float(
 GPU_MEMORY_LIMIT_MB = flags.DEFINE_integer(
     'gpu_memory_limit_mb', None,
     'Optional TensorFlow VRAM cap in MB for the shared Discord GPU inference process.')
+DEFAULT_PLAYSTYLE_BY_CHARACTER = flags.DEFINE_string(
+    'default_playstyle_by_character', '',
+    'Semicolon-separated model-scoped character defaults, e.g. '
+    'rl_doubles_d21_v4_latest:MARTH=Dragunov,FOX=Ralph,SHEIK=Darkatma')
 
 # Session management settings
 MENU_TIMEOUT = flags.DEFINE_float(
@@ -144,6 +148,20 @@ def _supported_state_names(state: dict) -> list[str]:
     return [by_code[code] for code in sorted(by_code)]
 
 
+def get_supported_playstyle_name(state: dict, playstyle: Optional[str]) -> Optional[str]:
+    if not playstyle:
+        return None
+    normalized = nametags.normalize_name(playstyle)
+    for supported_name in _supported_state_names(state):
+        supported_normalized = nametags.normalize_name(supported_name)
+        if (
+            supported_normalized == normalized or
+            supported_normalized.lower() == normalized.lower()
+        ):
+            return supported_name
+    return None
+
+
 def resolve_playstyle_for_state(
     requested_playstyle: Optional[str],
     default_name: Optional[str],
@@ -161,16 +179,10 @@ def resolve_playstyle_for_state(
     if requested_playstyle == DEFAULT_PLAYSTYLE_SENTINEL:
         requested_playstyle = None
 
-    normalized_to_supported = {
-        nametags.normalize_name(name): name for name in supported_names
-    }
-
     for candidate in (requested_playstyle, default_name, nametags.DEFAULT_NAME):
-        if not candidate:
-            continue
-        normalized = nametags.normalize_name(candidate)
-        if normalized in normalized_to_supported:
-            return normalized_to_supported[normalized]
+        supported_candidate = get_supported_playstyle_name(state, candidate)
+        if supported_candidate is not None:
+            return supported_candidate
 
     fallback = supported_names[0]
     if requested_playstyle:
@@ -219,9 +231,13 @@ def get_allowed_characters_for_state(state: dict) -> Optional[list[Character]]:
 def get_playstyle_autocomplete_choices(
     state: dict,
     current: str,
+    default_playstyle: Optional[str] = None,
 ) -> list[app_commands.Choice[str]]:
     supported_names = _supported_state_names(state)
-    default_playstyle = supported_names[0] if supported_names else None
+    default_playstyle = (
+        get_supported_playstyle_name(state, default_playstyle) or
+        (supported_names[0] if supported_names else None)
+    )
     current_normalized = current.strip().lower()
     choices = []
     default_label = (
@@ -1409,6 +1425,102 @@ def get_character_from_name(name: str) -> Character:
     logging.warning(f"Could not find character matching '{name}', defaulting to Fox")
     return Character.FOX
 
+
+def parse_character_config_key(name: str) -> Character:
+    normalized = name.strip().upper().replace(' ', '').replace('-', '').replace('.', '')
+    aliases = {
+        'CAPTAINFALCON': Character.CPTFALCON,
+        'FALCON': Character.CPTFALCON,
+        'DRMARIO': Character.DOC,
+        'DOC': Character.DOC,
+        'DONKEYKONG': Character.DK,
+        'DK': Character.DK,
+        'MRGAMEANDWATCH': Character.GAMEANDWATCH,
+        'GAMEANDWATCH': Character.GAMEANDWATCH,
+        'ICECLIMBERS': Character.POPO,
+        'ICIES': Character.POPO,
+        'YOUNGLINK': Character.YLINK,
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    return Character[normalized]
+
+
+def parse_default_playstyle_by_character(
+    raw_config: str,
+) -> Dict[str, Dict[Character, str]]:
+    defaults: Dict[str, Dict[Character, str]] = {}
+    if not raw_config.strip():
+        return defaults
+
+    for model_group in raw_config.split(';'):
+        model_group = model_group.strip()
+        if not model_group:
+            continue
+        if ':' not in model_group:
+            raise ValueError(
+                f'Default playstyle group "{model_group}" is missing model: prefix')
+        model_name, assignments_text = model_group.split(':', 1)
+        model_name = os.path.basename(model_name.strip())
+        if not model_name:
+            raise ValueError(f'Default playstyle group "{model_group}" has empty model')
+
+        model_defaults = defaults.setdefault(model_name, {})
+        for assignment in assignments_text.split(','):
+            assignment = assignment.strip()
+            if not assignment:
+                continue
+            if '=' not in assignment:
+                raise ValueError(
+                    f'Default playstyle assignment "{assignment}" is missing =')
+            character_name, playstyle = assignment.split('=', 1)
+            playstyle = playstyle.strip()
+            if not playstyle:
+                raise ValueError(
+                    f'Default playstyle assignment "{assignment}" has empty playstyle')
+            model_defaults[parse_character_config_key(character_name)] = playstyle
+
+    return defaults
+
+
+def get_character_default_playstyle(
+    agent_name: str,
+    character: Optional[Character],
+    default_playstyles_by_character: Dict[str, Dict[Character, str]],
+    state: dict,
+) -> Optional[str]:
+    if character is None:
+        return None
+
+    model_defaults = default_playstyles_by_character.get(os.path.basename(agent_name))
+    if not model_defaults:
+        return None
+
+    configured_default = model_defaults.get(character)
+    supported_default = get_supported_playstyle_name(state, configured_default)
+    if supported_default is not None:
+        return supported_default
+
+    if configured_default:
+        logging.warning(
+            'Configured default playstyle %s for %s/%s is not supported by this model.',
+            configured_default, agent_name, character.name)
+    return None
+
+
+def get_optional_character_from_name(name: Optional[str]) -> Optional[Character]:
+    if not name:
+        return None
+    try:
+        return parse_character_config_key(name)
+    except KeyError:
+        normalized = name.strip().lower()
+        for character, display_name in PLAYABLE_CHARACTER_CHOICES:
+            if normalized in (character.name.lower(), display_name.lower()):
+                return character
+    return None
+
+
 def get_valid_character_choices():
     """Return a list of character choices for the Discord API."""
     return [
@@ -1448,6 +1560,7 @@ class DiscordBot(commands.Bot):
         menu_timeout: float = 3,  # in minutes
         gpu_server: Optional[Any] = None,
         gpu_model_basename: Optional[str] = None,
+        default_playstyles_by_character: Optional[Dict[str, Dict[Character, str]]] = None,
     ):
         # Set up intents
         intents = discord.Intents.default()
@@ -1470,6 +1583,7 @@ class DiscordBot(commands.Bot):
         self._menu_timeout = menu_timeout
         self._gpu_server = gpu_server
         self._gpu_model_basename = gpu_model_basename
+        self._default_playstyles_by_character = default_playstyles_by_character or {}
 
         self._sessions: Dict[int, SessionInfo] = {}  # User ID -> SessionInfo
         self.lock = threading.RLock()
@@ -1725,7 +1839,7 @@ class DiscordBot(commands.Bot):
                     char_display = "Fox"
                 
                 agent_name = self._get_opponent(user_id)
-                resolved_playstyle = self._resolve_playstyle(agent_name, playstyle)
+                resolved_playstyle = self._resolve_playstyle(agent_name, playstyle, char_enum)
                 playstyle_display = format_playstyle(playstyle, resolved_playstyle)
 
                 team_colors = {port: team_color_num}
@@ -1914,8 +2028,8 @@ class DiscordBot(commands.Bot):
                 # Get agent names (using port index only for selecting different agents)
                 agent1_name = self._get_opponent(user_id, 1)
                 agent2_name = self._get_opponent(user_id, 2)
-                resolved_playstyle1 = self._resolve_playstyle(agent1_name, playstyle1)
-                resolved_playstyle2 = self._resolve_playstyle(agent1_name, playstyle2)
+                resolved_playstyle1 = self._resolve_playstyle(agent1_name, playstyle1, char1_enum)
+                resolved_playstyle2 = self._resolve_playstyle(agent2_name, playstyle2, char2_enum)
                 playstyle1_display = format_playstyle(playstyle1, resolved_playstyle1)
                 playstyle2_display = format_playstyle(playstyle2, resolved_playstyle2)
                 team_colors = {1: team1_num, 2: team2_num}
@@ -2153,9 +2267,9 @@ class DiscordBot(commands.Bot):
                 agent1_name = self._get_opponent(user_id, 1)
                 agent2_name = self._get_opponent(user_id, 2)
                 agent3_name = self._get_opponent(user_id, 3)
-                resolved_playstyle1 = self._resolve_playstyle(agent1_name, playstyle1)
-                resolved_playstyle2 = self._resolve_playstyle(agent1_name, playstyle2)
-                resolved_playstyle3 = self._resolve_playstyle(agent1_name, playstyle3)
+                resolved_playstyle1 = self._resolve_playstyle(agent1_name, playstyle1, char1_enum)
+                resolved_playstyle2 = self._resolve_playstyle(agent2_name, playstyle2, char2_enum)
+                resolved_playstyle3 = self._resolve_playstyle(agent3_name, playstyle3, char3_enum)
                 playstyle1_display = format_playstyle(playstyle1, resolved_playstyle1)
                 playstyle2_display = format_playstyle(playstyle2, resolved_playstyle2)
                 playstyle3_display = format_playstyle(playstyle3, resolved_playstyle3)
@@ -2426,14 +2540,45 @@ class DiscordBot(commands.Bot):
         agent_name = self._get_effective_agent_name(user_id, port)
         return self._models[agent_name]
 
+    def _get_autocomplete_character(self, interaction: discord.Interaction, port: int) -> Optional[Character]:
+        namespace = getattr(interaction, 'namespace', None)
+        if namespace is None:
+            return None
+
+        names = [f'character{port}']
+        if port == 1:
+            names.append('character')
+        for name in names:
+            character = get_optional_character_from_name(getattr(namespace, name, None))
+            if character is not None:
+                return character
+        return None
+
+    def _character_default_playstyle(
+        self,
+        agent_name: str,
+        character: Optional[Character],
+        state: dict,
+    ) -> Optional[str]:
+        return get_character_default_playstyle(
+            agent_name,
+            character,
+            self._default_playstyles_by_character,
+            state,
+        )
+
     async def _autocomplete_playstyle_for_port(
         self,
         interaction: discord.Interaction,
         current: str,
         port: int,
     ) -> list[app_commands.Choice[str]]:
-        state = self._get_state_for_port(interaction.user.id, port)
-        return get_playstyle_autocomplete_choices(state, current)
+        user_id = interaction.user.id
+        agent_name = self._get_effective_agent_name(user_id, port)
+        state = self._models[agent_name]
+        character = self._get_autocomplete_character(interaction, port)
+        default_playstyle = self._character_default_playstyle(agent_name, character, state)
+        return get_playstyle_autocomplete_choices(state, current, default_playstyle)
 
     async def _autocomplete_character_for_port(
         self,
@@ -2444,11 +2589,20 @@ class DiscordBot(commands.Bot):
         state = self._get_state_for_port(interaction.user.id, port)
         return get_character_autocomplete_choices(state, current)
 
-    def _resolve_playstyle(self, agent_name: str, playstyle: Optional[str]) -> str:
+    def _resolve_playstyle(
+        self,
+        agent_name: str,
+        playstyle: Optional[str],
+        character: Optional[Character] = None,
+    ) -> str:
         state = self._models[agent_name]
+        default_name = (
+            self._character_default_playstyle(agent_name, character, state) or
+            self.agent_kwargs.get('name')
+        )
         return resolve_playstyle_for_state(
             playstyle,
-            self.agent_kwargs.get('name'),
+            default_name,
             state,
         )
 
@@ -2665,6 +2819,8 @@ def main(_):
     agent_kwargs = AGENT.value
     if not agent_kwargs['path']:
         raise ValueError('Must provide agent path.')
+    default_playstyles_by_character = parse_default_playstyle_by_character(
+        DEFAULT_PLAYSTYLE_BY_CHARACTER.value)
 
     gpu_server = None
     gpu_model_basename = None
@@ -2702,6 +2858,7 @@ def main(_):
         menu_timeout=MENU_TIMEOUT.value,
         gpu_server=gpu_server,
         gpu_model_basename=gpu_model_basename,
+        default_playstyles_by_character=default_playstyles_by_character,
     )
 
     try:
