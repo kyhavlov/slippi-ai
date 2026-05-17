@@ -133,7 +133,7 @@ class DiscordAutocompleteHelperTest(unittest.TestCase):
     )
     self.assertEqual(
         [(choice.name, choice.value) for choice in choices[1:]],
-        [('Cody', 'Cody')],
+        [('Cody', 'Cody'), ('Master Player (Singles)', 'Master Player')],
     )
 
   def test_playstyle_autocomplete_uses_character_default_option(self):
@@ -153,7 +153,17 @@ class DiscordAutocompleteHelperTest(unittest.TestCase):
     )
     self.assertEqual(
         [(choice.name, choice.value) for choice in choices[1:]],
-        [('Master Player', 'Master Player'), ('Ralph', 'Ralph')],
+        [('Ralph', 'Ralph'), ('Master Player (Singles)', 'Master Player')],
+    )
+
+  def test_playstyle_autocomplete_filters_master_player_singles_label(self):
+    state = {'name_map': {'Master Player': 0, 'Cody': 1}}
+
+    choices = discordbot.get_playstyle_autocomplete_choices(state, 'singles')
+
+    self.assertEqual(
+        [(choice.name, choice.value) for choice in choices],
+        [('Master Player (Singles)', 'Master Player')],
     )
 
   def test_playstyle_autocomplete_uses_none_for_models_without_names(self):

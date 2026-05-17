@@ -228,6 +228,12 @@ def get_allowed_characters_for_state(state: dict) -> Optional[list[Character]]:
     return data_lib.chars_from_string(allowed_characters)
 
 
+def _playstyle_choice_name(playstyle: str) -> str:
+    if playstyle == nametags.DEFAULT_NAME:
+        return f'{playstyle} (Singles)'
+    return playstyle
+
+
 def get_playstyle_autocomplete_choices(
     state: dict,
     current: str,
@@ -254,11 +260,20 @@ def get_playstyle_autocomplete_choices(
             name=default_label,
             value=DEFAULT_PLAYSTYLE_SENTINEL,
         ))
+
+    master_player_name = get_supported_playstyle_name(state, nametags.DEFAULT_NAME)
+    explicit_names = []
+    for name in supported_names:
+        if name == master_player_name:
+            continue
+        if name == default_playstyle:
+            continue
+        explicit_names.append(name)
+    if master_player_name is not None:
+        explicit_names.append(master_player_name)
+
     choices.extend(_filter_autocomplete_choices(
-        [
-            (name, name) for name in supported_names
-            if name != default_playstyle
-        ],
+        [(_playstyle_choice_name(name), name) for name in explicit_names],
         current,
     ))
     return choices[:25]
