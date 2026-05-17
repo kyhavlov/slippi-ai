@@ -14,6 +14,7 @@ from slippi_ai import types
 from slippi_ai import utils
 from slippi_ai.controller_heads import SampleOutputs
 from slippi_ai.evaluators import Trajectory
+from slippi_ai.jax import embed as jax_embed
 from slippi_ai.jax.rl import learner as jax_learner
 from slippi_ai.rl import learner as tf_learner
 
@@ -416,7 +417,7 @@ class JaxRlLearnerTest(unittest.TestCase):
     jax_rollout.replace_env_action_queue_after_chunk(
         env_action_queue=chunked_queue,
         queue_start=[v.copy() for v in queue_start],
-        sample_outputs_list=samples,
+        sample_outputs_chunk=utils.map_nt(lambda *xs: np.stack(xs), *samples),
         reset_masks=reset_masks,
         dummy_outputs=dummy,
     )
@@ -431,12 +432,11 @@ class JaxRlLearnerTest(unittest.TestCase):
 
   def test_pending_env_action_applies_reset_before_resolution(self):
     future = concurrent.futures.Future()
-    future.set_result([
+    future.set_result(utils.map_single_structure(lambda t: t[None],
         SampleOutputs(
             controller_state=np.array([10, 20], dtype=np.int32),
             logits=np.array([1.0, 2.0], dtype=np.float32),
-        )
-    ])
+        )))
     pending = jax_rollout.PendingEnvAction(future=future, index=0)
     queue = deque([pending])
     dummy = SampleOutputs(
@@ -455,6 +455,44 @@ class JaxRlLearnerTest(unittest.TestCase):
     )
 
     self.assertEqual(resolved.tolist(), [10, -2])
+
+  def test_projected_game_preserves_encoded_policy_fields(self):
+    shape = (2,)
+    game = _game_from_players(
+        shape,
+        _player(
+            shape,
+            melee.Character.FOX,
+            actions=[melee.Action.STANDING.value, melee.Action.DASHING.value],
+            stocks=[4, 3],
+            percent=12,
+        ),
+        _player(
+            shape,
+            melee.Character.PEACH,
+            actions=[melee.Action.FALLING.value, melee.Action.EDGE_CATCHING.value],
+            stocks=[3, 2],
+            percent=48,
+        ),
+    )
+    embedding = jax_embed.EmbedConfig(
+        num_players=4,
+        player=jax_embed.PlayerConfig(with_controller=False, with_nana=False),
+        with_randall_xy=True,
+        items=jax_embed.ItemsConfig(type=jax_embed.ItemsType.FLAT),
+    ).make_game_embedding()
+
+    projected = jax_rollout._project_for_embedding(game, embedding)
+    encoded_full = embedding.from_state(game)
+    encoded_projected = embedding.from_state(projected)
+
+    self.assertEqual(projected.p0.controller, ())
+    self.assertEqual(projected.p0.nana, ())
+    full_leaves = utils.flatten_up_to(encoded_full, encoded_full)
+    projected_leaves = utils.flatten_up_to(encoded_projected, encoded_projected)
+    self.assertEqual(len(full_leaves), len(projected_leaves))
+    for full, projected_leaf in zip(full_leaves, projected_leaves):
+      np.testing.assert_array_equal(full, projected_leaf)
 
   def test_reset_frame_actions_splits_network_input_from_actor_outputs(self):
     controller_state = np.array([

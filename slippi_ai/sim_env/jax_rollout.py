@@ -27,10 +27,58 @@ import numpy as np
 from slippi_ai import reward as reward_lib
 from slippi_ai import sim_env
 from slippi_ai import utils
+from slippi_ai.controller_heads import SampleOutputs
 from slippi_ai.evaluators import Trajectory
 from slippi_ai.jax import agents as jax_agents
 from slippi_ai.sim_env import multiprocess_env
 from slippi_ai.sim_env import rewards as sim_rewards
+
+
+@dataclasses.dataclass(frozen=True)
+class TrajectoryScratch:
+  """Preallocated host rollout buffers for policy-visible Game fields."""
+
+  states: object
+  state_slots: list
+  state_slot_leaves: list[tuple]
+  source_leaves: tuple
+  reset_buffer: np.ndarray
+
+
+@dataclasses.dataclass(frozen=True)
+class PolicyChunk:
+  sample_outputs: SampleOutputs
+  controller_state: object
+
+
+def make_trajectory_scratch(
+    game_batch,
+    rollout_length: int,
+    actor: jax_agents.BasicAgent,
+) -> TrajectoryScratch:
+  """Precompute the state views used to pack one rollout without restacking."""
+  source_game = _project_game_for_actor(game_batch.game, actor)
+  states = utils.map_single_structure(
+      lambda leaf: np.empty(
+          (int(rollout_length) + 1,) + np.asarray(leaf).shape,
+          dtype=np.asarray(leaf).dtype,
+      ),
+      source_game,
+  )
+  state_slots = [
+      utils.map_single_structure(lambda leaf, i=i: leaf[i], states)
+      for i in range(int(rollout_length) + 1)
+  ]
+  return TrajectoryScratch(
+      states=states,
+      state_slots=state_slots,
+      state_slot_leaves=[tuple(jax.tree.leaves(slot)) for slot in state_slots],
+      source_leaves=tuple(jax.tree.leaves(source_game)),
+      reset_buffer=np.empty(
+          (int(rollout_length) + 1,) + game_batch.needs_reset.shape,
+          dtype=np.bool_,
+      ),
+  )
 
 
 class JaxSimRolloutWorker:
@@ -163,6 +211,11 @@ class JaxSimRolloutWorker:
     dummy_outputs = self.actor._policy.controller_head.dummy_sample_outputs(
         [self.total_batch * 2])
     self._dummy_outputs = dummy_outputs
+    self._trajectory_scratch = make_trajectory_scratch(
+        self.game_batch,
+        self.length,
+        self.actor,
+    )
     # Model delay is represented by two queues: controller states for the env and
     # full sampled outputs for PPO old-policy data. They reset differently.
     self._env_action_queue = deque(
@@ -207,6 +260,9 @@ class JaxSimRolloutWorker:
     del updates
 
   def rollout(self, num_steps: int) -> tuple[Trajectory, dict]:
+    if num_steps > self.length:
+      raise ValueError(
+          f'num_steps={num_steps} exceeds sim buffer length={self.length}')
     trajectory, stats = collect_trajectory(
         actor=self.actor,
         game_batch=self.game_batch,
@@ -215,6 +271,7 @@ class JaxSimRolloutWorker:
         env_action_queue=self._env_action_queue,
         learner_action_queue=self._learner_action_queue,
         dummy_outputs=self._dummy_outputs,
+        trajectory_scratch=self._trajectory_scratch,
         action_barrier=self._action_barrier,
         obs_barrier=self._obs_barrier,
         step_counters=self._step_counters,
@@ -433,6 +490,7 @@ def collect_trajectory(
     env_action_queue: deque,
     learner_action_queue: deque,
     dummy_outputs,
+    trajectory_scratch: TrajectoryScratch,
     action_barrier,
     obs_barrier,
     step_counters,
@@ -448,13 +506,13 @@ def collect_trajectory(
     barrier_timeout: float,
 ) -> tuple[Trajectory, dict]:
   """Collect one rollout while preserving policy delay and terminal rewards."""
-  states = []
   terminal_reward_overrides = []
   actions = []
-  resets = []
   timings = defaultdict(float)
   counters = defaultdict(int)
   initial_state = actor.hidden_state()
+  time_major_states = _time_prefix(trajectory_scratch.states, rollout_length + 1)
+  reset_buffer = trajectory_scratch.reset_buffer[:rollout_length + 1]
   actor_step_chunk_size = max(1, int(actor_step_chunk_size))
   policy_executor = (
       concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -469,15 +527,16 @@ def collect_trajectory(
       env_queue_start = list(env_action_queue) if policy_executor is None else None
 
       for _ in range(chunk_len):
+        transition_index = len(actions)
         state_start = time.perf_counter()
         # Snapshot only the leaf arrays. The shared Game buffers are immediately
         # reused by workers for the next observation.
-        actor_state = to_numpy_tree(game_batch.game)
+        _copy_state_slot(trajectory_scratch, transition_index)
         game_copy_done = time.perf_counter()
-        reset_mask = np.asarray(game_batch.needs_reset, dtype=np.bool_).copy()
+        reset_buffer[transition_index] = game_batch.needs_reset
+        reset_mask = reset_buffer[transition_index]
         reset_copy_done = time.perf_counter()
-        states.append(actor_state)
-        resets.append(reset_mask)
+        actor_state = trajectory_scratch.state_slots[transition_index]
         chunk_inputs.append((actor_state, reset_mask))
         chunk_reset_masks.append(reset_mask)
 
@@ -496,9 +555,8 @@ def collect_trajectory(
             delayed_entry,
             dummy_outputs=dummy_outputs,
         )
-        learner_action = _resolve_learner_action_entry(action_entry)
         wait_done = time.perf_counter()
-        actions.append(learner_action)
+        actions.append(action_entry)
 
         action_start = time.perf_counter()
         invalid = multiprocess_env.copy_action_to_shared_buffer(
@@ -520,7 +578,7 @@ def collect_trajectory(
           # post-step terminal frame instead.
           terminal_override_start = time.perf_counter()
           terminal_reward_overrides.append(sim_rewards.TerminalRewardOverride(
-              transition_index=len(states) - 1,
+              transition_index=transition_index,
               reset_mask=next_reset_mask,
               terminal_game=sim_rewards.masked_numpy_tree(
                   terminal_game_batch.game,
@@ -561,10 +619,11 @@ def collect_trajectory(
         # reduces Python/JAX launch overhead but still replays delay-queue reset
         # effects so the visible action stream matches single-step rollout.
         if chunk_len == 1:
-          sample_outputs_list = [
-              actor.step_device(chunk_inputs[0][0], chunk_inputs[0][1])]
+          sample_outputs_chunk = _policy_chunk_from_outputs(
+              _sample_output_chunk(
+                  actor.step_device(chunk_inputs[0][0], chunk_inputs[0][1])))
         else:
-          sample_outputs_list = actor.multi_step_device(chunk_inputs)
+          sample_outputs_chunk = _sample_policy_chunk(actor, chunk_inputs)
         policy_done = time.perf_counter()
         timings['policy_sample_s'] += policy_done - policy_start
         counters['policy_sample_calls'] += 1
@@ -572,12 +631,12 @@ def collect_trajectory(
         replace_env_action_queue_after_chunk(
             env_action_queue=env_action_queue,
             queue_start=env_queue_start,
-            sample_outputs_list=sample_outputs_list,
+            sample_outputs_chunk=sample_outputs_chunk,
             reset_masks=chunk_reset_masks,
             dummy_outputs=dummy_outputs,
         )
-        for sample_outputs in sample_outputs_list:
-          learner_action_queue.append(sample_outputs)
+        for index in range(chunk_len):
+          learner_action_queue.append(SampleOutputAt(sample_outputs_chunk, index))
         continue
 
       dependency_wait_start = time.perf_counter()
@@ -592,7 +651,8 @@ def collect_trajectory(
       # the env with already-delayed actions while the current chunk is sampled.
       policy_start = time.perf_counter()
       pending_policy_future = policy_executor.submit(
-          actor.multi_step_device,
+          _sample_policy_chunk,
+          actor,
           chunk_inputs,
       )
       policy_done = time.perf_counter()
@@ -611,27 +671,29 @@ def collect_trajectory(
       policy_executor.shutdown(wait=True)
 
   final_state_start = time.perf_counter()
-  states.append(to_numpy_tree(game_batch.game))
+  _copy_state_slot(trajectory_scratch, rollout_length)
   final_game_copy_done = time.perf_counter()
-  resets.append(np.asarray(game_batch.needs_reset, dtype=np.bool_).copy())
+  reset_buffer[rollout_length] = game_batch.needs_reset
   final_reset_copy_done = time.perf_counter()
-  actions.append(_resolve_learner_action_entry(learner_action_queue[0]))
+  actions.append(learner_action_queue[0])
   final_action_done = time.perf_counter()
-  _resolve_delay_queues(
+  _resolve_env_delay_queue(
       env_action_queue=env_action_queue,
-      learner_action_queue=learner_action_queue,
       dummy_outputs=dummy_outputs,
   )
   delay_queue_done = time.perf_counter()
-  delayed_actions = list(learner_action_queue)[1:]
+  delayed_actions = [
+      _resolve_delayed_action_entry(entry, dummy_outputs=dummy_outputs)
+      for entry in list(learner_action_queue)[1:]
+  ]
   delayed_actions_done = time.perf_counter()
   trajectory, build_timings = _build_trajectory(
       actor=actor,
-      states=states,
+      time_major_states=time_major_states,
       reward_config=reward_config,
       terminal_reward_overrides=terminal_reward_overrides,
       actions=actions,
-      resets=resets,
+      is_resetting=reset_buffer,
       initial_state=initial_state,
       delayed_actions=delayed_actions,
       name_code=name_code,
@@ -659,11 +721,11 @@ def collect_trajectory(
 def _build_trajectory(
     *,
     actor: jax_agents.BasicAgent,
-    states: list,
+    time_major_states,
     reward_config: reward_lib.RewardConfig,
     terminal_reward_overrides: list[sim_rewards.TerminalRewardOverride],
     actions: list,
-    resets: list[np.ndarray],
+    is_resetting: np.ndarray,
     initial_state,
     delayed_actions: list,
     name_code: np.ndarray,
@@ -673,9 +735,6 @@ def _build_trajectory(
   # Encode observations and compute rewards after rollout collection, rather
   # than once per frame, to keep the CPU stepping loop focused on env progress.
   timings = {}
-  batch_states_start = time.perf_counter()
-  time_major_states = utils.batch_nest_nt(states)
-  batch_states_done = time.perf_counter()
   encode_start = time.perf_counter()
   encoded_states = actor._policy.network.encode_game(time_major_states)
   encode_done = time.perf_counter()
@@ -693,17 +752,14 @@ def _build_trajectory(
   ).copy()
   name_done = time.perf_counter()
   actions_start = time.perf_counter()
-  batched_actions = _batch_nest_jax(actions)
+  batched_actions = _batch_action_entries(actions)
   actions_done = time.perf_counter()
-  resets_start = time.perf_counter()
-  is_resetting = np.stack(resets, axis=0)
-  resets_done = time.perf_counter()
-  timings['trajectory_batch_states_s'] = batch_states_done - batch_states_start
+  timings['trajectory_batch_states_s'] = 0.0
   timings['trajectory_encode_states_s'] = encode_done - encode_start
   timings['reward_compute_s'] = reward_done - reward_start
   timings['trajectory_name_broadcast_s'] = name_done - name_start
   timings['trajectory_batch_actions_s'] = actions_done - actions_start
-  timings['trajectory_stack_resets_s'] = resets_done - resets_start
+  timings['trajectory_stack_resets_s'] = 0.0
   return Trajectory(
       states=encoded_states,
       name=name,
@@ -716,6 +772,43 @@ def _build_trajectory(
 
 def to_numpy_tree(value):
   return utils.map_single_structure(lambda x: np.asarray(x).copy(), value)
+
+
+def _project_game_for_actor(game, actor: jax_agents.BasicAgent):
+  game_embedding = _actor_game_embedding(actor)
+  if game_embedding is None:
+    return game
+  return _project_for_embedding(game, game_embedding)
+
+
+def _actor_game_embedding(actor: jax_agents.BasicAgent):
+  network = getattr(actor._policy, 'network', None)
+  embed_module = getattr(network, '_embed_module', None)
+  return getattr(embed_module, '_embed_game', None)
+
+
+def _project_for_embedding(value, embedding):
+  wrapped = getattr(embedding, '_embed', None)
+  if wrapped is not None:
+    return _project_for_embedding(value, wrapped)
+
+  fields = getattr(embedding, 'embedding', None)
+  if fields is None:
+    return value
+
+  return embedding.builder({
+      name: _project_for_embedding(embedding.getter(value, name), child)
+      for name, child in fields
+  })
+
+
+def _time_prefix(value, length: int):
+  return utils.map_single_structure(lambda leaf: leaf[:int(length)], value)
+
+
+def _copy_state_slot(scratch: TrajectoryScratch, index: int) -> None:
+  for dst, src in zip(scratch.state_slot_leaves[int(index)], scratch.source_leaves):
+    dst[...] = src
 
 
 def reset_delay_queue_lanes(queue: deque, default, reset_mask: np.ndarray):
@@ -747,6 +840,12 @@ def reset_delay_queues(
   _ = learner_action_queue
 
 
+@dataclasses.dataclass(frozen=True)
+class SampleOutputAt:
+  outputs: object
+  index: int
+
+
 @dataclasses.dataclass
 class PendingEnvAction:
   future: concurrent.futures.Future
@@ -770,8 +869,8 @@ class PendingLearnerAction:
 def resolve_env_action_entry(entry, *, dummy_outputs):
   if not isinstance(entry, PendingEnvAction):
     return entry
-  sample_outputs = entry.future.result()[entry.index]
-  controller = to_numpy_tree(sample_outputs.controller_state)
+  controller = to_numpy_tree(
+      _controller_state_at(entry.future.result(), entry.index))
   if entry.reset_mask is not None and np.any(entry.reset_mask):
     controller = _reset_tree_lanes(
         controller,
@@ -781,16 +880,20 @@ def resolve_env_action_entry(entry, *, dummy_outputs):
   return controller
 
 
-def _resolve_learner_action_entry(entry):
-  if not isinstance(entry, PendingLearnerAction):
-    return entry
-  return entry.future.result()[entry.index]
+def _resolve_delayed_action_entry(entry, *, dummy_outputs):
+  if isinstance(entry, PendingLearnerAction):
+    entry = SampleOutputAt(entry.future.result(), entry.index)
+  if isinstance(entry, SampleOutputAt):
+    return SampleOutputs(
+        controller_state=_controller_state_at(entry.outputs, entry.index),
+        logits=dummy_outputs.logits,
+    )
+  return entry
 
 
-def _resolve_delay_queues(
+def _resolve_env_delay_queue(
     *,
     env_action_queue: deque,
-    learner_action_queue: deque,
     dummy_outputs,
 ) -> None:
   for index, entry in enumerate(env_action_queue):
@@ -798,15 +901,13 @@ def _resolve_delay_queues(
         entry,
         dummy_outputs=dummy_outputs,
     )
-  for index, entry in enumerate(learner_action_queue):
-    learner_action_queue[index] = _resolve_learner_action_entry(entry)
 
 
 def replace_env_action_queue_after_chunk(
     *,
     env_action_queue: deque,
     queue_start: list,
-    sample_outputs_list: list,
+    sample_outputs_chunk,
     reset_masks: list[np.ndarray],
     dummy_outputs,
 ) -> None:
@@ -821,14 +922,15 @@ def replace_env_action_queue_after_chunk(
   """
   env_action_queue.clear()
   env_action_queue.extend(queue_start)
-  for sample_outputs, reset_mask in zip(sample_outputs_list, reset_masks):
+  for index, reset_mask in enumerate(reset_masks):
     if np.any(reset_mask):
       reset_delay_queue_lanes(
           env_action_queue,
           dummy_outputs.controller_state,
           reset_mask,
       )
-    env_action_queue.append(to_numpy_tree(sample_outputs.controller_state))
+    env_action_queue.append(to_numpy_tree(
+        _controller_state_at(sample_outputs_chunk, index)))
     env_action_queue.popleft()
 
 
@@ -850,8 +952,72 @@ def _reset_tree_lanes(value, default, reset_mask: np.ndarray):
   return utils.map_nt(reset_leaf, value, default)
 
 
-def _batch_nest_jax(nests):
-  return utils.map_nt(lambda *xs: jnp.stack(xs), *nests)
+def _sample_output_chunk(sample_outputs):
+  return jax.tree.map(lambda t: t[None], sample_outputs)
+
+
+def _policy_chunk_from_outputs(sample_outputs) -> PolicyChunk:
+  return PolicyChunk(
+      sample_outputs=sample_outputs,
+      controller_state=to_numpy_tree(sample_outputs.controller_state),
+  )
+
+
+def _sample_policy_chunk(
+    actor: jax_agents.BasicAgent,
+    chunk_inputs: list,
+) -> PolicyChunk:
+  return _policy_chunk_from_outputs(actor.multi_step_stacked_device(chunk_inputs))
+
+
+def _chunk_outputs(outputs):
+  if isinstance(outputs, PolicyChunk):
+    return outputs.sample_outputs
+  return outputs
+
+
+def _controller_state_at(sample_outputs, index: int):
+  return jax.tree.map(lambda t: t[int(index)], sample_outputs.controller_state)
+
+
+def _batch_action_entries(entries):
+  segments = []
+  index = 0
+  while index < len(entries):
+    entry = entries[index]
+    if isinstance(entry, PendingLearnerAction):
+      entry = SampleOutputAt(entry.future.result(), entry.index)
+
+    if isinstance(entry, SampleOutputAt):
+      outputs = entry.outputs
+      sample_outputs = _chunk_outputs(outputs)
+      start = int(entry.index)
+      stop = start + 1
+      next_index = index + 1
+      while next_index < len(entries):
+        next_entry = entries[next_index]
+        if isinstance(next_entry, PendingLearnerAction):
+          next_entry = SampleOutputAt(
+              next_entry.future.result(),
+              next_entry.index,
+          )
+        if not (
+            isinstance(next_entry, SampleOutputAt)
+            and next_entry.outputs is outputs
+            and int(next_entry.index) == stop
+        ):
+          break
+        stop += 1
+        next_index += 1
+      segments.append(
+          jax.tree.map(lambda t, s=start, e=stop: t[s:e], sample_outputs))
+      index = next_index
+      continue
+
+    segments.append(jax.tree.map(lambda t: jnp.asarray(t)[None], entry))
+    index += 1
+
+  return jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *segments)
 
 
 def block_until_ready(value):

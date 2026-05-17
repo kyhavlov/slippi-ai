@@ -223,6 +223,11 @@ def main():
       raise ValueError(
           f'--actor-step-chunk-size must be <= policy delay '
           f'{actor._policy.delay}, got {args.actor_step_chunk_size}')
+    trajectory_scratch = jax_rollout.make_trajectory_scratch(
+        game_batch,
+        args.rollout_length,
+        actor,
+    )
     learner_state = learner.initial_state(total_players)
     dummy_outputs = actor._policy.controller_head.dummy_sample_outputs([total_players])
     env_action_queue = deque(
@@ -297,6 +302,7 @@ def main():
             env_action_queue=env_action_queue,
             learner_action_queue=learner_action_queue,
             dummy_outputs=dummy_outputs,
+            trajectory_scratch=trajectory_scratch,
             action_barrier=action_barrier,
             obs_barrier=obs_barrier,
             step_counters=step_counters,

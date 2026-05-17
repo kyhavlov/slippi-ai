@@ -129,7 +129,7 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
         name_code: jax.Array,
         prev_action: ControllerType,  # only for first step
         initial_state: policies.RecurrentState,
-    ) -> tuple[list[SampleOutputs[ControllerType]], policies.RecurrentState]:
+    ) -> tuple[SampleOutputs[ControllerType], policies.RecurrentState]:
 
       stacked_states_and_resets = jax.tree.map(
           lambda *xs: jnp.stack(xs, axis=0), *states_and_resets)
@@ -151,11 +151,7 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
       stacked_sample_outputs, (_, final_state) = scan_fn(
           rngs.fork(split=length), stacked_states_and_resets, (prev_action, initial_state))
 
-      sample_outputs = [
-          jax.tree.map(lambda t, i=i: t[i], stacked_sample_outputs)
-          for i in range(length)]
-
-      return sample_outputs, final_state
+      return stacked_sample_outputs, final_state
 
     self._multi_sample = functools.partial(multi_sample, policy, rngs)
 
@@ -251,6 +247,16 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
       states: list[tuple[Game, agents.BoolArray]],
   ) -> list[SampleOutputs[ControllerType]]:
     """Sample a time chunk and leave the full output tree on device."""
+    sample_outputs = self.multi_step_stacked_device(states)
+    return [
+        jax.tree.map(lambda t, i=i: t[i], sample_outputs)
+        for i in range(len(states))]
+
+  def multi_step_stacked_device(
+      self,
+      states: list[tuple[Game, agents.BoolArray]],
+  ) -> SampleOutputs[ControllerType]:
+    """Sample a time chunk and return a time-major output tree on device."""
     states_and_resets = [
         (self._policy.network.encode_game(game), needs_reset)
         for game, needs_reset in states
@@ -261,6 +267,7 @@ class BasicAgent(agents.BasicAgent[ControllerType, policies.RecurrentState]):
     sample_outputs, self._hidden_state = multi_sample_fn(
         states_and_resets, self._name_code, self._prev_controller, self._hidden_state)
 
-    self._prev_controller = sample_outputs[-1].controller_state
+    self._prev_controller = jax.tree.map(
+        lambda t: t[-1], sample_outputs.controller_state)
 
     return sample_outputs
