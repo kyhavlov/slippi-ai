@@ -427,11 +427,9 @@ def _copy_controller_slice(
   ):
     values = np.asarray(src_arr)
     invalid += int((values < 0).sum() + (values > limit).sum())
-    np.copyto(dst_arr[dst_slice], values, casting='unsafe')
+    dst_arr[dst_slice] = values
   for name in Buttons._fields:
-    np.copyto(
-        getattr(dst.buttons, name)[dst_slice],
-        np.asarray(getattr(src.buttons, name)))
+    getattr(dst.buttons, name)[dst_slice] = np.asarray(getattr(src.buttons, name))
   return invalid
 
 
